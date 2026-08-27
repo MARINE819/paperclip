@@ -41,6 +41,9 @@ import { Approvals } from "./pages/Approvals";
 import { ApprovalDetail } from "./pages/ApprovalDetail";
 import { Costs } from "./pages/Costs";
 import { CompanyActivity } from "./pages/audit/CompanyActivity";
+import { MobileApprovalConsole } from "./pages/mobile/MobileApprovalConsole";
+import { MobileApprovalDetail } from "./pages/mobile/MobileApprovalDetail";
+import { MobileSettings } from "./pages/mobile/MobileSettings";
 import { Inbox } from "./pages/Inbox";
 import { WhatNeedsMe } from "./pages/WhatNeedsMe";
 import { DecisionQueuePage } from "./pages/DecisionQueuePage";
@@ -260,6 +263,9 @@ function boardRoutes() {
       <Route path="approvals/pending" element={<Approvals />} />
       <Route path="approvals/all" element={<Approvals />} />
       <Route path="approvals/:approvalId" element={<ApprovalDetail />} />
+      <Route path="mobile/approvals" element={<MobileApprovalConsole />} />
+      <Route path="mobile/approvals/:approvalId" element={<MobileApprovalDetail />} />
+      <Route path="mobile/settings" element={<MobileSettings />} />
       <Route path="costs" element={<Costs />} />
       <Route path="activity" element={<CompanyActivity />} />
       {/* `/audit` merged into the single Activity page (PAP-16302). Existing deep

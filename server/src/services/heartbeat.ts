@@ -150,6 +150,7 @@ import {
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
 import { issueService } from "./issues.js";
+import { approvalTtlMsForRisk, computeApprovalFingerprint, consumeApproval } from "./approval-lifecycle.js";
 import { projectService } from "./projects.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
@@ -5302,12 +5303,20 @@ function enrichWakeContextSnapshot(input: {
   const { contextSnapshot, reason, source, triggerDetail, payload } = input;
   const issueIdFromPayload = readNonEmptyString(payload?.["issueId"]) ?? readNonEmptyString(payload?.["taskId"]);
   const commentIdFromPayload = readNonEmptyString(payload?.["commentId"]);
+  const promptFromPayload = readNonEmptyString(payload?.["prompt"]);
+  const messageFromPayload = readNonEmptyString(payload?.["message"]);
   const taskKey = deriveTaskKey(contextSnapshot, payload);
   const wakeCommentId = deriveCommentId(contextSnapshot, payload);
   const wakeCommentIds = mergeWakeCommentIds(contextSnapshot, commentIdFromPayload);
 
   if (!readNonEmptyString(contextSnapshot["wakeReason"]) && reason) {
     contextSnapshot.wakeReason = reason;
+  }
+  if (!readNonEmptyString(contextSnapshot["prompt"]) && promptFromPayload) {
+    contextSnapshot.prompt = promptFromPayload;
+  }
+  if (!readNonEmptyString(contextSnapshot["message"]) && messageFromPayload) {
+    contextSnapshot.message = messageFromPayload;
   }
   if (!readNonEmptyString(contextSnapshot["issueId"]) && issueIdFromPayload) {
     contextSnapshot.issueId = issueIdFromPayload;
@@ -6587,6 +6596,24 @@ export function resolveHeartbeatSchedulingSuppression(
     return { suppressed: true, reason: "database_restore_in_progress" };
   }
   return { suppressed: false, reason: null };
+}
+
+const PRE_EXECUTION_HIGH_RISK_RE = /create|modify|delete|write|update|insert|drop|post|send|email|pay|buy|purchase|finance|account|permission|security|config|deploy|production|customer/i;
+const PRE_EXECUTION_LOW_RISK_RE = /read|view|list|summarize|analyze|plan|propose|research|investigate|explain|describe|조회|출력|분석|보고서/i;
+const SAFE_NEGATIVE_CODE_CHANGE_RE = /\b(?:do\s+not|don't|must\s+not|never)\s+(?:modify|change|edit|update|write(?:\s+to)?)\s+(?:(?:the|any)\s+)?(?:(?:paperclip|application|app|source)\s+)?code\b/gi;
+
+export type PreExecutionRisk = "LOW" | "HIGH" | "UNKNOWN";
+
+export function classifyPreExecutionRisk(taskText: string): PreExecutionRisk {
+  let safeNegativeConstraintFound = false;
+  const classificationText = taskText.toLowerCase().replace(SAFE_NEGATIVE_CODE_CHANGE_RE, () => {
+    safeNegativeConstraintFound = true;
+    return " ";
+  });
+
+  if (PRE_EXECUTION_HIGH_RISK_RE.test(classificationText)) return "HIGH";
+  if (PRE_EXECUTION_LOW_RISK_RE.test(classificationText)) return "LOW";
+  return safeNegativeConstraintFound ? "LOW" : "UNKNOWN";
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -13580,6 +13607,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return promise;
   }
 
+  // Retries never reuse the failed run's id — a process-loss/scheduled retry
+  // always inserts a NEW heartbeat_runs row with retryOfRunId pointing at the
+  // run it's retrying. Walking that chain to its root gives every run in one
+  // retry family the same canonical consume identity, so a genuine retry is
+  // an idempotent "same run" to consumeApproval while an unrelated run (a
+  // different task, a different wake, or a forged/unrelated retryOfRunId)
+  // resolves to a different root and is correctly rejected. Bounded to 25
+  // hops — real retry chains are always far shorter (see
+  // BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS) — so a corrupted chain
+  // fails closed (stops walking, uses whatever root it reached) rather than
+  // looping forever.
+  async function resolveRetryChainRootRunId(
+    startRun: Pick<typeof heartbeatRuns.$inferSelect, "id" | "retryOfRunId">,
+  ): Promise<string> {
+    let current: Pick<typeof heartbeatRuns.$inferSelect, "id" | "retryOfRunId"> = startRun;
+    for (let hops = 0; hops < 25 && current.retryOfRunId; hops += 1) {
+      const parent = await db
+        .select({ id: heartbeatRuns.id, retryOfRunId: heartbeatRuns.retryOfRunId })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, current.retryOfRunId))
+        .then((rows) => rows[0] ?? null);
+      if (!parent) break;
+      current = parent;
+    }
+    return current.id;
+  }
+
   async function executeRun(runId: string) {
     if ((await getSchedulingSuppression()).suppressed) return;
 
@@ -15586,7 +15640,201 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterFinalizeOutcome = status;
       };
 
+      // PRE-EXECUTION RISK GUARD
+      // Classify structured user-authored intent only. Generated task markdown
+      // contains trusted safety prose (for example "permission" and
+      // "security") that must not become part of the requested action.
+      const wakeCommentBody = readNonEmptyString(parseObject(context.paperclipWakeComment).body);
+      const taskText = [
+        issueRef?.title,
+        issueRef?.description,
+        readNonEmptyString(context.prompt),
+        readNonEmptyString(context.title),
+        readNonEmptyString(context.message),
+        wakeCommentBody,
+      ].filter((value): value is string => Boolean(value)).join(" ").toLowerCase();
+      const risk = classifyPreExecutionRisk(taskText);
+      const taskFingerprint = createHash("sha256").update(taskText).digest("hex");
+      // SSOT for security decisions from here on — computeApprovalFingerprint
+      // additionally binds company/issue/agent/risk, not just the task text.
+      // taskFingerprint (above) is kept only so payload.taskFingerprint stays
+      // a human-readable audit trail; no security decision reads it anymore.
+      const canonicalFingerprint = computeApprovalFingerprint({
+        companyId: agent.companyId,
+        issueId: issueId ?? null,
+        requestedByAgentId: agent.id,
+        risk,
+        taskText,
+      });
+
+      // A high-risk run may proceed only with an explicit board approval that
+      // is linked to this exact issue. An unrelated or merely pending approval
+      // must never authorize execution.
+      const approvedRiskGuardApproval = issueId
+        ? await db
+          .select({ id: approvals.id })
+          .from(issueApprovals)
+          .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+          .where(
+            and(
+              eq(issueApprovals.companyId, agent.companyId),
+              eq(issueApprovals.issueId, issueId),
+              eq(approvals.companyId, agent.companyId),
+              eq(approvals.type, "request_board_approval"),
+              eq(approvals.status, "approved"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+        : await db
+          .select({ id: approvals.id })
+          .from(approvals)
+          .where(
+            and(
+              eq(approvals.companyId, agent.companyId),
+              eq(approvals.type, "request_board_approval"),
+              eq(approvals.status, "approved"),
+              sql`${approvals.payload} ->> 'source' = 'risk_guard'`,
+              eq(approvals.taskFingerprint, canonicalFingerprint),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+
+      // The approval found above only proves a Human approved *something*
+      // matching this issue at some point — it does not by itself prove the
+      // approval is still live (unexpired), still matches this exact task
+      // (fingerprint), hasn't already authorized a different execution, and
+      // hasn't been superseded. consumeApproval re-validates every one of
+      // those atomically and, only if they all still hold, records this run
+      // as the (sole) execution it authorizes — in the same step, so there is
+      // no gap between "checked valid" and "consumed" for a concurrent run to
+      // exploit. Retries in the same retry chain reuse the chain's root run
+      // id, so a genuine retry is an idempotent re-consume, never a rejection.
+      const rootRunId = approvedRiskGuardApproval ? await resolveRetryChainRootRunId(run) : null;
+      const consumeResult = approvedRiskGuardApproval && rootRunId
+        ? await consumeApproval(db, {
+            approvalId: approvedRiskGuardApproval.id,
+            runId: rootRunId,
+            expectedTaskFingerprint: canonicalFingerprint,
+          })
+        : null;
+      const executionAuthorized =
+        consumeResult?.outcome === "consumed" || consumeResult?.outcome === "already_consumed_same_run";
+      if (consumeResult && !executionAuthorized) {
+        logger.warn(
+          { runId: run.id, rootRunId, approvalId: approvedRiskGuardApproval?.id, outcome: consumeResult.outcome },
+          "Risk guard approval failed atomic consume re-validation; re-intercepting.",
+        );
+      }
+      const interceptedByRiskGuard =
+        (risk === "HIGH" || risk === "UNKNOWN") &&
+        agent.adapterType === "codex_local" &&
+        !executionAuthorized;
+
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
+      if (interceptedByRiskGuard) {
+        const approval = await db.transaction(async (tx) => {
+          const lockKey = `risk-guard-approval:${agent.companyId}:${issueId ?? "unscoped"}:${canonicalFingerprint}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+
+          const linkedApprovalCondition = issueId
+            ? sql`exists (
+                select 1 from ${issueApprovals}
+                where ${issueApprovals.approvalId} = ${approvals.id}
+                  and ${issueApprovals.companyId} = ${agent.companyId}
+                  and ${issueApprovals.issueId} = ${issueId}
+              )`
+            : sql`true`;
+          const existing = await tx
+            .select({ id: approvals.id })
+            .from(approvals)
+            .where(
+              and(
+                eq(approvals.companyId, agent.companyId),
+                eq(approvals.type, "request_board_approval"),
+                inArray(approvals.status, ["pending", "revision_requested"]),
+                sql`${approvals.payload} ->> 'source' = 'risk_guard'`,
+                eq(approvals.taskFingerprint, canonicalFingerprint),
+                linkedApprovalCondition,
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existing) return existing;
+
+          const ttlMs = approvalTtlMsForRisk(risk);
+          const created = await tx
+            .insert(approvals)
+            .values({
+              companyId: agent.companyId,
+              type: "request_board_approval",
+              requestedByAgentId: agent.id,
+              requestedByUserId: null,
+              status: "pending",
+              taskFingerprint: canonicalFingerprint,
+              expiresAt: ttlMs === null ? null : new Date(Date.now() + ttlMs),
+              payload: {
+                source: "risk_guard",
+                issueId,
+                issueIdentifier: issueRef?.identifier ?? null,
+                runId: run.id,
+                risk,
+                taskFingerprint,
+                title: `Risk Guard approval${issueRef?.identifier ? ` for ${issueRef.identifier}` : ""}`,
+                summary: `Allow this ${risk} risk task to proceed through the existing Risk Guard authorization path.`,
+              },
+            })
+            .returning({ id: approvals.id })
+            .then((rows) => rows[0]!);
+
+          if (issueId) {
+            await tx.insert(issueApprovals).values({
+              companyId: agent.companyId,
+              issueId,
+              approvalId: created.id,
+              linkedByAgentId: agent.id,
+              linkedByUserId: null,
+            });
+          }
+
+          await logActivity(tx as unknown as Db, {
+            companyId: agent.companyId,
+            actorType: "agent",
+            actorId: agent.id,
+            agentId: agent.id,
+            runId: run.id,
+            action: "approval.created",
+            entityType: "approval",
+            entityId: created.id,
+            details: { type: "request_board_approval", issueIds: issueId ? [issueId] : [], source: "risk_guard" },
+          });
+          return created;
+        });
+
+        logger.warn({ runId: run.id, risk, approvalId: approval.id }, "High/Unknown risk task intercepted before execution. Demanding Human Approval.");
+        adapterResult = {
+          exitCode: 1,
+          errorFamily: "human_intervention_required",
+          errorMessage: `Task intercepted due to ${risk} risk. Human Approval is required before execution.`,
+          summary: "Execution blocked by Risk Guard.",
+          resultJson: { risk, approvalId: approval.id }
+        } as any;
+        // The run must continue through the normal finalization path below.
+        // Returning here leaves it "running" until lease teardown rewrites it
+        // as lease_released_before_terminal.
+        await recordWorkspaceFinalize("failed", {
+          errorMessage: `Task intercepted due to ${risk} risk. Human Approval is required before execution.`,
+          reason: "risk_guard",
+        });
+      } else {
+        if (approvedRiskGuardApproval) {
+          logger.info(
+            { runId: run.id, risk, approvalId: approvedRiskGuardApproval.id },
+            "Risk guard authorization satisfied by approved issue-linked board approval.",
+          );
+        }
+
       try {
         const adapterContext = { ...context };
         const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
@@ -15678,6 +15926,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "failed to revoke heartbeat-run MCP gateway tokens",
           );
         }
+      }
       }
       // Reconcile the referenced-project set against the real remote staging outcome. A referenced
       // project can pass authorization and clone locally at run prep, then fail to stage into the

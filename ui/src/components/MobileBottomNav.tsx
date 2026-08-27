@@ -6,6 +6,7 @@ import {
   SquarePen,
   Users,
   Inbox,
+  ShieldCheck,
 } from "lucide-react";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
@@ -43,6 +44,7 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
 
   const items = useMemo<MobileNavItem[]>(
     () => [
+      { type: "link", to: "/mobile/approvals", label: "관제탑", icon: ShieldCheck },
       { type: "link", to: "/dashboard", label: "Home", icon: House },
       { type: "link", to: "/issues", label: "Tasks", icon: CircleDot },
       { type: "action", label: "Create", icon: SquarePen, onClick: () => openNewIssue() },
@@ -66,7 +68,7 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
       )}
       aria-label="Mobile navigation"
     >
-      <div className="grid h-16 grid-cols-5 px-1">
+      <div className="grid h-16 grid-cols-6 px-1">
         {items.map((item) => {
           if (item.type === "action") {
             const Icon = item.icon;

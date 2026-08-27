@@ -18,6 +18,16 @@ import {
   logActivity,
   secretService,
 } from "../services/index.js";
+import {
+  effectiveApprovalStatus,
+  fingerprintStatus,
+  actorIdentityFor,
+  requestFingerprintFor,
+  checkApprovalIdempotency,
+  claimApprovalIdempotency,
+  completeApprovalIdempotency,
+  type ApprovalRecord,
+} from "../services/approval-lifecycle.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -31,6 +41,16 @@ function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(a
   };
 }
 
+// Every approval-shaped response gets the same additive fields — existing
+// consumers reading only the pre-existing keys are unaffected.
+function projectApprovalResponse(approval: ApprovalRecord) {
+  return {
+    ...redactApprovalPayload(approval),
+    effectiveStatus: effectiveApprovalStatus(approval),
+    fingerprintStatus: fingerprintStatus(approval),
+  };
+}
+
 function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
   const context = contextSnapshot as Record<string, unknown>;
@@ -39,6 +59,19 @@ function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     context.allowDeliverableWork === false &&
     context.allowDocumentUpdates === false &&
     context.resumeRequiresNormalModel === true;
+}
+
+/**
+ * When the actor is a paired Board API key (mobile or CLI), record its key
+ * id and scope in the audit log details — never the raw token or its hash.
+ * Empty for every other actor source (session, agent key/JWT, local_implicit).
+ */
+function boardKeySourceDetails(req: Request): Record<string, unknown> {
+  if (req.actor.source !== "board_key" || !req.actor.keyId) return {};
+  return {
+    boardApiKeyId: req.actor.keyId,
+    boardKeyScope: req.actor.boardKeyScope ?? null,
+  };
 }
 
 export function approvalRoutes(
@@ -153,6 +186,114 @@ export function approvalRoutes(
     }
   }
 
+  // Extracted verbatim from the former inline `if (applied) { ... }` body of
+  // POST /approvals/:id/approve, so both the idempotencyKey path and the
+  // plain path below call the exact same wakeup/review-path logic instead of
+  // maintaining two copies that could silently drift apart.
+  async function runApproveSideEffects(req: Request, approval: ApprovalRecord) {
+    const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
+    const linkedIssueIds = linkedIssues.map((issue) => issue.id);
+    const primaryIssueId = linkedIssueIds[0] ?? null;
+    const lostReviewIssueIds = await lostReviewPathIssueIds(approval.companyId, linkedIssues);
+    const primaryReviewPathContext = primaryIssueId && lostReviewIssueIds.has(primaryIssueId)
+      ? approvalReviewPathContext(approval.id)
+      : null;
+
+    let primaryReviewPathWakeCovered = false;
+    if (approval.requestedByAgentId) {
+      try {
+        const wakeRun = await heartbeat.wakeup(approval.requestedByAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "approval_approved",
+          payload: {
+            approvalId: approval.id,
+            approvalStatus: approval.status,
+            issueId: primaryIssueId,
+            issueIds: linkedIssueIds,
+            ...(primaryReviewPathContext ?? {}),
+          },
+          requestedByActorType: "user",
+          requestedByActorId: req.actor.userId ?? "board",
+          contextSnapshot: {
+            source: "approval.approved",
+            approvalId: approval.id,
+            approvalStatus: approval.status,
+            issueId: primaryIssueId,
+            issueIds: linkedIssueIds,
+            taskId: primaryIssueId,
+            wakeReason: "approval_approved",
+            ...(primaryReviewPathContext ?? {}),
+          },
+        });
+        primaryReviewPathWakeCovered = Boolean(wakeRun && primaryReviewPathContext);
+
+        await logActivity(db, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "approval.requester_wakeup_queued",
+          entityType: "approval",
+          entityId: approval.id,
+          details: {
+            requesterAgentId: approval.requestedByAgentId,
+            wakeRunId: wakeRun?.id ?? null,
+            linkedIssueIds,
+          },
+        });
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            approvalId: approval.id,
+            requestedByAgentId: approval.requestedByAgentId,
+          },
+          "failed to queue requester wakeup after approval",
+        );
+        await logActivity(db, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "approval.requester_wakeup_failed",
+          entityType: "approval",
+          entityId: approval.id,
+          details: {
+            requesterAgentId: approval.requestedByAgentId,
+            linkedIssueIds,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
+    }
+
+    await queueAdditionalApprovalReviewPathWakes({
+      approvalId: approval.id,
+      approvalStatus: approval.status,
+      companyId: approval.companyId,
+      linkedIssues,
+      lostIssueIds: lostReviewIssueIds,
+      alreadyWoken: primaryReviewPathWakeCovered && approval.requestedByAgentId && primaryIssueId
+        ? { agentId: approval.requestedByAgentId, issueId: primaryIssueId }
+        : null,
+      requestedByUserId: req.actor.userId ?? "board",
+    });
+  }
+
+  // Extracted verbatim from the former inline `if (applied) { ... }` body of
+  // POST /approvals/:id/reject.
+  async function runRejectSideEffects(req: Request, approval: ApprovalRecord) {
+    const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
+    const lostReviewIssueIds = await lostReviewPathIssueIds(approval.companyId, linkedIssues);
+    await queueAdditionalApprovalReviewPathWakes({
+      approvalId: approval.id,
+      approvalStatus: approval.status,
+      companyId: approval.companyId,
+      linkedIssues,
+      lostIssueIds: lostReviewIssueIds,
+      requestedByUserId: req.actor.userId ?? "board",
+    });
+  }
+
   async function requireApprovalAccess(req: Request, id: string) {
     const approval = await svc.getById(id);
     if (!approval || !hasCompanyAccess(req, approval.companyId)) {
@@ -210,7 +351,7 @@ export function approvalRoutes(
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
     const status = req.query.status as string | undefined;
     const result = await svc.list(companyId, status);
-    res.json(result.map((approval) => redactApprovalPayload(approval)));
+    res.json(result.map((approval) => projectApprovalResponse(approval)));
   });
 
   router.get("/approvals/:id", async (req, res) => {
@@ -218,7 +359,7 @@ export function approvalRoutes(
     const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
     if (!approval) return;
     if (!(await assertApprovalAccessAllowed(req, res, approval.companyId))) return;
-    res.json(redactApprovalPayload(approval));
+    res.json(projectApprovalResponse(approval));
   });
 
   router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
@@ -273,7 +414,7 @@ export function approvalRoutes(
       details: { type: approval.type, issueIds: uniqueIssueIds },
     });
 
-    res.status(201).json(redactApprovalPayload(approval));
+    res.status(201).json(projectApprovalResponse(approval));
   });
 
   router.get("/approvals/:id/issues", async (req, res) => {
@@ -288,152 +429,278 @@ export function approvalRoutes(
   router.post("/approvals/:id/approve", validate(resolveApprovalSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    if (!(await requireApprovalAccess(req, id))) {
+    const existingApproval = await requireApprovalAccess(req, id);
+    if (!existingApproval) {
       res.status(404).json({ error: "Approval not found" });
       return;
     }
     const decidedByUserId = req.actor.userId ?? "board";
-    const { approval, applied } = await svc.approve(id, decidedByUserId, req.body.decisionNote);
+    const idempotencyKey = req.body.idempotencyKey as string | undefined;
 
-    if (applied) {
-      const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
-      const linkedIssueIds = linkedIssues.map((issue) => issue.id);
-      const primaryIssueId = linkedIssueIds[0] ?? null;
-      const lostReviewIssueIds = await lostReviewPathIssueIds(approval.companyId, linkedIssues);
-      const primaryReviewPathContext = primaryIssueId && lostReviewIssueIds.has(primaryIssueId)
-        ? approvalReviewPathContext(approval.id)
-        : null;
+    if (!idempotencyKey) {
+      const { approval, applied, outcome } = await svc.approve(id, decidedByUserId, req.body.decisionNote);
 
-      await logActivity(db, {
-        companyId: approval.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
-        action: "approval.approved",
-        entityType: "approval",
-        entityId: approval.id,
-        details: {
-          type: approval.type,
-          requestedByAgentId: approval.requestedByAgentId,
-          linkedIssueIds,
-        },
+      if (outcome === "expired") {
+        res.status(410).json({
+          error: "This approval has expired and can no longer be resolved",
+          reason: "approval_expired",
+          expiredAt: approval.expiresAt?.toISOString() ?? null,
+        });
+        return;
+      }
+      if (outcome === "conflict") {
+        res.status(409).json({
+          error: "This approval was already resolved to a different status",
+          reason: "already_resolved_conflict",
+          currentStatus: approval.status,
+        });
+        return;
+      }
+
+      if (applied) {
+        await logActivity(db, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: decidedByUserId,
+          action: "approval.approved",
+          entityType: "approval",
+          entityId: approval.id,
+          details: {
+            type: approval.type,
+            requestedByAgentId: approval.requestedByAgentId,
+            ...boardKeySourceDetails(req),
+          },
+        });
+        await runApproveSideEffects(req, approval);
+      }
+
+      res.json(projectApprovalResponse(approval));
+      return;
+    }
+
+    // idempotencyKey path — access already checked above (requireApprovalAccess).
+    const actorIdentity = actorIdentityFor(req);
+    const requestFingerprint = requestFingerprintFor({ decisionNote: req.body.decisionNote });
+
+    const fastPath = await checkApprovalIdempotency(db, {
+      actorIdentity, idempotencyKey, approvalId: id, action: "approve", requestFingerprint,
+    });
+    if (fastPath.kind === "key_reused_with_different_request") {
+      res.status(409).json({
+        error: "This idempotency key was already used with a different approval, action, or request body",
+        reason: "idempotency_key_reused",
+      });
+      return;
+    }
+    if (fastPath.kind === "replay") {
+      res.status(fastPath.httpStatus).json(fastPath.body);
+      return;
+    }
+
+    let applied = false;
+    let httpStatus = 200;
+    let body: unknown;
+    let approvalForSideEffects: ApprovalRecord | null = null;
+
+    await db.transaction(async (tx) => {
+      const claim = await claimApprovalIdempotency(tx as unknown as Db, {
+        companyId: existingApproval.companyId, actorIdentity, idempotencyKey, approvalId: id, action: "approve", requestFingerprint,
       });
 
-      let primaryReviewPathWakeCovered = false;
-      if (approval.requestedByAgentId) {
-        try {
-          const wakeRun = await heartbeat.wakeup(approval.requestedByAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "approval_approved",
-            payload: {
-              approvalId: approval.id,
-              approvalStatus: approval.status,
-              issueId: primaryIssueId,
-              issueIds: linkedIssueIds,
-              ...(primaryReviewPathContext ?? {}),
-            },
-            requestedByActorType: "user",
-            requestedByActorId: req.actor.userId ?? "board",
-            contextSnapshot: {
-              source: "approval.approved",
-              approvalId: approval.id,
-              approvalStatus: approval.status,
-              issueId: primaryIssueId,
-              issueIds: linkedIssueIds,
-              taskId: primaryIssueId,
-              wakeReason: "approval_approved",
-              ...(primaryReviewPathContext ?? {}),
-            },
-          });
-          primaryReviewPathWakeCovered = Boolean(wakeRun && primaryReviewPathContext);
+      if (claim.kind === "lost_conflict") {
+        httpStatus = 409;
+        body = {
+          error: "This idempotency key was already used with a different approval, action, or request body",
+          reason: "idempotency_key_reused",
+        };
+        return;
+      }
+      if (claim.kind === "lost_replay") {
+        httpStatus = claim.httpStatus;
+        body = claim.body;
+        return;
+      }
 
-          await logActivity(db, {
-            companyId: approval.companyId,
+      const result = await approvalService(tx as unknown as Db).approve(id, decidedByUserId, req.body.decisionNote);
+      applied = result.applied;
+
+      if (result.outcome === "expired") {
+        httpStatus = 410;
+        body = {
+          error: "This approval has expired and can no longer be resolved",
+          reason: "approval_expired",
+          expiredAt: result.approval.expiresAt?.toISOString() ?? null,
+        };
+      } else if (result.outcome === "conflict") {
+        httpStatus = 409;
+        body = {
+          error: "This approval was already resolved to a different status",
+          reason: "already_resolved_conflict",
+          currentStatus: result.approval.status,
+        };
+      } else {
+        if (result.applied) {
+          await logActivity(tx as unknown as Db, {
+            companyId: result.approval.companyId,
             actorType: "user",
-            actorId: req.actor.userId ?? "board",
-            action: "approval.requester_wakeup_queued",
+            actorId: decidedByUserId,
+            action: "approval.approved",
             entityType: "approval",
-            entityId: approval.id,
+            entityId: result.approval.id,
             details: {
-              requesterAgentId: approval.requestedByAgentId,
-              wakeRunId: wakeRun?.id ?? null,
-              linkedIssueIds,
-            },
-          });
-        } catch (err) {
-          logger.warn(
-            {
-              err,
-              approvalId: approval.id,
-              requestedByAgentId: approval.requestedByAgentId,
-            },
-            "failed to queue requester wakeup after approval",
-          );
-          await logActivity(db, {
-            companyId: approval.companyId,
-            actorType: "user",
-            actorId: req.actor.userId ?? "board",
-            action: "approval.requester_wakeup_failed",
-            entityType: "approval",
-            entityId: approval.id,
-            details: {
-              requesterAgentId: approval.requestedByAgentId,
-              linkedIssueIds,
-              error: err instanceof Error ? err.message : String(err),
+              type: result.approval.type,
+              requestedByAgentId: result.approval.requestedByAgentId,
+              ...boardKeySourceDetails(req),
             },
           });
         }
+        httpStatus = 200;
+        body = projectApprovalResponse(result.approval);
+        approvalForSideEffects = result.approval;
       }
 
-      await queueAdditionalApprovalReviewPathWakes({
-        approvalId: approval.id,
-        approvalStatus: approval.status,
-        companyId: approval.companyId,
-        linkedIssues,
-        lostIssueIds: lostReviewIssueIds,
-        alreadyWoken: primaryReviewPathWakeCovered && approval.requestedByAgentId && primaryIssueId
-          ? { agentId: approval.requestedByAgentId, issueId: primaryIssueId }
-          : null,
-        requestedByUserId: req.actor.userId ?? "board",
-      });
+      await completeApprovalIdempotency(tx as unknown as Db, { claimId: claim.claimId, httpStatus, body });
+    });
+
+    if (applied && approvalForSideEffects) {
+      await runApproveSideEffects(req, approvalForSideEffects);
     }
 
-    res.json(redactApprovalPayload(approval));
+    res.status(httpStatus).json(body);
   });
 
   router.post("/approvals/:id/reject", validate(resolveApprovalSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    if (!(await requireApprovalAccess(req, id))) {
+    const existingApproval = await requireApprovalAccess(req, id);
+    if (!existingApproval) {
       res.status(404).json({ error: "Approval not found" });
       return;
     }
     const decidedByUserId = req.actor.userId ?? "board";
-    const { approval, applied } = await svc.reject(id, decidedByUserId, req.body.decisionNote);
+    const idempotencyKey = req.body.idempotencyKey as string | undefined;
 
-    if (applied) {
-      const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
-      const lostReviewIssueIds = await lostReviewPathIssueIds(approval.companyId, linkedIssues);
-      await logActivity(db, {
-        companyId: approval.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
-        action: "approval.rejected",
-        entityType: "approval",
-        entityId: approval.id,
-        details: { type: approval.type },
-      });
-      await queueAdditionalApprovalReviewPathWakes({
-        approvalId: approval.id,
-        approvalStatus: approval.status,
-        companyId: approval.companyId,
-        linkedIssues,
-        lostIssueIds: lostReviewIssueIds,
-        requestedByUserId: req.actor.userId ?? "board",
-      });
+    if (!idempotencyKey) {
+      const { approval, applied, outcome } = await svc.reject(id, decidedByUserId, req.body.decisionNote);
+
+      if (outcome === "expired") {
+        res.status(410).json({
+          error: "This approval has expired and can no longer be resolved",
+          reason: "approval_expired",
+          expiredAt: approval.expiresAt?.toISOString() ?? null,
+        });
+        return;
+      }
+      if (outcome === "conflict") {
+        res.status(409).json({
+          error: "This approval was already resolved to a different status",
+          reason: "already_resolved_conflict",
+          currentStatus: approval.status,
+        });
+        return;
+      }
+
+      if (applied) {
+        await logActivity(db, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: decidedByUserId,
+          action: "approval.rejected",
+          entityType: "approval",
+          entityId: approval.id,
+          details: { type: approval.type, ...boardKeySourceDetails(req) },
+        });
+        await runRejectSideEffects(req, approval);
+      }
+
+      res.json(projectApprovalResponse(approval));
+      return;
     }
 
-    res.json(redactApprovalPayload(approval));
+    const actorIdentity = actorIdentityFor(req);
+    const requestFingerprint = requestFingerprintFor({ decisionNote: req.body.decisionNote });
+
+    const fastPath = await checkApprovalIdempotency(db, {
+      actorIdentity, idempotencyKey, approvalId: id, action: "reject", requestFingerprint,
+    });
+    if (fastPath.kind === "key_reused_with_different_request") {
+      res.status(409).json({
+        error: "This idempotency key was already used with a different approval, action, or request body",
+        reason: "idempotency_key_reused",
+      });
+      return;
+    }
+    if (fastPath.kind === "replay") {
+      res.status(fastPath.httpStatus).json(fastPath.body);
+      return;
+    }
+
+    let applied = false;
+    let httpStatus = 200;
+    let body: unknown;
+    let approvalForSideEffects: ApprovalRecord | null = null;
+
+    await db.transaction(async (tx) => {
+      const claim = await claimApprovalIdempotency(tx as unknown as Db, {
+        companyId: existingApproval.companyId, actorIdentity, idempotencyKey, approvalId: id, action: "reject", requestFingerprint,
+      });
+
+      if (claim.kind === "lost_conflict") {
+        httpStatus = 409;
+        body = {
+          error: "This idempotency key was already used with a different approval, action, or request body",
+          reason: "idempotency_key_reused",
+        };
+        return;
+      }
+      if (claim.kind === "lost_replay") {
+        httpStatus = claim.httpStatus;
+        body = claim.body;
+        return;
+      }
+
+      const result = await approvalService(tx as unknown as Db).reject(id, decidedByUserId, req.body.decisionNote);
+      applied = result.applied;
+
+      if (result.outcome === "expired") {
+        httpStatus = 410;
+        body = {
+          error: "This approval has expired and can no longer be resolved",
+          reason: "approval_expired",
+          expiredAt: result.approval.expiresAt?.toISOString() ?? null,
+        };
+      } else if (result.outcome === "conflict") {
+        httpStatus = 409;
+        body = {
+          error: "This approval was already resolved to a different status",
+          reason: "already_resolved_conflict",
+          currentStatus: result.approval.status,
+        };
+      } else {
+        if (result.applied) {
+          await logActivity(tx as unknown as Db, {
+            companyId: result.approval.companyId,
+            actorType: "user",
+            actorId: decidedByUserId,
+            action: "approval.rejected",
+            entityType: "approval",
+            entityId: result.approval.id,
+            details: { type: result.approval.type, ...boardKeySourceDetails(req) },
+          });
+        }
+        httpStatus = 200;
+        body = projectApprovalResponse(result.approval);
+        approvalForSideEffects = result.approval;
+      }
+
+      await completeApprovalIdempotency(tx as unknown as Db, { claimId: claim.claimId, httpStatus, body });
+    });
+
+    if (applied && approvalForSideEffects) {
+      await runRejectSideEffects(req, approvalForSideEffects);
+    }
+
+    res.status(httpStatus).json(body);
   });
 
   router.post(
@@ -442,24 +709,126 @@ export function approvalRoutes(
     async (req, res) => {
       assertBoard(req);
       const id = req.params.id as string;
-      if (!(await requireApprovalAccess(req, id))) {
+      const existingApproval = await requireApprovalAccess(req, id);
+      if (!existingApproval) {
         res.status(404).json({ error: "Approval not found" });
         return;
       }
       const decidedByUserId = req.actor.userId ?? "board";
-      const approval = await svc.requestRevision(id, decidedByUserId, req.body.decisionNote);
+      const idempotencyKey = req.body.idempotencyKey as string | undefined;
 
-      await logActivity(db, {
-        companyId: approval.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
-        action: "approval.revision_requested",
-        entityType: "approval",
-        entityId: approval.id,
-        details: { type: approval.type },
+      if (!idempotencyKey) {
+        const { approval, applied, outcome } = await svc.requestRevision(id, decidedByUserId, req.body.decisionNote);
+
+        if (outcome === "expired") {
+          res.status(410).json({
+            error: "This approval has expired and can no longer be resolved",
+            reason: "approval_expired",
+            expiredAt: approval.expiresAt?.toISOString() ?? null,
+          });
+          return;
+        }
+        if (outcome === "conflict") {
+          res.status(409).json({
+            error: "This approval was already resolved to a different status",
+            reason: "already_resolved_conflict",
+            currentStatus: approval.status,
+          });
+          return;
+        }
+
+        if (applied) {
+          await logActivity(db, {
+            companyId: approval.companyId,
+            actorType: "user",
+            actorId: decidedByUserId,
+            action: "approval.revision_requested",
+            entityType: "approval",
+            entityId: approval.id,
+            details: { type: approval.type, ...boardKeySourceDetails(req) },
+          });
+        }
+
+        res.json(projectApprovalResponse(approval));
+        return;
+      }
+
+      const actorIdentity = actorIdentityFor(req);
+      const requestFingerprint = requestFingerprintFor({ decisionNote: req.body.decisionNote });
+
+      const fastPath = await checkApprovalIdempotency(db, {
+        actorIdentity, idempotencyKey, approvalId: id, action: "request_revision", requestFingerprint,
+      });
+      if (fastPath.kind === "key_reused_with_different_request") {
+        res.status(409).json({
+          error: "This idempotency key was already used with a different approval, action, or request body",
+          reason: "idempotency_key_reused",
+        });
+        return;
+      }
+      if (fastPath.kind === "replay") {
+        res.status(fastPath.httpStatus).json(fastPath.body);
+        return;
+      }
+
+      let httpStatus = 200;
+      let body: unknown;
+
+      await db.transaction(async (tx) => {
+        const claim = await claimApprovalIdempotency(tx as unknown as Db, {
+          companyId: existingApproval.companyId, actorIdentity, idempotencyKey, approvalId: id, action: "request_revision", requestFingerprint,
+        });
+
+        if (claim.kind === "lost_conflict") {
+          httpStatus = 409;
+          body = {
+            error: "This idempotency key was already used with a different approval, action, or request body",
+            reason: "idempotency_key_reused",
+          };
+          return;
+        }
+        if (claim.kind === "lost_replay") {
+          httpStatus = claim.httpStatus;
+          body = claim.body;
+          return;
+        }
+
+        const result = await approvalService(tx as unknown as Db).requestRevision(id, decidedByUserId, req.body.decisionNote);
+
+        if (result.outcome === "expired") {
+          httpStatus = 410;
+          body = {
+            error: "This approval has expired and can no longer be resolved",
+            reason: "approval_expired",
+            expiredAt: result.approval.expiresAt?.toISOString() ?? null,
+          };
+        } else if (result.outcome === "conflict") {
+          httpStatus = 409;
+          body = {
+            error: "This approval was already resolved to a different status",
+            reason: "already_resolved_conflict",
+            currentStatus: result.approval.status,
+          };
+        } else {
+          if (result.applied) {
+            await logActivity(tx as unknown as Db, {
+              companyId: result.approval.companyId,
+              actorType: "user",
+              actorId: decidedByUserId,
+              action: "approval.revision_requested",
+              entityType: "approval",
+              entityId: result.approval.id,
+              details: { type: result.approval.type, ...boardKeySourceDetails(req) },
+            });
+          }
+          httpStatus = 200;
+          body = projectApprovalResponse(result.approval);
+        }
+
+        await completeApprovalIdempotency(tx as unknown as Db, { claimId: claim.claimId, httpStatus, body });
       });
 
-      res.json(redactApprovalPayload(approval));
+      res.status(httpStatus).json(body);
     },
   );
 
@@ -495,7 +864,7 @@ export function approvalRoutes(
       entityId: approval.id,
       details: { type: approval.type },
     });
-    res.json(redactApprovalPayload(approval));
+    res.json(projectApprovalResponse(approval));
   });
 
   router.get("/approvals/:id/comments", async (req, res) => {
@@ -525,7 +894,7 @@ export function approvalRoutes(
       action: "approval.comment_added",
       entityType: "approval",
       entityId: approval.id,
-      details: { commentId: comment.id },
+      details: { commentId: comment.id, ...boardKeySourceDetails(req) },
     });
 
     res.status(201).json(comment);

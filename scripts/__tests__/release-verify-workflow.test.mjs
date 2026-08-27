@@ -60,6 +60,19 @@ test("candidate-branch betas are validated and fully verified before publish", (
   assert.match(releaseWorkflow, /needs\.verify_beta_candidate\.result == 'success'/);
 });
 
+test("post-publish beta smoke survives the skipped candidate-verification ancestor", () => {
+  const releaseWorkflow = readWorkflow("release.yml");
+
+  // publish_beta's needs chain contains verify_beta_candidate, which is
+  // skipped on promote-mode betas. An `if:` without a status-check function
+  // gets an implicit success() that evaluates that chain transitively and
+  // silently skips the smoke. The condition must stay explicit.
+  assert.match(
+    releaseWorkflow,
+    /smoke_beta:\n\s+needs: publish_beta\n\s+if: \$\{\{ !cancelled\(\) && needs\.publish_beta\.result == 'success' && !inputs\.dry_run \}\}/,
+  );
+});
+
 test("every lane's tag push degrades to recovery instructions when rejected", () => {
   const releaseWorkflow = readWorkflow("release.yml");
 
@@ -91,6 +104,7 @@ test("release verify workflow covers the same split test surface as stable PR ve
   assert.match(verifyWorkflow, /node \.\/scripts\/release-package-map\.mjs check/);
   assert.match(verifyWorkflow, /pnpm -r typecheck/);
   assert.match(verifyWorkflow, /pnpm build/);
+  assert.match(verifyWorkflow, /pnpm --filter @paperclipai\/paperclip-runner check:all/);
 
   for (const group of ["general-server", "general-workspaces-a", "general-workspaces-b"]) {
     assert.match(verifyWorkflow, new RegExp(`group: ${group}`));

@@ -771,13 +771,14 @@ describe("Secrets page layout", () => {
 
     expect(container.textContent).toContain("OPENAI_API_KEY");
     expect(container.textContent).toContain("Personal GitHub token");
-    expect(container.textContent).toContain("Company");
+    expect(container.textContent).toContain("Organization");
     expect(container.textContent).toContain("Each user");
     expect(container.textContent).toContain("3/5 set");
     expect(container.textContent).not.toContain("User secret definitions");
 
     const listContainer = container.querySelector('[data-testid="secrets-list-container"]');
     const tableView = container.querySelector('[data-testid="secrets-table-view"]');
+    expect(listContainer?.parentElement?.className).not.toContain("overflow-y-auto");
     const cardView = container.querySelector('[data-testid="secrets-card-view"]');
     expect(listContainer?.className).toContain("@container");
     expect(tableView?.className).toContain("@min-[40rem]:block");

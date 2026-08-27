@@ -15,6 +15,12 @@
 //   - `http/json`        → @opentelemetry/exporter-trace-otlp-http
 // Any other value logs a warning and falls back to grpc.
 //
+// Before it imports any package, the bootstrap checks the four common
+// packages and the selected exporter against the exact versions this
+// manifest's `peerDependencies` declare. A missing or a mismatched version
+// logs one diagnostic and leaves the server running without tracing; it
+// never throws.
+//
 // Timing guarantee: the bootstrap is async (dynamic imports), so it cannot
 // patch modules "before they are evaluated" — by the time the first await
 // yields, index.ts's static imports (http, express, pg) are already loaded.
@@ -26,7 +32,10 @@
 // exit via `shutdownInstrumentation()`, which index.ts awaits in its signal
 // handler before `process.exit`.
 
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 
 const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
 
@@ -272,6 +281,20 @@ export function recordProviderPluginSpan(input: {
 }
 
 /**
+ * The four OTel packages that every protocol needs, regardless of which
+ * exporter `OTEL_EXPORTER_OTLP_PROTOCOL` selects. `bootstrapOtel` reads this
+ * synchronously (before its first `await`), so it must be declared above
+ * `instrumentationReady`: that export calls `bootstrapOtel` at module-init
+ * time, and a `const` declared below it is not yet initialized then.
+ */
+const OTEL_COMMON_PACKAGES = [
+  "@opentelemetry/sdk-node",
+  "@opentelemetry/auto-instrumentations-node",
+  "@opentelemetry/resources",
+  "@opentelemetry/semantic-conventions",
+] as const;
+
+/**
  * Resolves once the OTel SDK has started (or once bootstrap has failed and
  * logged, or immediately when the feature is off). Await before constructing
  * the HTTP server so trace coverage doesn't depend on incidental timing.
@@ -338,6 +361,112 @@ export function resolveProtocol(): {
   }
 }
 
+/**
+ * Read this package's own `peerDependencies`, so the exact-version gate
+ * compares an installed package against the same version this manifest
+ * declares — one source of truth, not a second hardcoded copy. Returns an
+ * empty map on any read or parse failure (fail open: an unreadable manifest
+ * skips the version check rather than blocking startup).
+ */
+function readOwnPeerDependencies(): Record<string, string> {
+  try {
+    const pkgUrl = new URL("../package.json", import.meta.url);
+    const raw = readFileSync(pkgUrl, "utf8");
+    const parsed = JSON.parse(raw) as { peerDependencies?: Record<string, string> };
+    return parsed.peerDependencies ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Read an installed package's own declared `version`, without importing or
+ * executing the package. Resolves the package's main entry point (which
+ * respects its `exports` map) and then walks up the filesystem to the
+ * nearest `package.json` whose `name` matches — a direct
+ * `require.resolve(\`${packageName}/package.json\`)` throws for a package
+ * whose `exports` map does not expose `./package.json` as a subpath, which
+ * several `@opentelemetry/*` packages do not, even though the package is
+ * correctly installed. Returns null when the package cannot be resolved or no
+ * matching `package.json` is found.
+ */
+function readInstalledPackageVersion(packageName: string): string | null {
+  try {
+    const require = createRequire(import.meta.url);
+    let dir = dirname(require.resolve(packageName));
+    for (;;) {
+      const candidate = join(dir, "package.json");
+      if (existsSync(candidate)) {
+        const parsed = JSON.parse(readFileSync(candidate, "utf8")) as {
+          name?: unknown;
+          version?: unknown;
+        };
+        if (parsed.name === packageName) {
+          return typeof parsed.version === "string" ? parsed.version : null;
+        }
+      }
+      const parent = dirname(dir);
+      if (parent === dir) return null;
+      dir = parent;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Verify that every package in `packageNames` is installed at the exact
+ * version `peerDependencies` declares. Checks only the packages the caller
+ * passes in — the bootstrap passes the four common packages plus the one
+ * exporter `OTEL_EXPORTER_OTLP_PROTOCOL` selected, never the two unselected
+ * exporters. Never throws: a missing manifest, a missing package, or an
+ * unreadable `package.json` all resolve to a reported issue, not an
+ * exception.
+ *
+ * `peerDependencies` defaults to this manifest's own declared versions
+ * (`readOwnPeerDependencies()`), which is what the bootstrap uses. A test
+ * passes an explicit map instead, so it can check the comparison logic
+ * against a package it controls without writing into `node_modules`.
+ */
+export function checkExactPeerVersions(
+  packageNames: readonly string[],
+  peerDependencies: Record<string, string> = readOwnPeerDependencies(),
+): { ok: true } | { ok: false; diagnostic: string; detail: unknown } {
+  const missing: string[] = [];
+  const mismatched: { name: string; installed: string; expected: string }[] = [];
+
+  for (const name of packageNames) {
+    const expected = peerDependencies[name];
+    const installed = readInstalledPackageVersion(name);
+    if (installed === null) {
+      missing.push(name);
+    } else if (expected && installed !== expected) {
+      mismatched.push({ name, installed, expected });
+    }
+  }
+
+  if (missing.length === 0 && mismatched.length === 0) return { ok: true };
+
+  const parts: string[] = [];
+  if (missing.length > 0) {
+    parts.push(`the @opentelemetry/* packages are not installed: ${missing.join(", ")}`);
+  }
+  if (mismatched.length > 0) {
+    const detail = mismatched
+      .map((m) => `${m.name}@${m.installed} (expected ${m.expected})`)
+      .join(", ");
+    parts.push(`a package is installed at an unsupported version: ${detail}`);
+  }
+
+  return {
+    ok: false,
+    diagnostic:
+      `[paperclip] OTEL_EXPORTER_OTLP_ENDPOINT is set but ${parts.join("; and ")}. ` +
+      "Continuing without tracing.",
+    detail: { missing, mismatched },
+  };
+}
+
 async function importExporter(protocol: ExporterProtocol): Promise<{
   OTLPTraceExporter: new (config?: Record<string, unknown>) => unknown;
 }> {
@@ -354,8 +483,85 @@ async function importExporter(protocol: ExporterProtocol): Promise<{
   }
 }
 
+/**
+ * Read the commit SHA from the build stamp. The server `build` script writes
+ * `dist/build-info.json` next to the compiled module. Return the SHA, or null
+ * when the stamp is absent or unreadable. In `tsx` dev mode the module runs
+ * from `src`, where no stamp exists, so this returns null and the caller falls
+ * back to a runtime git lookup.
+ */
+export function readBuildStamp(): string | null {
+  try {
+    const stampUrl = new URL("./build-info.json", import.meta.url);
+    const raw = readFileSync(stampUrl, "utf8");
+    const parsed = JSON.parse(raw) as { commit?: unknown };
+    if (typeof parsed.commit === "string" && parsed.commit.length > 0) {
+      return parsed.commit;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the current commit SHA with `git rev-parse --short HEAD`. Return the
+ * SHA, or null on any failure. This covers dev mode, where the process runs
+ * from a git checkout. A missing `git` or a checkout with no `.git` returns
+ * null and is not fatal.
+ *
+ * The lookup runs in the directory of this module, not the directory the
+ * server process started in. `import.meta.url` points at `src` in dev mode and
+ * `dist` in a built server; both sit inside the Paperclip checkout. A server
+ * launched from an unrelated directory, or from inside another repository,
+ * would otherwise report a wrong commit or fall back.
+ */
+export function readGitCommit(): string | null {
+  try {
+    const out = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+      cwd: new URL("./", import.meta.url),
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the `service.version` span attribute. The order is:
+ *   1. The build stamp — the commit the running server was built from.
+ *   2. A runtime git lookup — covers `tsx src/index.ts` dev mode.
+ *   3. The `OTEL_SERVICE_VERSION` environment variable.
+ *   4. "unknown".
+ * The build stamp wins over the environment variable, so a stale
+ * `OTEL_SERVICE_VERSION` cannot mask the true built commit. `OTEL_SERVICE_VERSION`
+ * is a Paperclip-specific variable, not an OpenTelemetry SDK variable, so
+ * Paperclip controls this precedence.
+ */
+export function resolveServiceVersion(
+  buildStamp: string | null,
+  gitCommit: string | null,
+  envVersion: string | undefined,
+): string {
+  return buildStamp || gitCommit || envVersion || "unknown";
+}
+
 async function bootstrapOtel(endpoint: string): Promise<void> {
   const { protocol, packageName: exporterPackage } = resolveProtocol();
+
+  // Gate on exact peer versions before touching a single dynamic import: a
+  // package installed at the wrong version can still load and start, then
+  // fail in a way the operator only sees in the collector, not the server
+  // log. Checking first turns that into one precise, fail-open diagnostic.
+  const versionCheck = checkExactPeerVersions([...OTEL_COMMON_PACKAGES, exporterPackage]);
+  if (!versionCheck.ok) {
+    // eslint-disable-next-line no-console
+    console.warn(versionCheck.diagnostic, versionCheck.detail);
+    return;
+  }
 
   try {
     // Dynamic imports so type-resolution doesn't require the packages to
@@ -379,10 +585,19 @@ async function bootstrapOtel(endpoint: string): Promise<void> {
     const { resourceFromAttributes } = resources;
     const { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } = semconv;
 
+    const serviceVersion = resolveServiceVersion(
+      readBuildStamp(),
+      readGitCommit(),
+      process.env.OTEL_SERVICE_VERSION,
+    );
+    // Log the resolved value once so an operator can confirm the built commit.
+    // eslint-disable-next-line no-console
+    console.log(`[paperclip] OpenTelemetry service.version=${serviceVersion}`);
+
     const sdk = new NodeSDK({
       resource: resourceFromAttributes({
         [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME || "paperclip",
-        [ATTR_SERVICE_VERSION]: process.env.OTEL_SERVICE_VERSION || "unknown",
+        [ATTR_SERVICE_VERSION]: serviceVersion,
       }),
       // For the HTTP protocols OTEL_EXPORTER_OTLP_ENDPOINT is a *base* URL
       // and the exporter appends /v1/traces only when it reads the env var
@@ -440,14 +655,16 @@ async function bootstrapOtel(endpoint: string): Promise<void> {
     process.once("SIGTERM", () => void shutdownInstrumentation());
     process.once("SIGINT", () => void shutdownInstrumentation());
   } catch (err) {
-    // OTel packages not installed, or dynamic import failed. Fall through
-    // with a single diagnostic so the opt-in path is self-documenting.
+    // The exact-version gate above already confirmed every checked package is
+    // installed at the declared version, so only a load failure after that
+    // point reaches this block: a bad build, a broken native binding, or a
+    // package that throws during its own module init. Fall through with a
+    // single diagnostic so the opt-in path is self-documenting.
     // eslint-disable-next-line no-console
     console.warn(
-      "[paperclip] OTEL_EXPORTER_OTLP_ENDPOINT is set but the @opentelemetry/* " +
-        `packages are not installed. Install @opentelemetry/sdk-node, ` +
-        `@opentelemetry/auto-instrumentations-node, ${exporterPackage}, ` +
-        `@opentelemetry/resources, and @opentelemetry/semantic-conventions to enable tracing.`,
+      "[paperclip] OTEL_EXPORTER_OTLP_ENDPOINT is set and the @opentelemetry/* " +
+        "packages passed the version check, but one of them failed to load. " +
+        "Continuing without tracing.",
       err,
     );
   }

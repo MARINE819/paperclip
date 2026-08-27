@@ -4,21 +4,23 @@ import { multilineTextSchema } from "./text.js";
 
 export const createApprovalSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
-  requestedByAgentId: z.string().uuid().optional().nullable(),
+  requestedByAgentId: z.string().guid().optional().nullable(),
   payload: z.record(z.string(), z.unknown()),
-  issueIds: z.array(z.string().uuid()).optional(),
+  issueIds: z.array(z.string().guid()).optional(),
 });
 
 export type CreateApproval = z.infer<typeof createApprovalSchema>;
 
 export const resolveApprovalSchema = z.object({
   decisionNote: multilineTextSchema.optional().nullable(),
+  idempotencyKey: z.string().trim().min(1).max(200).optional(),
 });
 
 export type ResolveApproval = z.infer<typeof resolveApprovalSchema>;
 
 export const requestApprovalRevisionSchema = z.object({
   decisionNote: multilineTextSchema.optional().nullable(),
+  idempotencyKey: z.string().trim().min(1).max(200).optional(),
 });
 
 export type RequestApprovalRevision = z.infer<typeof requestApprovalRevisionSchema>;

@@ -10,11 +10,10 @@ const ADMIN_PASSWORD =
   "paperclip-smoke-password";
 
 const COMPANY_NAME = `Release-Smoke-${Date.now()}`;
-const MISSION = "Ship a reliable release smoke suite for Paperclip.";
 const AGENT_NAME = "CEO";
 // Seeded by the wizard's launch step (DEFAULT_TASK_TITLE in
 // ui/src/components/OnboardingWizard.tsx).
-const FIRST_TASK_TITLE = "Hire your first engineer and create a hiring plan";
+const FIRST_TASK_TITLE = "Paperclip onboarding";
 
 async function signIn(page: Page) {
   await page.goto("/");
@@ -28,7 +27,7 @@ async function signIn(page: Page) {
 }
 
 async function openOnboarding(page: Page) {
-  const wizardHeading = page.locator("h3", { hasText: "Name your company" });
+  const wizardHeading = page.locator("h3", { hasText: "Name your organization" });
   const startButton = page.getByRole("button", { name: "Start Onboarding" });
 
   await expect(wizardHeading.or(startButton)).toBeVisible({ timeout: 20_000 });
@@ -47,44 +46,38 @@ test.describe("Docker authenticated onboarding smoke", () => {
     await signIn(page);
     await openOnboarding(page);
 
-    // Step 1: name the company.
+    // Step 1: name the company. "Next" creates the company itself and routes
+    // straight to the agent step — onboarding no longer asks for the mission
+    // (it is collected later, in the tenant app), so there is no step 2.
     await page.locator('input[placeholder="Acme Corp"]').fill(COMPANY_NAME);
     await page.getByRole("button", { name: "Next" }).click();
 
-    // Step 2: define the mission directly; confirming creates the company.
-    await expect(
-      page.locator("h3", { hasText: "Define your mission" })
-    ).toBeVisible({ timeout: 10_000 });
-    await page.getByRole("button", { name: "I know my mission" }).click();
-    await page
-      .locator('textarea[placeholder="What is your team trying to achieve?"]')
-      .fill(MISSION);
-    await page.getByRole("button", { name: "Confirm mission" }).click();
-
-    // Step 3: name the team lead.
-    const leadNameInput = page.locator('input[placeholder="Chief of staff"]');
-    await expect(leadNameInput).toBeVisible({ timeout: 20_000 });
-    await leadNameInput.fill(AGENT_NAME);
+    // Step 3: give the team lead a role, then a name. The role gates "Next".
+    const roleSelect = page.locator("#onboarding-agent-role");
+    await expect(roleSelect).toBeVisible({ timeout: 20_000 });
+    await roleSelect.click();
+    await page.getByRole("option", { name: "CEO", exact: true }).click();
+    await page.locator("#onboarding-agent-name").fill(AGENT_NAME);
     await page.getByRole("button", { name: "Next" }).click();
 
-    // Step 4: keep the default adapter and hire the lead. The adapter
-    // environment test runs inside the smoke container, where no agent CLIs
-    // are installed; an unhealthy report is expected and must not block the
-    // hire. Allow generous time for the env probe + hire + auto-approval.
-    const heartbeatButton = page.getByRole("button", {
-      name: "Give it a heartbeat",
-    });
-    await expect(heartbeatButton).toBeVisible({ timeout: 10_000 });
-    await expect(heartbeatButton).toBeEnabled({ timeout: 30_000 });
-    await heartbeatButton.click();
+    // Step 4: keep the default adapter and connect (hire) the lead. The
+    // adapter environment check runs inside the smoke container, where no
+    // agent CLIs are installed; an unhealthy report is expected and must not
+    // block the hire. Allow generous time for the env probe + hire +
+    // auto-approval.
+    const connectButton = page.getByRole("button", { name: "Connect" });
+    await expect(connectButton).toBeVisible({ timeout: 10_000 });
+    await expect(connectButton).toBeEnabled({ timeout: 30_000 });
+    await connectButton.click();
 
     // Step 5: review, then launch. "Get started" provisions the onboarding
-    // goal/project and navigates to the dashboard only on success.
+    // goal/project/first task and, only on success, drops the user into the
+    // seeded first task's thread (not the dashboard).
     const getStartedButton = page.getByRole("button", { name: "Get started" });
     await expect(getStartedButton).toBeVisible({ timeout: 60_000 });
     await expect(getStartedButton).toBeEnabled({ timeout: 10_000 });
     await getStartedButton.click();
-    await expect(page).toHaveURL(/\/dashboard/, { timeout: 30_000 });
+    await expect(page).toHaveURL(/\/issues\//, { timeout: 30_000 });
 
     const baseUrl = new URL(page.url()).origin;
 
@@ -109,25 +102,15 @@ test.describe("Docker authenticated onboarding smoke", () => {
     expect(ceoAgent!.role).toBe("ceo");
     expect(ceoAgent!.adapterType).not.toBe("process");
 
+    // Onboarding deliberately writes no goal: the mission is collected later
+    // in the tenant app, so a fresh company must come out of the wizard with
+    // an empty goal list rather than an unchosen one.
     const goalsRes = await page.request.get(
       `${baseUrl}/api/companies/${company!.id}/goals`
     );
     expect(goalsRes.ok()).toBe(true);
-    const goals = (await goalsRes.json()) as Array<{
-      id: string;
-      title: string;
-      level: string;
-      status: string;
-    }>;
-    expect(goals).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          title: MISSION,
-          level: "company",
-          status: "active",
-        }),
-      ])
-    );
+    const goals = (await goalsRes.json()) as Array<{ id: string }>;
+    expect(goals).toEqual([]);
 
     const issuesRes = await page.request.get(
       `${baseUrl}/api/companies/${company!.id}/issues`
@@ -135,12 +118,20 @@ test.describe("Docker authenticated onboarding smoke", () => {
     expect(issuesRes.ok()).toBe(true);
     const issues = (await issuesRes.json()) as Array<{
       id: string;
+      identifier: string | null;
       title: string;
       assigneeAgentId: string | null;
     }>;
     const seededIssue = issues.find((entry) => entry.title === FIRST_TASK_TITLE);
     expect(seededIssue).toBeTruthy();
     expect(seededIssue!.assigneeAgentId).toBe(ceoAgent!.id);
+
+    // The launch must have landed on the seeded task itself, not merely on
+    // some issue route.
+    const seededRef = seededIssue!.identifier ?? seededIssue!.id;
+    expect(new URL(page.url()).pathname.endsWith(`/issues/${seededRef}`)).toBe(
+      true
+    );
 
     await expect.poll(
       async () => {

@@ -116,6 +116,26 @@ describe("GET /health", () => {
     });
   });
 
+  it("lists operator-hidden settings and drops unknown keys", async () => {
+    const app = createApp(undefined, testServerInfo, undefined, {
+      PAPERCLIP_HIDDEN_SETTINGS: "instance.plugins,instance.adapters,instance.bogus",
+    });
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.hiddenSettings).toEqual(["instance.plugins", "instance.adapters"]);
+  });
+
+  it("omits hiddenSettings entirely when nothing is hidden", async () => {
+    const app = createApp(undefined, testServerInfo, undefined, {});
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(Object.prototype.hasOwnProperty.call(res.body, "hiddenSettings")).toBe(false);
+  });
+
   it("returns 200 when the database probe succeeds", async () => {
     const db = {
       execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
@@ -543,5 +563,129 @@ describe("GET /health", () => {
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
     });
+  });
+});
+
+describe("GET /health/ready", () => {
+  function createReadinessApp(input: {
+    db?: Db;
+    deploymentMode?: "local_trusted" | "authenticated";
+    authReady?: boolean;
+    heartbeatSchedulerStatus?: "ready" | "disabled" | "not_ready";
+    databaseBackupHealth?: Parameters<typeof healthRoutes>[1]["databaseBackupHealth"];
+  } = {}) {
+    const app = express();
+    app.use(
+      "/health",
+      healthRoutes(input.db, {
+        deploymentMode: input.deploymentMode ?? "local_trusted",
+        deploymentExposure: "private",
+        authReady: input.authReady ?? true,
+        companyDeletionEnabled: true,
+        heartbeatSchedulerStatus: input.heartbeatSchedulerStatus,
+        databaseBackupHealth: input.databaseBackupHealth,
+        runtimeEnv: {},
+      }),
+    );
+    return app;
+  }
+
+  function createAuthenticatedDb(adminCount: number): Db {
+    return {
+      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn().mockResolvedValue([{ count: adminCount }]),
+        })),
+      })),
+    } as unknown as Db;
+  }
+
+  it("returns ready only when every mandatory dependency is satisfied", async () => {
+    const app = createReadinessApp({
+      db: createAuthenticatedDb(1),
+      deploymentMode: "authenticated",
+      authReady: true,
+      heartbeatSchedulerStatus: "ready",
+    });
+
+    const res = await request(app).get("/health/ready");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: "ready" });
+  });
+
+  it.each([
+    {
+      name: "an unconfigured database",
+      app: () => createReadinessApp(),
+      error: "database_unconfigured",
+    },
+    {
+      name: "an unreachable database",
+      app: () => createReadinessApp({
+        db: { execute: vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED")) } as unknown as Db,
+      }),
+      error: "database_unreachable",
+    },
+    {
+      name: "authentication initialization",
+      app: () => createReadinessApp({
+        db: createAuthenticatedDb(1),
+        deploymentMode: "authenticated",
+        authReady: false,
+        heartbeatSchedulerStatus: "ready",
+      }),
+      error: "authentication_not_ready",
+    },
+    {
+      name: "instance bootstrap",
+      app: () => createReadinessApp({
+        db: createAuthenticatedDb(0),
+        deploymentMode: "authenticated",
+        authReady: true,
+        heartbeatSchedulerStatus: "ready",
+      }),
+      error: "bootstrap_pending",
+    },
+    {
+      name: "the configured heartbeat scheduler",
+      app: () => createReadinessApp({
+        db: createAuthenticatedDb(1),
+        deploymentMode: "authenticated",
+        authReady: true,
+        heartbeatSchedulerStatus: "not_ready",
+      }),
+      error: "heartbeat_scheduler_not_ready",
+    },
+  ])("returns not ready when missing $name", async ({ app: buildApp, error }) => {
+    const res = await request(buildApp()).get("/health/ready");
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ status: "not_ready", error });
+  });
+
+  it("does not let optional dependencies block readiness", async () => {
+    const app = createReadinessApp({
+      db: createHealthyDb(),
+      heartbeatSchedulerStatus: "disabled",
+      databaseBackupHealth: {
+        enabled: true,
+        backupDir: path.join(os.tmpdir(), "missing-paperclip-readiness-backups"),
+        maxAgeHours: 1,
+      },
+    });
+
+    const res = await request(app).get("/health/ready");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: "ready" });
+  });
+
+  it("preserves the existing successful local readiness case", async () => {
+    const res = await request(createReadinessApp({ db: createHealthyDb() })).get("/health/ready");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: "ready" });
   });
 });

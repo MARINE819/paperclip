@@ -6,6 +6,7 @@ import {
   GripVertical,
   LogOut,
   Plus,
+  RefreshCw,
   UserPlus,
 } from "lucide-react";
 import {
@@ -198,7 +199,8 @@ function SortableCompanyItem({
 export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: SidebarCompanyMenuProps = {}) {
   const [internalOpen, setInternalOpen] = useState(false);
   const [isEditingOrder, setIsEditingOrder] = useState(false);
-  const { companies, selectedCompany, setSelectedCompanyId } = useCompany();
+  const { companies, selectedCompany, setSelectedCompanyId, companyListUnavailable, retryCompanies } =
+    useCompany();
   const { openOnboarding } = useDialogActions();
   const { isMobile, setSidebarOpen, collapsed, peeking } = useSidebar();
   const rail = collapsed && !peeking;
@@ -249,7 +251,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
       ?? null
     : null;
   const createStackUrl = isCloud ? cloudStackCreateUrl(cloudBaseUrl) : null;
-  const switcherNoun = isCloud ? "organization" : "company";
+  const switcherNoun = "organization";
   // The one name the chrome shows for "where am I": the stack in cloud, the
   // company when self-hosted.
   const currentName = isCloud
@@ -366,7 +368,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
               )}
               title={currentName ?? undefined}
             >
-              {currentName ?? (isCloud ? "Select organization" : "Select company")}
+              {currentName ?? `Select ${switcherNoun}`}
             </span>
           </span>
           {!rail && <ChevronsUpDown className="size-3.5 shrink-0 text-muted-foreground" />}
@@ -375,7 +377,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
       <DropdownMenuContent align="start" sideOffset={8} className="w-64 p-1">
         <div className="flex items-center justify-between gap-2 px-2 py-1.5">
           <DropdownMenuLabel className="p-0 text-(length:--text-micro) font-semibold uppercase text-muted-foreground">
-            {isCloud ? "Switch organization" : "Switch company"}
+            {`Switch ${switcherNoun}`}
           </DropdownMenuLabel>
           {/* Stack order is owned by cloud's own portfolio in v1, so the
               drag-to-reorder affordance stays self-hosted-only. */}
@@ -437,7 +439,27 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
                 </SortableContext>
               </DndContext>
               {orderedCompanies.length === 0 ? (
-                <DropdownMenuItem disabled>No companies</DropdownMenuItem>
+                // "No companies" is a claim about the account. After a failed
+                // list request it is one we cannot make, and this menu is the
+                // only place the customer can act on it — say what happened and
+                // offer the way back.
+                companyListUnavailable ? (
+                  <>
+                    <DropdownMenuItem disabled>Couldn&apos;t load organizations</DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={(event) => {
+                        // Keep the menu open so the result of the retry is visible.
+                        event.preventDefault();
+                        void retryCompanies();
+                      }}
+                    >
+                      <RefreshCw className="h-4 w-4 mr-2" />
+                      Try again
+                    </DropdownMenuItem>
+                  </>
+                ) : (
+                  <DropdownMenuItem disabled>No organizations</DropdownMenuItem>
+                )
               ) : null}
             </>
           )}

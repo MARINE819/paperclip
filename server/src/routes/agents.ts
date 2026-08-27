@@ -29,6 +29,9 @@ import {
   updateAgentSchema,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
+  startAdapterAuthSessionRequestSchema,
+  startClaudeSetupTokenSessionRequestSchema,
+  submitBrowserCodeRequestSchema,
 } from "@paperclipai/shared";
 import {
   isForbiddenConfigEnvKey,
@@ -55,10 +58,15 @@ import {
   logActivity,
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
+  resolveAgentEffectiveConfig,
+  calculateConfigSnapshotHash,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
-import { assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
+import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -67,6 +75,7 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import { resolvePluginSandboxProviderDriverByKey } from "../services/plugin-environment-driver.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type {
   AdapterEnvironmentCheck,
@@ -103,16 +112,34 @@ import {
   assessConfidentialStartup,
   evaluateConfidentialTransport,
   SETUP_TOKEN_START_FAILED,
-  SETUP_TOKEN_TRANSPORT_INSECURE,
+  SETUP_TOKEN_SESSION_NOT_FOUND,
+  SETUP_TOKEN_PROVIDER_UNSUPPORTED,
+  SETUP_TOKEN_PROVIDER_UNSUPPORTED_CODE,
   type ConfidentialTransportConfig,
   type SetupTokenCleanupRecord,
   type SetupTokenCleanupStore,
   type SetupTokenLease,
   type SetupTokenLeaseManager,
   type SetupTokenLoginProcessFactory,
+  type SetupTokenSecretWriter,
   type SetupTokenSessionScope,
+  type SetupTokenSessionState,
+  type SetupTokenSessionDescriptor,
+  SETUP_TOKEN_ADAPTER_TYPE,
 } from "../services/setup-token-session.js";
-import type { DeploymentMode } from "@paperclipai/shared";
+import type {
+  DeploymentMode,
+  AdapterAuthSessionStatus,
+  AdapterAuthSessionFailure,
+  ClaudeSetupTokenSessionResponse,
+  ClaudeSetupTokenSessionOwnerResponse,
+  ClaudeSetupTokenSessionPrompt,
+  ClaudeSetupTokenCompletionResponse,
+  ClaudeOAuthTokenStatusResponse,
+  ClaudeSetupTokenOverwrite,
+  SetupTokenTransportAdvisory,
+} from "@paperclipai/shared";
+import { SETUP_TOKEN_TRANSPORT_ADVISORY_CODE } from "@paperclipai/shared";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
 import {
   checkStagedCredentialReadiness,
@@ -120,14 +147,17 @@ import {
 } from "@paperclipai/adapter-codex-local/server";
 import {
   AdapterAuthSessionConflictError,
-  CODEX_DEVICE_LOGIN_ADAPTER_TYPE,
   createCodexDeviceLoginService,
+  createCodexWorkerBoundLoginPtyOpener,
   createDbAdapterAuthSessionStore,
   createProductionLoginSessionRuntime,
+  CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED,
+  CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED_CODE,
 } from "../services/codex-device-login-service.js";
 import type { AdapterAuthSessionOwnerResponse } from "@paperclipai/shared";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
+import { DEFAULT_KIMI_LOCAL_MODEL } from "@paperclipai/adapter-kimi-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
 import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/server";
 import {
@@ -215,6 +245,13 @@ export function agentRoutes(
      */
     confidentialProxyAllowlist?: string[];
     /**
+     * The explicit operator declaration that a platform edge terminates TLS for
+     * every client request (SR-7). Set from `CLAUDE_LOGIN_EDGE_TLS_TERMINATED`.
+     * Use it on a managed PaaS where the app socket is always plain HTTP and
+     * the edge-proxy peer addresses cannot be allowlisted.
+     */
+    confidentialEdgeTlsTerminated?: boolean;
+    /**
      * Receives the setup-token login session service once the router builds it.
      * The caller registers the startup reaper and the graceful-shutdown cleanup.
      */
@@ -233,6 +270,11 @@ export function agentRoutes(
       leases: SetupTokenLeaseManager;
       /** The durable cleanup store. Defaults to the in-memory record store. */
       store?: SetupTokenCleanupStore;
+      /**
+       * The owner-bound secret writer. When the caller omits it, the completion
+       * fails closed, because the secret sink is not bound yet.
+       */
+      completeCredential?: SetupTokenSecretWriter;
     };
   } = {},
 ) {
@@ -243,6 +285,7 @@ export function agentRoutes(
     codex_local: "instructionsFilePath",
     droid_local: "instructionsFilePath",
     gemini_local: "instructionsFilePath",
+    kimi_local: "instructionsFilePath",
     opencode_local: "instructionsFilePath",
     cursor: "instructionsFilePath",
     pi_local: "instructionsFilePath",
@@ -300,6 +343,7 @@ export function agentRoutes(
   const setupTokenConfidentialConfig: ConfidentialTransportConfig = {
     deploymentMode: options.deploymentMode ?? "local_trusted",
     trustedProxies: options.confidentialProxyAllowlist ?? [],
+    edgeTlsTerminated: options.confidentialEdgeTlsTerminated ?? false,
   };
 
   // Rate-limit the start route: a small window per company and owner (SR-4).
@@ -325,19 +369,44 @@ export function agentRoutes(
   // The in-memory non-secret cleanup record store. It is the default store when a
   // caller does not inject a durable database-backed store.
   const setupTokenCleanupRows = new Map<string, SetupTokenCleanupRecord>();
+  const scopeMatchesRow = (row: SetupTokenCleanupRecord, identity: {
+    companyId: string;
+    ownerUserId: string;
+    adapterType: string;
+  }): boolean =>
+    row.companyId === identity.companyId &&
+    row.ownerUserId === identity.ownerUserId &&
+    row.adapterType === identity.adapterType;
   const inMemorySetupTokenCleanupStore: SetupTokenCleanupStore = {
     async record(record): Promise<void> {
       setupTokenCleanupRows.set(record.sessionId, { ...record });
     },
-    async markState(sessionId, state): Promise<void> {
-      const row = setupTokenCleanupRows.get(sessionId);
-      if (row) row.state = state;
+    async markState(identity, state): Promise<void> {
+      const row = setupTokenCleanupRows.get(identity.sessionId);
+      if (row && scopeMatchesRow(row, identity)) row.state = state;
     },
-    async remove(sessionId): Promise<void> {
-      setupTokenCleanupRows.delete(sessionId);
+    async remove(identity): Promise<void> {
+      // The delete matches the full owner scope, so it never removes a row by the
+      // session id alone.
+      const row = setupTokenCleanupRows.get(identity.sessionId);
+      if (row && scopeMatchesRow(row, identity)) setupTokenCleanupRows.delete(identity.sessionId);
     },
     async listReapable(): Promise<SetupTokenCleanupRecord[]> {
       return [];
+    },
+    async consumeStoredClaim(identity): Promise<SetupTokenCleanupRecord | null> {
+      const row = setupTokenCleanupRows.get(identity.sessionId);
+      if (
+        !row ||
+        !scopeMatchesRow(row, identity) ||
+        row.state !== "stored" ||
+        row.boundAt !== null ||
+        row.deadline <= Date.now()
+      ) {
+        return null;
+      }
+      row.boundAt = Date.now();
+      return { ...row };
     },
   };
 
@@ -347,19 +416,49 @@ export function agentRoutes(
     throw new SetupTokenSessionError(503, SETUP_TOKEN_START_FAILED);
   };
 
-  // Resolve the transport: use the injected factory, lease manager, and store
-  // when a caller binds them; otherwise use the deferred, fail-closed defaults.
+  const deferredSetupTokenSecretWriter: SetupTokenSecretWriter = async () => {
+    // The owner-bound secret writer arrives through `options.setupTokenLogin`.
+    // Until then the completion fails closed, so the session never reports a
+    // stored credential without a real secret write.
+    throw new SetupTokenSessionError(503, SETUP_TOKEN_START_FAILED);
+  };
+
+  // Resolve the transport: use the injected factory, lease manager, store, and
+  // secret writer when a caller binds them; otherwise use the deferred,
+  // fail-closed defaults.
   const setupTokenLoginFactory =
     options.setupTokenLogin?.factory ?? deferredSetupTokenLoginFactory;
   const setupTokenLeaseManager =
     options.setupTokenLogin?.leases ?? deferredSetupTokenLeaseManager;
   const setupTokenCleanupStore =
     options.setupTokenLogin?.store ?? inMemorySetupTokenCleanupStore;
+  const setupTokenSecretWriter =
+    options.setupTokenLogin?.completeCredential ?? deferredSetupTokenSecretWriter;
+
+  // Re-check the environment company binding at lease acquisition. The start
+  // route runs `assertSandboxLoginEnvironment` before the session begins, but
+  // managed-environment reconciliation can bind the sandbox to another company
+  // between that guard and the lease acquire. This wrapper re-runs the same
+  // guard at acquire time and fails closed with the 403
+  // `environment_company_mismatch` before the transport provisions a sandbox.
+  // The lease insert transaction re-checks the binding once more inside the
+  // insert, so a bind that lands during the provider call still holds no lease.
+  const guardedSetupTokenLeaseManager: SetupTokenLeaseManager = {
+    async acquire(input): Promise<SetupTokenLease> {
+      await assertSandboxLoginEnvironment(input.scope.companyId, input.scope.environmentId, {
+        requireSetupTokenLoginProvider: true,
+      });
+      return setupTokenLeaseManager.acquire(input);
+    },
+    release: (lease) => setupTokenLeaseManager.release(lease),
+    releaseById: (leaseId) => setupTokenLeaseManager.releaseById(leaseId),
+  };
 
   const setupTokenLoginService = new SetupTokenSessionService({
     factory: setupTokenLoginFactory,
-    leases: setupTokenLeaseManager,
+    leases: guardedSetupTokenLeaseManager,
     store: setupTokenCleanupStore,
+    completeCredential: setupTokenSecretWriter,
     rateLimiter: setupTokenRateLimiter,
   });
 
@@ -399,7 +498,28 @@ export function agentRoutes(
   const adapterLoginStore = createDbAdapterAuthSessionStore(db);
   const adapterLoginService = createCodexDeviceLoginService({
     store: adapterLoginStore,
-    runtime: createProductionLoginSessionRuntime({ db, environmentRuntime }),
+    runtime: createProductionLoginSessionRuntime({
+      db,
+      environmentRuntime,
+      // Re-check the provider login pseudo-terminal capability from current
+      // runtime state immediately before the provider lease. The route gate ran
+      // earlier, so a managed reconciliation can rebind the environment to an
+      // unsupported provider between the gate and the acquire; this fails closed
+      // before the lease and the pseudo-terminal.
+      assertProviderSupportsLoginPty: (environmentId) =>
+        assertCodexLoginProviderCapability(environmentId),
+      // Wire the live Codex pseudo-terminal opener through the plugin worker
+      // manager route. The opener sets the sandbox `CODEX_HOME` to the same
+      // server-controlled session home the descriptor-bound credential read
+      // opens. When no worker manager is bound, the runtime keeps its fail-closed
+      // opener and the login fails closed.
+      openLivePtySession: options.pluginWorkerManager
+        ? createCodexWorkerBoundLoginPtyOpener({
+            workerManager: options.pluginWorkerManager,
+            log: (line) => logger.info(line),
+          })
+        : undefined,
+    }),
     // The mandatory credential promotion. A successful login authenticates only
     // after this promotion validates the exact staged credential, runs an
     // independent readiness check, confirms the session still holds the sole
@@ -417,6 +537,7 @@ export function agentRoutes(
         // after the fence; the lock spans the whole section.
         const outcome = await adapterLoginStore.withCompanyAdapterPromotionLock(
           context.companyId,
+          context.startedByUserId,
           context.adapterType,
           () =>
             promoteDeviceLoginCredential({
@@ -547,8 +668,8 @@ export function agentRoutes(
       };
     }
 
-    const environment = await environmentsSvc.getById(input.environmentId);
-    if (!environment) {
+    const requestedEnvironment = await environmentsSvc.getById(input.environmentId);
+    if (!requestedEnvironment) {
       return {
         executionTarget: null,
         environmentName: null,
@@ -561,6 +682,40 @@ export function agentRoutes(
         ],
         release: noopRelease,
       };
+    }
+
+    // Managed-sandbox-only policy: redirect a Test that would run on the local
+    // host onto the platform-managed sandbox, the same as a real run does
+    // (resolveExecutionWorkspaceEnvironmentId in heartbeat). Without this
+    // redirect the Test probes the local host while the run executes in the
+    // managed sandbox, so a passing Test validates the wrong execution target.
+    // With no active managed sandbox the Test fails closed — never local.
+    let environment = requestedEnvironment;
+    if (requestedEnvironment.driver === "local") {
+      const managedSandboxOnly =
+        (await instanceSettings.getExperimental()).enableManagedSandboxOnly === true;
+      if (managedSandboxOnly) {
+        const managedSandboxEnvironment = await environmentsSvc.findManagedSandboxEnvironment(
+          input.companyId,
+        );
+        if (!managedSandboxEnvironment) {
+          return {
+            executionTarget: null,
+            environmentName: requestedEnvironment.name,
+            fallbackChecks: [
+              {
+                code: "managed_sandbox_unavailable",
+                level: "error",
+                message:
+                  "This instance runs agents only in its platform-managed sandbox, but no active managed sandbox environment exists. The test did not run.",
+                hint: "Restore the managed sandbox environment, then test again.",
+              },
+            ],
+            release: noopRelease,
+          };
+        }
+        environment = managedSandboxEnvironment;
+      }
     }
 
     if (environment.driver === "local") {
@@ -656,6 +811,11 @@ export function agentRoutes(
         issueId: null,
         heartbeatRunId: null,
         persistedExecutionWorkspace: null,
+        // Re-check the company binding atomically at lease time. The route
+        // guard already rejected a foreign environment, but the binding could
+        // change between the guard check and the lease acquire. This closes
+        // that check-to-lease race so a foreign sandbox never gets a lease.
+        assertCompanyBinding: true,
         // Apply the active custom-image template so the Test boots with the
         // operator's captured sandbox customizations and prepared image state,
         // matching what real agent runs use. Without this the test would
@@ -762,7 +922,7 @@ export function agentRoutes(
           {
             code: "environment_target_failed",
             level: "error",
-            message: `Could not resolve a sandbox execution target for "${environment.name}".`,
+            message: `Could not resolve an execution target for "${environment.name}".`,
             detail: err instanceof Error ? err.message : String(err),
           },
         ],
@@ -854,9 +1014,9 @@ export function agentRoutes(
     return {
       code: "sandbox_test_identity",
       level: "info",
-      message: `Sandbox test identity for "${input.environmentName}".`,
+      message: `Environment test identity for "${input.environmentName}".`,
       detail: detailParts.join("; "),
-      hint: "Use these provider-neutral IDs when comparing model-test output with provider logs or refreshed sandbox snapshots.",
+      hint: "Use these provider-neutral IDs when comparing model-test output with provider logs or refreshed environment snapshots.",
     };
   }
 
@@ -1077,9 +1237,32 @@ export function agentRoutes(
     return userId;
   }
 
-  // The device-login flow supports only the Codex adapter. Reject any other type.
-  function assertCodexLoginAdapter(type: string): void {
-    if (type !== CODEX_DEVICE_LOGIN_ADAPTER_TYPE) {
+  // Read the interactive login capability the registry declares for an adapter
+  // type. Return null when the adapter declares no capability, so a guard fails
+  // closed on the absent case.
+  function getRegistryLoginCapability(type: string) {
+    return findActiveServerAdapter(type)?.loginCapability ?? null;
+  }
+
+  // The device-login route drives a login that shows a one-time code on a real
+  // pseudo-terminal. It serves an adapter whose registry login capability
+  // declares the displayed-code panel mode and whose trusted adapter type maps
+  // to a login command key. The guard reads the panel mode and the command map,
+  // not the adapter name, so a new adapter that satisfies both passes with no
+  // guard code change. It rejects an adapter with no matching capability, and an
+  // adapter with no mapped command key, with the same fixed 400.
+  //
+  // The command-map check keeps admission consistent with the closed command
+  // map. The login opener resolves the command key from the same map. An adapter
+  // that declares the displayed-code capability but has no mapped key would pass
+  // the panel-mode check, then fail at command resolution after the route
+  // creates session state. The guard rejects it before any session or lease side
+  // effect.
+  function assertDeviceLoginAdapter(type: string): void {
+    if (getRegistryLoginCapability(type)?.panelMode !== "displayed_code") {
+      throw badRequest(`Adapter "${type}" does not support a device login.`);
+    }
+    if (!isLoginCommandSupportedAdapterType(type)) {
       throw badRequest(`Adapter "${type}" does not support a device login.`);
     }
   }
@@ -1088,13 +1271,96 @@ export function agentRoutes(
   // only in an active sandbox environment. This reuses the shared environment
   // selection guard, so it rejects a missing, archived (inactive), local, SSH, or
   // plugin environment the same way the agent configuration routes do.
+  //
+  // The execution environment catalog is instance-scoped, not company-owned. PR
+  // #8375 moved the catalog to one shared instance catalog, so an environment row
+  // carries no single owning company. The shared selection guard therefore checks
+  // only the driver and the status. The company-binding check below then rejects
+  // an environment that binds to other companies. The route caller is already
+  // bound to the path company by `assertCompanyAccess`, and the acquired lease
+  // records that same company, so the login stays attributed to the caller.
   async function assertSandboxLoginEnvironment(
     companyId: string,
     environmentId: string,
+    options?: { requireSetupTokenLoginProvider?: boolean },
   ): Promise<void> {
     await assertEnvironmentSelectionForCompany(environmentsSvc, companyId, environmentId, {
       allowedDrivers: ["sandbox"],
     });
+    // Reject an environment that another company owns. A managed sandbox
+    // environment binds to the companies that the instance provisions it for.
+    // When the environment binds to companies but not the request company, the
+    // environment belongs to another company. A login there runs the process in
+    // a foreign company sandbox, so the guard fails closed. An environment with
+    // no company binding is instance-global and stays open to every member.
+    const boundCompanyIds = await environmentsSvc.listBoundCompanyIds(environmentId);
+    if (boundCompanyIds.length > 0 && !boundCompanyIds.includes(companyId)) {
+      throw forbidden("The selected environment belongs to another company.", {
+        code: "environment_company_mismatch",
+      });
+    }
+    // Gate the Claude setup-token login on the provider capability. Only a
+    // sandbox provider that advertises the setup-token login capability
+    // implements the setup-token pseudo-terminal methods. The setup-token start
+    // routes pass this option, so an unsupported provider fails closed here
+    // before the session starts. The lease guard passes it too, so a
+    // reconciliation that rebinds the environment to an unsupported provider
+    // still fails closed before the lease and the pseudo-terminal.
+    if (options?.requireSetupTokenLoginProvider) {
+      await assertSetupTokenLoginProviderCapability(environmentId);
+    }
+  }
+
+  /**
+   * Reports whether the environment provider advertises the login pseudo-terminal
+   * capability. It resolves the effective provider from the current environment
+   * config, then reads the static capability from the provider plugin manifest. It
+   * never checks the provider by name. A missing provider, a missing plugin, a
+   * non-plugin provider, and a provider without the flag all return false. Both
+   * login flows share this resolver, so both gates read the same current
+   * capability.
+   */
+  async function resolveProviderSupportsLoginPty(environmentId: string): Promise<boolean> {
+    const environment = await environmentsSvc.getById(environmentId);
+    const config =
+      environment?.config && typeof environment.config === "object"
+        ? (environment.config as Record<string, unknown>)
+        : {};
+    const provider = typeof config.provider === "string" ? config.provider : "";
+    const resolved = provider
+      ? await resolvePluginSandboxProviderDriverByKey({ db, driverKey: provider })
+      : null;
+    return resolved?.driver.supportsLoginPty === true;
+  }
+
+  /**
+   * Fails closed when the environment provider does not advertise the login
+   * pseudo-terminal capability that the Claude setup-token login needs. It reads
+   * the current provider capability. It fails closed with the fixed, typed error,
+   * so no session row, lease, or pseudo-terminal starts.
+   */
+  async function assertSetupTokenLoginProviderCapability(environmentId: string): Promise<void> {
+    if (!(await resolveProviderSupportsLoginPty(environmentId))) {
+      throw unprocessable(SETUP_TOKEN_PROVIDER_UNSUPPORTED, {
+        code: SETUP_TOKEN_PROVIDER_UNSUPPORTED_CODE,
+      });
+    }
+  }
+
+  /**
+   * Fails closed when the environment provider does not advertise the login
+   * pseudo-terminal capability that the Codex device login needs. It reads the
+   * current provider capability. The Codex route runs it before any session or
+   * lease state, and the lease-acquisition path runs it again from current runtime
+   * state before the provider lease. It fails closed with the fixed, typed error,
+   * so no session row, lease, or pseudo-terminal starts.
+   */
+  async function assertCodexLoginProviderCapability(environmentId: string): Promise<void> {
+    if (!(await resolveProviderSupportsLoginPty(environmentId))) {
+      throw unprocessable(CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED, {
+        code: CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED_CODE,
+      });
+    }
   }
 
   // Read a login session for its owner. The durable row is the authority for the
@@ -1105,19 +1371,17 @@ export function agentRoutes(
   async function readOwnerLoginSession(
     companyId: string,
     adapterType: string,
-    sessionId: string,
+    publicSessionId: string,
     requestingUserId: string,
   ): Promise<AdapterAuthSessionOwnerResponse | null> {
-    const row = await adapterLoginStore.get(sessionId);
-    if (
-      !row ||
-      row.companyId !== companyId ||
-      row.adapterType !== adapterType ||
-      row.startedByUserId !== requestingUserId
-    ) {
+    // Read by the public session id, scoped to the company. The store predicate
+    // already carries the company id, so a foreign-company caller reads nothing
+    // and the internal row id never matches. Keep the adapter and owner checks.
+    const row = await adapterLoginStore.getByPublicId(publicSessionId, companyId);
+    if (!row || row.adapterType !== adapterType || row.startedByUserId !== requestingUserId) {
       return null;
     }
-    return adapterLoginService.readOwnerSession(sessionId, requestingUserId);
+    return adapterLoginService.readOwnerSession(publicSessionId, companyId, requestingUserId);
   }
 
   async function assertCanReadConfigurations(req: Request, companyId: string) {
@@ -1307,8 +1571,17 @@ export function agentRoutes(
    * (listEnabledServerAdapters documents the same rule: hidden from selection,
    * still functional for agents that already use them).
    */
-  function assertSelectableAdapterType(type: string | null | undefined): string {
+  async function assertSelectableAdapterType(type: string | null | undefined): Promise<string> {
     const adapterType = assertKnownAdapterType(type);
+    if (adapterType === "paperclip_runner") {
+      const experimental = await instanceSettings.getExperimental();
+      if (experimental.enableNativeRunner !== true) {
+        throw unprocessable(
+          "Paperclip Runner is experimental and disabled on this instance.",
+          { code: "paperclip_runner_rollout_disabled" },
+        );
+      }
+    }
     const disabled = new Set(getDisabledAdapterTypes());
     if (!disabled.has(adapterType)) return adapterType;
     const available = listServerAdapters()
@@ -1695,6 +1968,10 @@ export function agentRoutes(
       next.model = DEFAULT_GEMINI_LOCAL_MODEL;
       return ensureGatewayDeviceKey(adapterType, next);
     }
+    if (adapterType === "kimi_local" && !asNonEmptyString(next.model)) {
+      next.model = DEFAULT_KIMI_LOCAL_MODEL;
+      return ensureGatewayDeviceKey(adapterType, next);
+    }
     if (adapterType === "opencode_local" && !asNonEmptyString(next.model)) {
       next.model = DEFAULT_OPENCODE_LOCAL_MODEL;
       return ensureGatewayDeviceKey(adapterType, next);
@@ -1869,6 +2146,22 @@ export function agentRoutes(
     );
   }
 
+  async function assertCanResumeAgent(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+  ) {
+    if (req.actor.type !== "agent") return;
+
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
+      scope: { requiresChangeGrant: true },
+    });
+    if (decision.allowed) return;
+    throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+
   function assertNoAgentInstructionsConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
@@ -1933,6 +2226,34 @@ export function agentRoutes(
     };
   }
 
+  // The default CEO instructions assume the core paperclip skills (board
+  // coordination, planning, hiring, memory). Union them into every
+  // skills-capable CEO hire/create so a fresh CEO never starts with an empty
+  // desired-skill set that contradicts its own instructions. Optional role
+  // skills remain removable afterwards. Legacy adapters separately guarantee
+  // the Paperclip operational skill as a runtime invariant.
+  function defaultRoleSkillSelections(
+    role: string | null | undefined,
+    adapterType: string,
+  ): AgentDesiredSkillEntry[] | undefined {
+    if (role !== "ceo") return undefined;
+    const adapter = findActiveServerAdapter(adapterType);
+    if (!adapter?.listSkills && !adapter?.syncSkills) return undefined;
+    return PAPERCLIP_CORE_SKILL_KEYS.map((key) => ({ key, versionId: null }));
+  }
+
+  function withDefaultRoleSkillSelections(
+    requested: AgentDesiredSkillEntry[] | undefined,
+    defaults: AgentDesiredSkillEntry[] | undefined,
+  ): AgentDesiredSkillEntry[] | undefined {
+    if (!defaults) return requested;
+    if (!requested) return defaults;
+    const merged = new Map(defaults.map((entry) => [entry.key, entry]));
+    // An explicit request wins over a default for the same key (version pins).
+    for (const entry of requested) merged.set(entry.key, entry);
+    return Array.from(merged.values());
+  }
+
   function normalizeDesiredSkillSelections(
     requestedDesiredSkills: Array<string | AgentDesiredSkillEntry> | undefined,
   ): AgentDesiredSkillEntry[] | undefined {
@@ -1952,7 +2273,7 @@ export function agentRoutes(
   // declare requiresMaterializedRuntimeSkills explicitly.
   const LEGACY_MATERIALIZED_SKILLS_SET = new Set([
     "cursor",
-    "gemini_local",
+    "gemini_local", "antigravity_local",
     "opencode_local",
     "pi_local",
   ]);
@@ -2185,6 +2506,39 @@ export function agentRoutes(
     res.json(detected);
   });
 
+  // The environment drivers the adapter Test route accepts. A local, SSH, or
+  // sandbox environment can host a probe; a plugin environment cannot.
+  const ADAPTER_TEST_ALLOWED_ENVIRONMENT_DRIVERS = ["local", "ssh", "sandbox"];
+
+  // The fail-closed tenant-binding guard for the adapter Test route. A caller
+  // may name any instance environment by id, so the route must reject an
+  // environment that binds to another company before it resolves secrets,
+  // merges env, resolves the target, leases a sandbox, or runs the adapter
+  // test. The guard checks the company binding BEFORE it validates the status
+  // or the driver, so it never reveals the status or the driver of a foreign
+  // environment. A same-company or an instance-global environment then gets the
+  // shared driver and status validation.
+  async function assertAdapterTestEnvironmentForCompany(
+    companyId: string,
+    environmentId: string,
+  ): Promise<void> {
+    const environment = await environmentsSvc.getById(environmentId);
+    if (!environment) {
+      // A missing environment leaks no tenant state. The execution-context
+      // resolver surfaces the existing environment_not_found check.
+      return;
+    }
+    const boundCompanyIds = await environmentsSvc.listBoundCompanyIds(environmentId);
+    if (boundCompanyIds.length > 0 && !boundCompanyIds.includes(companyId)) {
+      throw forbidden("The selected environment belongs to another company.", {
+        code: "environment_company_mismatch",
+      });
+    }
+    await assertEnvironmentSelectionForCompany(environmentsSvc, companyId, environmentId, {
+      allowedDrivers: ADAPTER_TEST_ALLOWED_ENVIRONMENT_DRIVERS,
+    });
+  }
+
   router.post(
     "/companies/:companyId/adapters/:type/test-environment",
     validate(testAdapterEnvironmentSchema),
@@ -2201,6 +2555,11 @@ export function agentRoutes(
         typeof req.body?.environmentId === "string" && req.body.environmentId.trim().length > 0
           ? (req.body.environmentId as string)
           : null;
+      // Fail closed on a foreign environment before any secret resolution, env
+      // merge, target resolution, sandbox lease, or adapter test runs.
+      if (requestedEnvironmentId) {
+        await assertAdapterTestEnvironmentForCompany(companyId, requestedEnvironmentId);
+      }
       const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
         companyId,
         inputAdapterConfig,
@@ -2348,33 +2707,43 @@ export function agentRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const type = req.params.type as string;
-      const startedByUserId = await assertCanManageAdapterLogin(req, companyId);
-      assertCodexLoginAdapter(type);
 
-      const environmentId =
-        typeof req.body?.environmentId === "string" && req.body.environmentId.trim().length > 0
-          ? (req.body.environmentId as string)
-          : null;
-      if (!environmentId) {
-        throw badRequest("A sandbox environment is required to start a device login.");
-      }
-      const ttlSeconds =
-        typeof req.body?.ttlSeconds === "number" && Number.isFinite(req.body.ttlSeconds)
-          ? (req.body.ttlSeconds as number)
-          : undefined;
-
-      // Reject a non-sandbox or inactive environment before the service starts.
-      await assertSandboxLoginEnvironment(companyId, environmentId);
+      // The shared start-route spine derives the owner, checks the path adapter
+      // type, validates the strict request schema, and checks the sandbox
+      // environment before any session or lease side effect. The client body
+      // carries no adapter type, so the spine injects the path type into the
+      // parse. The strict schema rejects an unknown field, a non-uuid
+      // environment id, and an out-of-range time-to-live with a fixed 400.
+      const resolved = await runAdapterLoginStartSpine({
+        req,
+        res,
+        deriveOwner: () => assertCanManageAdapterLogin(req, companyId),
+        guardBeforeValidate: () => assertDeviceLoginAdapter(type),
+        requestSchema: startAdapterAuthSessionRequestSchema,
+        invalidRequestError: "The device login start request is invalid.",
+        requestOverrides: { adapterType: type },
+        assertSandbox: async (data) => {
+          // The device login runs on a real pseudo-terminal, so it needs a
+          // provider that advertises the login pseudo-terminal capability. Gate
+          // the route on the current provider capability before any session or
+          // lease state. The lease-acquisition path re-checks it from current
+          // runtime state before the provider lease.
+          await assertSandboxLoginEnvironment(companyId, data.environmentId);
+          await assertCodexLoginProviderCapability(data.environmentId);
+        },
+      });
+      if (!resolved) return;
+      const { ownerUserId: startedByUserId, data } = resolved;
 
       const controller = new AbortController();
       let result: Awaited<ReturnType<typeof adapterLoginService.start>>;
       try {
         result = await adapterLoginService.start({
           companyId,
-          environmentId,
+          environmentId: data.environmentId,
           adapterType: type,
           startedByUserId,
-          ttlSeconds,
+          ttlSeconds: data.ttlSeconds,
           signal: controller.signal,
         });
       } catch (error) {
@@ -2410,7 +2779,7 @@ export function agentRoutes(
       const type = req.params.type as string;
       const sessionId = req.params.sessionId as string;
       const ownerUserId = await assertCanManageAdapterLogin(req, companyId);
-      assertCodexLoginAdapter(type);
+      assertDeviceLoginAdapter(type);
 
       const owner = await readOwnerLoginSession(companyId, type, sessionId, ownerUserId);
       if (!owner) {
@@ -2430,7 +2799,7 @@ export function agentRoutes(
       const type = req.params.type as string;
       const sessionId = req.params.sessionId as string;
       const ownerUserId = await assertCanManageAdapterLogin(req, companyId);
-      assertCodexLoginAdapter(type);
+      assertDeviceLoginAdapter(type);
 
       // Scope the cancel to this company, adapter, and owner. A non-owner and a
       // cross-company caller both receive a 404 and cannot cancel a session.
@@ -2443,7 +2812,7 @@ export function agentRoutes(
       // even when this process does not own the in-flight run, so a cross-process
       // cancel or a cancel after a restart does not leave the slot held until the
       // expiry. The reaper deletes the sandbox and finalizes the terminal.
-      const cancelled = await adapterLoginService.cancelOwnerSession(sessionId, ownerUserId);
+      const cancelled = await adapterLoginService.cancelOwnerSession(sessionId, companyId, ownerUserId);
       // Abort the in-flight run this process owns, so the local login stops at
       // once instead of waiting for the reaper. A run in another process, or an
       // already-terminal run, has no controller here.
@@ -2852,6 +3221,48 @@ export function agentRoutes(
     res.json(redactAgentConfiguration(agent));
   });
 
+  router.get("/agents/:id/effective-config", async (req, res) => {
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    await assertCanReadConfigurations(req, agent.companyId);
+
+    const resolved = resolveAgentEffectiveConfig(agent);
+    const agentsList = await svc.list(agent.companyId);
+    const resolvedConfigs = agentsList.map((a) => resolveAgentEffectiveConfig(a));
+    const configSnapshotHash = calculateConfigSnapshotHash(resolvedConfigs);
+
+    resolved.metadata.configSnapshotHash = configSnapshotHash;
+
+    res.json(resolved);
+  });
+
+  router.get("/companies/:companyId/effective-config", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    await assertCanReadConfigurations(req, companyId);
+
+    const agentsList = await svc.list(companyId);
+    const resolvedConfigs = agentsList.map((agent) => resolveAgentEffectiveConfig(agent));
+    const configSnapshotHash = calculateConfigSnapshotHash(resolvedConfigs);
+
+    const results = resolvedConfigs.map((c) => {
+      c.metadata.configSnapshotHash = configSnapshotHash;
+      return c;
+    });
+
+    res.json({
+      resolverVersion: "1.0.0",
+      resolvedAt: new Date().toISOString(),
+      companyId,
+      configSnapshotHash,
+      configs: results
+    });
+  });
+
   router.get("/agents/:id/config-revisions", async (req, res) => {
     const id = req.params.id as string;
     const agent = await svc.getById(id);
@@ -2976,9 +3387,16 @@ export function agentRoutes(
       instructionsBundle,
       sourceIssueId: _sourceIssueId,
       sourceIssueIds: _sourceIssueIds,
+      // The stored-session claim is not an agent column. The server derives the
+      // owner from the authenticated actor and consumes the claim in the create
+      // transaction, so it never reaches the insert values.
+      storedSessionId: hireStoredSessionId,
+      // The apply-existing flag is not an agent column. The server binds the
+      // fixed reference to the owner stored value with no login round trip.
+      applyStoredClaudeLogin: hireApplyStoredClaudeLogin,
       ...hireInput
     } = req.body;
-    hireInput.adapterType = assertSelectableAdapterType(hireInput.adapterType);
+    hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertNoNewAgentLegacyPromptTemplate(
       hireInput.adapterType,
@@ -3000,7 +3418,10 @@ export function agentRoutes(
       companyId,
       hireInput.adapterType,
       requestedAdapterConfig,
-      normalizeDesiredSkillSelections(Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined),
+      withDefaultRoleSkillSelections(
+        normalizeDesiredSkillSelections(Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined),
+        defaultRoleSkillSelections(hireInput.role, hireInput.adapterType),
+      ),
       "add",
     );
     const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
@@ -3032,13 +3453,26 @@ export function agentRoutes(
 
     const requiresApproval = company.requireBoardApprovalForNewAgents;
     const status = requiresApproval ? "pending_approval" : "idle";
-    const createdAgent = await svc.create(companyId, {
-      id: hiredAgentId,
-      ...normalizedHireInput,
-      status,
-      spentMonthlyCents: 0,
-      lastHeartbeatAt: null,
-    });
+    const createdAgent = await svc.create(
+      companyId,
+      {
+        id: hiredAgentId,
+        ...normalizedHireInput,
+        status,
+        spentMonthlyCents: 0,
+        lastHeartbeatAt: null,
+      },
+      {
+        claudeLogin: {
+          storedSessionId: hireStoredSessionId ?? null,
+          ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
+          // The apply-existing path runs only for a user actor. The owner comes
+          // from the actor, so an agent actor never reaches the no-claim bind.
+          applyExistingWithoutClaim:
+            req.actor.type !== "agent" && hireApplyStoredClaudeLogin === true,
+        },
+      },
+    );
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
@@ -3172,9 +3606,16 @@ export function agentRoutes(
     const {
       desiredSkills: requestedDesiredSkills,
       instructionsBundle,
+      // The stored-session claim is not an agent column. The server derives the
+      // owner from the authenticated actor and consumes the claim in the create
+      // transaction, so it never reaches the insert values.
+      storedSessionId: createStoredSessionId,
+      // The apply-existing flag is not an agent column. The server binds the
+      // fixed reference to the owner stored value with no login round trip.
+      applyStoredClaudeLogin: createApplyStoredClaudeLogin,
       ...createInput
     } = req.body;
-    createInput.adapterType = assertSelectableAdapterType(createInput.adapterType);
+    createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertNoNewAgentLegacyPromptTemplate(
       createInput.adapterType,
@@ -3196,7 +3637,10 @@ export function agentRoutes(
       companyId,
       createInput.adapterType,
       requestedAdapterConfig,
-      normalizeDesiredSkillSelections(Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined),
+      withDefaultRoleSkillSelections(
+        normalizeDesiredSkillSelections(Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined),
+        defaultRoleSkillSelections(createInput.role, createInput.adapterType),
+      ),
       "add",
     );
     const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
@@ -3216,15 +3660,28 @@ export function agentRoutes(
       allowedSandboxProviders: allowedSandboxProvidersForAgent(createInput.adapterType),
     });
 
-    const createdAgent = await svc.create(companyId, {
-      id: agentId,
-      ...createInput,
-      adapterConfig: normalizedAdapterConfig,
-      runtimeConfig: normalizedRuntimeConfig,
-      status: "idle",
-      spentMonthlyCents: 0,
-      lastHeartbeatAt: null,
-    });
+    const createdAgent = await svc.create(
+      companyId,
+      {
+        id: agentId,
+        ...createInput,
+        adapterConfig: normalizedAdapterConfig,
+        runtimeConfig: normalizedRuntimeConfig,
+        status: "idle",
+        spentMonthlyCents: 0,
+        lastHeartbeatAt: null,
+      },
+      {
+        claudeLogin: {
+          storedSessionId: createStoredSessionId ?? null,
+          ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
+          // The apply-existing path runs only for a user actor. The owner comes
+          // from the actor, so an agent actor never reaches the no-claim bind.
+          applyExistingWithoutClaim:
+            req.actor.type !== "agent" && createApplyStoredClaudeLogin === true,
+        },
+      },
+    );
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
     const actor = getActorInfo(req);
@@ -3572,6 +4029,11 @@ export function agentRoutes(
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
+    // The apply-existing flag is not an agent column. The server binds the fixed
+    // reference to the owner stored value with no login round trip. Remove it
+    // from the patch so it never reaches the update values.
+    const applyStoredClaudeLogin = patchData.applyStoredClaudeLogin === true;
+    delete patchData.applyStoredClaudeLogin;
     if (hasOwn(patchData, "adapterConfig")) {
       const adapterConfig = asRecord(patchData.adapterConfig);
       if (!adapterConfig) {
@@ -3590,12 +4052,12 @@ export function agentRoutes(
     // it gets the selectable check; keeping the agent's current adapter (even
     // one since disabled) stays allowed, so a disabled harness does not make an
     // existing agent uneditable.
-    const requestedAdapterType = hasOwn(patchData, "adapterType")
-      ? (() => {
-        const next = assertKnownAdapterType(patchData.adapterType as string | null | undefined);
-        return next === existing.adapterType ? next : assertSelectableAdapterType(next);
-      })()
+    const nextAdapterType = hasOwn(patchData, "adapterType")
+      ? assertKnownAdapterType(patchData.adapterType as string | null | undefined)
       : existing.adapterType;
+    const requestedAdapterType = nextAdapterType === existing.adapterType
+      ? nextAdapterType
+      : await assertSelectableAdapterType(nextAdapterType);
     let requestedRuntimeConfig: Record<string, unknown> | null = null;
     if (hasOwn(patchData, "runtimeConfig")) {
       const runtimeConfig = asRecord(patchData.runtimeConfig);
@@ -3630,9 +4092,21 @@ export function agentRoutes(
         rawEffectiveAdapterConfig = { ...existingAdapterConfig, ...requestedAdapterConfig };
       }
       if (changingAdapterType) {
-        // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
-        // when the adapter type changes. Without this, a PATCH that includes
-        // adapterConfig but omits these keys would silently drop them.
+        // A provider change is a configuration boundary. Unless the caller
+        // explicitly supplies a replacement config, carry only cross-provider
+        // keys; forwarding the current adapterConfig must not leak fields such
+        // as model/engine/permissionMode into the newly selected provider.
+        const targetAdapterConfig = replaceAdapterConfig
+          ? { ...(requestedAdapterConfig ?? {}) }
+          : Object.fromEntries(
+            ADAPTER_AGNOSTIC_KEYS
+              .filter((key) => requestedAdapterConfig?.[key] !== undefined)
+              .map((key) => [key, requestedAdapterConfig?.[key]]),
+          );
+        rawEffectiveAdapterConfig = targetAdapterConfig;
+
+        // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing
+        // config when the target config omits them.
         for (const key of ADAPTER_AGNOSTIC_KEYS) {
           if (KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET.has(key)) continue;
           if (rawEffectiveAdapterConfig[key] === undefined && existingAdapterConfig[key] !== undefined) {
@@ -3698,6 +4172,13 @@ export function agentRoutes(
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         source: "patch",
       },
+      claudeLogin: {
+        ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
+        // The apply-existing path runs only for a user actor. The owner comes
+        // from the actor, so an agent actor never reaches the no-claim bind.
+        applyExistingWithoutClaim:
+          req.actor.type !== "agent" && applyStoredClaudeLogin,
+      },
     });
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -3747,12 +4228,12 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/resume", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) {
       return;
     }
+    await assertCanResumeAgent(req, existing);
     if (existing.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
         error: existing.orgChainHealth?.repairGuidance ?? "Repair this agent's reporting chain before resuming it",
@@ -3765,10 +4246,14 @@ export function agentRoutes(
       return;
     }
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
@@ -4229,21 +4714,22 @@ export function agentRoutes(
 
   // --- Setup-token login session routes --------------------------------------
   //
-  // The routes give the harness the operations against one live login session.
-  // Every operation verifies the company, the owner user, and the target agent
-  // through the session scope. A missing session and a cross-scope session both
-  // return the same 404. The confidential responses (read-prompt and
-  // receive-token) pass through the fail-closed transport guard and set
+  // The routes give the UI operations against one live login session. Every
+  // operation verifies the company and owner user through the session scope. A
+  // missing session and a cross-scope session both return the same 404. The
+  // confidential responses pass through the transport assessment and set
   // `Cache-Control: no-store`. The routes write no prompt, code, token, or raw
   // process chunk to a log or an activity detail, and they return fixed error
   // text only.
   //
   // Operator requirement (SR-7): to serve the confidential responses behind a
   // TLS-terminating reverse proxy, set `CLAUDE_LOGIN_TRUSTED_PROXIES` to the
-  // explicit proxy IP or CIDR allowlist. The global `TRUST_PROXY` setting,
-  // including `TRUST_PROXY=true` and a hop-count value, does not satisfy the
-  // guard. A direct TLS request is always valid; a non-TLS request is valid only
-  // on a loopback peer in the `local_trusted` deployment mode.
+  // explicit proxy IP or CIDR allowlist — or, on a managed platform whose edge
+  // always terminates TLS and whose proxy peer addresses cannot be allowlisted,
+  // declare `CLAUDE_LOGIN_EDGE_TLS_TERMINATED=true`. The global `TRUST_PROXY`
+  // setting, including `TRUST_PROXY=true` and a hop-count value, does not
+  // satisfy the guard. A direct TLS request is always valid; a non-TLS request
+  // is valid only on a loopback peer in the `local_trusted` deployment mode.
   //
   // Each route below writes its full path as a plain string literal. The static
   // OpenAPI coverage test reads the route paths from the source text; it does
@@ -4251,28 +4737,63 @@ export function agentRoutes(
   // test with an unresolved path, so the routes repeat the base path instead.
 
   /**
-   * Builds the immutable session scope from the authenticated owner user and the
-   * target agent (SR-3, FU-1). Only a user actor owns a login session; the route
-   * uses this dedicated login scope, not the broad agent-manage permission.
+   * Derives the immutable owner of a setup-token login session from the actor.
+   * Only a board user owns a login session. It returns the owner id, or it
+   * throws a forbidden error. The owner is never a client field; it comes only
+   * from the authenticated actor.
    */
-  const buildSetupTokenScope = (
-    req: Request,
-    agent: { id: string; companyId: string },
-  ): SetupTokenSessionScope => {
+  const deriveSetupTokenOwnerUserId = (req: Request): string => {
     const actor = getActorInfo(req);
     if (actor.actorType !== "user") {
       throw forbidden("A user must own a setup-token login session.");
     }
-    return { companyId: agent.companyId, ownerUserId: actor.actorId, targetAgentId: agent.id };
+    return actor.actorId;
   };
 
   /**
-   * Applies the fail-closed confidential transport guard (SR-6, SR-7). It reads
-   * the raw socket TLS bit and the immediate peer address, so the global
-   * `trust proxy` setting cannot influence the decision. It returns false and
-   * sends the fixed no-secret error when the transport is not confidential.
+   * Read-access gate for the company-scoped setup-token session routes. It runs
+   * before a route resolves a session. The session id is an opaque secret-bearing
+   * reference, so a cross-company reference must fail closed like a missing
+   * session. This gate returns the same fixed not-found error for a cross-company
+   * reference by an authenticated non-member as for a missing session, so the
+   * route is not a company-membership oracle. It keeps the not-found equivalence
+   * the session lookups use.
+   *
+   * The gate keeps the actor rules unchanged. It throws 401 for an unauthenticated
+   * caller and 403 for a non-user actor through the owner derivation. For an
+   * authorized member it runs the full `assertCompanyAccess` write-path checks and
+   * returns the owner user id. For a non-member it sends the fixed 404 and returns
+   * null; the route must stop.
    */
-  const enforceSetupTokenTransport = (req: Request, res: Response): boolean => {
+  const resolveCompanySessionOwner = (
+    req: Request,
+    companyId: string,
+    res: Response,
+  ): string | null => {
+    assertAuthenticated(req);
+    const ownerUserId = deriveSetupTokenOwnerUserId(req);
+    if (!hasCompanyAccess(req, companyId)) {
+      res.setHeader("Cache-Control", "no-store");
+      res.status(404).json({ error: SETUP_TOKEN_SESSION_NOT_FOUND });
+      return null;
+    }
+    assertCompanyAccess(req, companyId);
+    return ownerUserId;
+  };
+
+  /**
+   * Assesses the setup-token confidential transport. The product
+   * owner set a non-negotiable requirement: do not force TLS. Many users run
+   * Paperclip over plain HTTP on a home server or a Tailscale tailnet. So the
+   * route does not block a non-confidential transport. It returns a non-blocking
+   * advisory instead, and the route attaches it to the confidential response.
+   * The client shows a visible disclaimer and lets the login proceed. The
+   * function reads the raw socket TLS bit and the immediate peer address, so the
+   * global `trust proxy` setting cannot change the result. It returns null when
+   * the transport is confidential (direct TLS, a local-trusted loopback, or an
+   * allowlisted TLS proxy), so a confidential response shows no disclaimer.
+   */
+  const assessSetupTokenTransport = (req: Request): SetupTokenTransportAdvisory | null => {
     const socket = req.socket as { encrypted?: boolean; remoteAddress?: string };
     const forwardedProto = req.headers["x-forwarded-proto"];
     const decision = evaluateConfidentialTransport(setupTokenConfidentialConfig, {
@@ -4280,12 +4801,7 @@ export function agentRoutes(
       remoteAddress: socket?.remoteAddress,
       forwardedProto: Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto,
     });
-    if (!decision.allowed) {
-      res.setHeader("Cache-Control", "no-store");
-      res.status(403).json({ error: SETUP_TOKEN_TRANSPORT_INSECURE });
-      return false;
-    }
-    return true;
+    return decision.allowed ? null : { code: SETUP_TOKEN_TRANSPORT_ADVISORY_CODE };
   };
 
   const sendSetupTokenError = (res: Response, err: unknown): void => {
@@ -4296,119 +4812,345 @@ export function agentRoutes(
     throw err;
   };
 
-  /**
-   * Resolves the target agent for a login-session route and verifies it is a
-   * `claude_local` agent. Returns null and sends the response when the agent is
-   * missing, inaccessible, or the wrong adapter type.
-   */
-  const resolveSetupTokenAgent = async (req: Request, res: Response) => {
-    const id = req.params.id as string;
-    const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
-    if (!agent) return null;
-    if (agent.adapterType !== "claude_local") {
-      res.status(400).json({ error: "Login is only supported for claude_local agents" });
-      return null;
+  // --- Company-and-environment setup-token login routes ----------------------
+  //
+  // These routes serve the agentless Claude login. The scope binds one login to
+  // one company, one owner user, one adapter, and one environment. The scope
+  // carries no agent id, so a hire flow starts one login before an agent exists.
+  //
+  // Object-level authorization: every action derives the owner from
+  // the authenticated actor, fixes the adapter to `claude_local`, and resolves
+  // the environment server-side. The lookup scopes by the immutable tuple
+  // company, owner, adapter, environment, and session. A foreign session returns
+  // the same not-found error as a missing session, so a caller cannot enumerate
+  // a session across a company, an owner, an adapter, or an environment.
+  //
+  // Each route writes its full path as a plain string literal, so the static
+  // OpenAPI coverage test can read the path from the source text.
+
+  // Maps the internal session state to the public login status. The public union
+  // carries no server-only state, so the route never returns the internal
+  // `submitting` or `stored` state to a client.
+  const toClaudeLoginStatus = (state: SetupTokenSessionState): AdapterAuthSessionStatus => {
+    switch (state) {
+      case "starting":
+        return "starting";
+      case "awaiting_code":
+      case "submitting":
+      case "stored":
+        return "waiting_for_user";
+      case "completed":
+        return "authenticated";
+      case "failed":
+        return "failed";
+      case "timed_out":
+        return "timed_out";
+      case "cancelled":
+        return "cancelled";
     }
-    return agent;
   };
 
-  router.post("/agents/:id/setup-token-login-sessions", async (req, res) => {
-    const agent = await resolveSetupTokenAgent(req, res);
-    if (!agent) return;
-    const scope = buildSetupTokenScope(req, agent);
+  // Builds the fixed, non-secret failure for a terminal failure state. A live or
+  // a completed session has no failure. The failure carries a stable reason and
+  // no secret detail.
+  const toClaudeLoginFailure = (state: SetupTokenSessionState): AdapterAuthSessionFailure | null => {
+    switch (state) {
+      case "failed":
+        return { reason: "failed", message: null };
+      case "timed_out":
+        return { reason: "timed_out", message: null };
+      case "cancelled":
+        return { reason: "cancelled", message: null };
+      default:
+        return null;
+    }
+  };
+
+  // The public login-session response. It carries no prompt and no secret.
+  const toClaudePublicResponse = (
+    descriptor: SetupTokenSessionDescriptor,
+  ): ClaudeSetupTokenSessionResponse => ({
+    sessionId: descriptor.sessionId,
+    environmentId: descriptor.environmentId,
+    status: toClaudeLoginStatus(descriptor.state),
+    expiresAt: new Date(descriptor.deadline).toISOString(),
+    failure: toClaudeLoginFailure(descriptor.state),
+  });
+
+  // The company-and-environment login key the non-start routes derive. The route
+  // path gives the company, the actor gives the owner, and the route fixes the
+  // adapter. The service matches this key and the agentless marker.
+  const companySetupTokenKey = (companyId: string, ownerUserId: string) => ({
+    companyId,
+    ownerUserId,
+    adapterType: SETUP_TOKEN_ADAPTER_TYPE,
+  });
+
+  // The stored Claude OAuth token status read. It returns
+  // only the secret id and the latest version of the owner value; it returns no
+  // token. The client reads the version, applies the stored token first, and
+  // captures the version for a later confirmed overwrite. The route derives the
+  // owner only from the authenticated actor and reads the fixed Claude
+  // definition; it accepts no owner, no definition, and no secret id as input.
+  //
+  // The route returns the same fixed 404 for a missing owner value as the
+  // company gate returns for a non-member, so it discloses no existence
+  // distinction across owners or companies. It sets `Cache-Control: no-store`,
+  // so no cache holds the metadata.
+  router.get("/companies/:companyId/claude-oauth-token-status", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const ownerUserId = resolveCompanySessionOwner(req, companyId, res);
+    if (ownerUserId === null) return;
     res.setHeader("Cache-Control", "no-store");
-    if (!SETUP_TOKEN_LOGIN_TRANSPORT_READY) {
-      // The live login transport binds at a later call site. Fail closed with the
-      // fixed no-secret error until then.
-      res.status(503).json({ error: SETUP_TOKEN_START_FAILED });
+    const status = await secretsSvc.readClaudeOAuthUserSecretStatus(companyId, ownerUserId);
+    if (!status) {
+      // A missing owner value returns the same fixed not-found as the non-member
+      // gate, so a member without a value and a non-member look the same.
+      res.status(404).json({ error: SETUP_TOKEN_SESSION_NOT_FOUND });
       return;
     }
+    const body: ClaudeOAuthTokenStatusResponse = status;
+    res.json(body);
+  });
+
+  router.post("/companies/:companyId/setup-token-login-sessions", async (req, res) => {
+    const companyId = req.params.companyId as string;
+
+    // The shared start-route spine derives the owner, validates the strict
+    // request schema, runs the Claude-only guards, and checks the sandbox
+    // environment before any session, lease, or pseudo-terminal side effect.
+    //
+    // The owner step runs the company access check, derives the owner, and then
+    // sets `Cache-Control: no-store`, so a rejected member sees no cache header
+    // and every other response carries it. The strict schema rejects an unknown
+    // field, including a legacy `ttlSeconds`, with a fixed 400. The post-validate
+    // guard rejects a non-Claude adapter with a fixed 400 and fails closed with
+    // the fixed no-secret 503 until the live login transport binds. The sandbox
+    // check fails closed on a missing, archived, non-sandbox, fake-provider, or
+    // foreign environment, and on a provider without the setup-token login
+    // capability, so no rejected environment reaches a session row, a lease, or a
+    // pseudo-terminal.
+    const resolved = await runAdapterLoginStartSpine({
+      req,
+      res,
+      deriveOwner: () => {
+        assertCompanyAccess(req, companyId);
+        const ownerUserId = deriveSetupTokenOwnerUserId(req);
+        res.setHeader("Cache-Control", "no-store");
+        return ownerUserId;
+      },
+      requestSchema: startClaudeSetupTokenSessionRequestSchema,
+      invalidRequestError: "The Claude login start request is invalid.",
+      guardAfterValidate: (data) => {
+        // The setup-token route drives a login on a pseudo-terminal and records a
+        // stored session identifier on success. It serves any adapter whose
+        // registry login capability records that completion claim. The guard reads
+        // the capability, not the adapter name, so a new adapter with the same
+        // claim passes with no code change. It rejects an adapter with no matching
+        // capability with a fixed 400.
+        const capability = getRegistryLoginCapability(data.adapterType);
+        if (capability?.completionClaim !== "storedSessionId") {
+          res.status(400).json({ error: "This adapter does not support a setup-token login." });
+          return true;
+        }
+        // The five follow-up routes and the restart reaper both read only the
+        // one pinned adapter type. A capability match alone is not enough: an
+        // adapter that declares `storedSessionId` but is not the served type
+        // would pass the check above, then create a session that no follow-up
+        // route and no reaper scan can reach. Reject that case here, before any
+        // sandbox assertion, lease, durable row, or pseudo-terminal, with the
+        // same fixed 400 as the capability check above, so the response
+        // discloses no difference between the two rejection reasons.
+        if (data.adapterType !== SETUP_TOKEN_ADAPTER_TYPE) {
+          res.status(400).json({ error: "This adapter does not support a setup-token login." });
+          return true;
+        }
+        if (!SETUP_TOKEN_LOGIN_TRANSPORT_READY) {
+          res.status(503).json({ error: SETUP_TOKEN_START_FAILED });
+          return true;
+        }
+        return false;
+      },
+      assertSandbox: (data) =>
+        assertSandboxLoginEnvironment(companyId, data.environmentId, {
+          requireSetupTokenLoginProvider: true,
+        }),
+    });
+    if (!resolved) return;
+    const { ownerUserId, data } = resolved;
+    const { environmentId, adapterType } = data;
+    const confirmedOverwrite: ClaudeSetupTokenOverwrite | null = data.overwrite ?? null;
+
+    const scope: SetupTokenSessionScope = {
+      companyId,
+      ownerUserId,
+      adapterType,
+      environmentId,
+      confirmedOverwrite,
+    };
+    // Read the panel mode from the adapter capability. The guard already checked
+    // the capability, so it is present here. The client renders the panel from
+    // this value instead of a hard-coded mode.
+    const panelMode =
+      getRegistryLoginCapability(adapterType)?.panelMode ?? "submitted_browser_code";
     try {
       const started = await setupTokenLoginService.start(scope);
-      res.status(201).json({ sessionId: started.sessionId, state: started.state });
+      const descriptor = setupTokenLoginService.describeOwned(started.sessionId, scope);
+      // The start response carries the panel mode, so the client renders the
+      // correct panel. The full login URL rides only through the guarded prompt
+      // read, not the start response, so the prompt is null here. The client
+      // reads the prompt route for the login URL.
+      const body: ClaudeSetupTokenSessionOwnerResponse = {
+        ...toClaudePublicResponse(descriptor),
+        panelMode,
+        prompt: null,
+      };
+      res.status(201).json(body);
     } catch (err) {
       sendSetupTokenError(res, err);
     }
   });
 
-  router.get("/agents/:id/setup-token-login-sessions/:sessionId/prompt", async (req, res) => {
-    const agent = await resolveSetupTokenAgent(req, res);
-    if (!agent) return;
-    const scope = buildSetupTokenScope(req, agent);
+  router.get("/companies/:companyId/setup-token-login-sessions/:sessionId", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const ownerUserId = resolveCompanySessionOwner(req, companyId, res);
+    if (ownerUserId === null) return;
     res.setHeader("Cache-Control", "no-store");
-    // SR-6 and SR-7: the full login URL is a confidential response.
-    if (!enforceSetupTokenTransport(req, res)) return;
     try {
-      const view = setupTokenLoginService.readPrompt(req.params.sessionId as string, scope);
-      // SR-5: the full login URL rides only in this authorized owner response.
-      res.json({ state: view.state, loginUrl: view.loginUrl });
+      const sessionId = req.params.sessionId as string;
+      const scope = setupTokenLoginService.resolveCompanyScope(
+        sessionId,
+        companySetupTokenKey(companyId, ownerUserId),
+      );
+      const descriptor = setupTokenLoginService.describeOwned(sessionId, scope);
+      // The status response is public. It carries no prompt and no secret.
+      res.json(toClaudePublicResponse(descriptor));
     } catch (err) {
       sendSetupTokenError(res, err);
     }
   });
 
-  router.post("/agents/:id/setup-token-login-sessions/:sessionId/code", async (req, res) => {
-    const agent = await resolveSetupTokenAgent(req, res);
-    if (!agent) return;
-    const scope = buildSetupTokenScope(req, agent);
-    const browserCode = typeof req.body?.browserCode === "string" ? req.body.browserCode : null;
+  router.get("/companies/:companyId/setup-token-login-sessions/:sessionId/prompt", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const ownerUserId = resolveCompanySessionOwner(req, companyId, res);
+    if (ownerUserId === null) return;
     res.setHeader("Cache-Control", "no-store");
-    // SR-6 and SR-7: the browser code is the confidential OAuth authorization
-    // secret. Enforce the fail-closed confidential transport guard before the
-    // route reads it, so the code never rides an untrusted transport.
-    if (!enforceSetupTokenTransport(req, res)) return;
-    if (!browserCode) {
-      // The route echoes no input; it returns fixed error text only (SR-1).
-      res.status(400).json({ error: "A browserCode is required." });
+    // The full login URL is a confidential response. The route
+    // does not force TLS. It attaches a non-blocking advisory instead.
+    const transportAdvisory = assessSetupTokenTransport(req);
+    try {
+      const sessionId = req.params.sessionId as string;
+      const scope = setupTokenLoginService.resolveCompanyScope(
+        sessionId,
+        companySetupTokenKey(companyId, ownerUserId),
+      );
+      const descriptor = setupTokenLoginService.describeOwned(sessionId, scope);
+      if (!descriptor.loginUrl) {
+        // The prompt has not surfaced yet. Return the same not-found error as a
+        // missing or a foreign session, so the route never confirms the session
+        // exists before the URL is ready.
+        res.status(404).json({ error: SETUP_TOKEN_SESSION_NOT_FOUND });
+        return;
+      }
+      // The full login URL rides only in this authorized owner response.
+      const body: ClaudeSetupTokenSessionPrompt = {
+        authorizationUrl: descriptor.loginUrl,
+        transportAdvisory,
+      };
+      res.json(body);
+    } catch (err) {
+      sendSetupTokenError(res, err);
+    }
+  });
+
+  router.post("/companies/:companyId/setup-token-login-sessions/:sessionId/code", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const ownerUserId = resolveCompanySessionOwner(req, companyId, res);
+    if (ownerUserId === null) return;
+    res.setHeader("Cache-Control", "no-store");
+    // The browser code is the confidential OAuth authorization
+    // secret. The route does not force TLS. It attaches a non-blocking advisory
+    // to the response instead, so the client can show a disclaimer.
+    const transportAdvisory = assessSetupTokenTransport(req);
+    // Parse the request with the shared strict validator before the route forwards
+    // the code to the live process. `.strict()` rejects an unknown field, and the
+    // grammar rejects an empty, an oversized, or a control-byte code. The route
+    // echoes no input; it returns fixed error text only.
+    const parsed = submitBrowserCodeRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "A valid browser code is required." });
       return;
     }
     try {
-      const result = setupTokenLoginService.submitCode(req.params.sessionId as string, scope, browserCode);
-      res.json({ state: result.state });
+      const sessionId = req.params.sessionId as string;
+      const scope = setupTokenLoginService.resolveCompanyScope(
+        sessionId,
+        companySetupTokenKey(companyId, ownerUserId),
+      );
+      setupTokenLoginService.submitCode(sessionId, scope, parsed.data.browserCode);
+      const descriptor = setupTokenLoginService.describeOwned(sessionId, scope);
+      const body: ClaudeSetupTokenSessionResponse = {
+        ...toClaudePublicResponse(descriptor),
+        transportAdvisory,
+      };
+      res.json(body);
     } catch (err) {
       sendSetupTokenError(res, err);
     }
   });
 
-  router.post("/agents/:id/setup-token-login-sessions/:sessionId/cancel", async (req, res) => {
-    const agent = await resolveSetupTokenAgent(req, res);
-    if (!agent) return;
-    const scope = buildSetupTokenScope(req, agent);
-    try {
-      const result = await setupTokenLoginService.cancel(req.params.sessionId as string, scope);
-      res.json({ state: result.state });
-    } catch (err) {
-      sendSetupTokenError(res, err);
-    }
-  });
-
-  router.post("/agents/:id/setup-token-login-sessions/:sessionId/expire", async (req, res) => {
-    const agent = await resolveSetupTokenAgent(req, res);
-    if (!agent) return;
-    const scope = buildSetupTokenScope(req, agent);
-    try {
-      const result = await setupTokenLoginService.expire(req.params.sessionId as string, scope);
-      res.json({ state: result.state });
-    } catch (err) {
-      sendSetupTokenError(res, err);
-    }
-  });
-
-  router.post("/agents/:id/setup-token-login-sessions/:sessionId/token", async (req, res) => {
-    const agent = await resolveSetupTokenAgent(req, res);
-    if (!agent) return;
-    const scope = buildSetupTokenScope(req, agent);
+  router.post("/companies/:companyId/setup-token-login-sessions/:sessionId/completion", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const ownerUserId = resolveCompanySessionOwner(req, companyId, res);
+    if (ownerUserId === null) return;
     res.setHeader("Cache-Control", "no-store");
-    // SR-6 and SR-7: the token is a confidential response.
-    if (!enforceSetupTokenTransport(req, res)) return;
     try {
-      // The service returns the token one time from a completed session. It
-      // returns the fixed unavailable error when the token is not ready or the
-      // owner already received it. The full token rides only in this authorized
-      // owner response over the confidential transport (SR-5, SR-6, SR-7).
-      const result = setupTokenLoginService.receiveToken(req.params.sessionId as string, scope);
-      res.json({ token: result.token });
+      const sessionId = req.params.sessionId as string;
+      const scope = setupTokenLoginService.resolveCompanyScope(
+        sessionId,
+        companySetupTokenKey(companyId, ownerUserId),
+      );
+      // The service returns the non-secret `storedSessionId` claim from a
+      // completed session whose owner-bound secret write succeeded. The response
+      // carries no token.
+      const result = setupTokenLoginService.completeSession(sessionId, scope);
+      const body: ClaudeSetupTokenCompletionResponse = { storedSessionId: result.storedSessionId };
+      res.json(body);
     } catch (err) {
+      sendSetupTokenError(res, err);
+    }
+  });
+
+  router.post("/companies/:companyId/setup-token-login-sessions/:sessionId/cancel", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const ownerUserId = resolveCompanySessionOwner(req, companyId, res);
+    if (ownerUserId === null) return;
+    res.setHeader("Cache-Control", "no-store");
+    const sessionId = req.params.sessionId as string;
+    try {
+      const scope = setupTokenLoginService.resolveCompanyScope(
+        sessionId,
+        companySetupTokenKey(companyId, ownerUserId),
+      );
+      await setupTokenLoginService.cancel(sessionId, scope);
+      res.status(200).json({});
+    } catch (err) {
+      // Cancel is idempotent. The service removes a session when it reaches a
+      // terminal state, so a repeat cancel, a cancel after a timeout, or a
+      // cancel of an unknown session finds no record and throws the fixed
+      // not-found error. Return the same success as an active cancel, so the
+      // client stops the poll and returns to its start state.
+      //
+      // This keeps the not-found uniform. The 200 response is identical
+      // for a missing session, an already-terminal session, and a foreign
+      // session, so the route never confirms a session exists and cancels
+      // nothing for a foreign id. A non-member still fails closed with a 404 at
+      // the company-access gate above, before this handler runs. A non-404
+      // error still surfaces.
+      if (err instanceof SetupTokenSessionError && err.status === 404) {
+        res.status(200).json({});
+        return;
+      }
       sendSetupTokenError(res, err);
     }
   });

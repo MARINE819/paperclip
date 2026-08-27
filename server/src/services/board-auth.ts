@@ -1,6 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { BoardApiKeyScope, Db } from "@paperclipai/db";
 import {
   authUsers,
   boardApiKeys,
@@ -244,6 +244,7 @@ export function boardAuthService(db: Db) {
       .select({
         id: boardApiKeys.id,
         name: boardApiKeys.name,
+        scope: boardApiKeys.scope,
         createdAt: boardApiKeys.createdAt,
         lastUsedAt: boardApiKeys.lastUsedAt,
         revokedAt: boardApiKeys.revokedAt,
@@ -260,6 +261,7 @@ export function boardAuthService(db: Db) {
         id: boardApiKeys.id,
         userId: boardApiKeys.userId,
         name: boardApiKeys.name,
+        scope: boardApiKeys.scope,
         createdAt: boardApiKeys.createdAt,
         lastUsedAt: boardApiKeys.lastUsedAt,
         revokedAt: boardApiKeys.revokedAt,
@@ -273,7 +275,7 @@ export function boardAuthService(db: Db) {
   async function createCliAuthChallenge(input: {
     command: string;
     clientName?: string | null;
-    requestedAccess: "board" | "instance_admin_required";
+    requestedAccess: "board" | "instance_admin_required" | "approval_only";
     requestedCompanyId?: string | null;
   }) {
     const challengeSecret = createCliAuthSecret();
@@ -283,7 +285,9 @@ export function boardAuthService(db: Db) {
     const pendingKeyName =
       input.requestedAccess === "instance_admin_required"
         ? `${labelBase} (instance admin)`
-        : `${labelBase} (board)`;
+        : input.requestedAccess === "approval_only"
+          ? `${labelBase} (approval-only)`
+          : `${labelBase} (board)`;
 
     const created = await db
       .insert(cliAuthChallenges)
@@ -348,7 +352,7 @@ export function boardAuthService(db: Db) {
       status: challengeStatusForRow(challenge),
       command: challenge.command,
       clientName: challenge.clientName ?? null,
-      requestedAccess: challenge.requestedAccess as "board" | "instance_admin_required",
+      requestedAccess: challenge.requestedAccess as "board" | "instance_admin_required" | "approval_only",
       requestedCompanyId: challenge.requestedCompanyId ?? null,
       requestedCompanyName: company?.name ?? null,
       approvedAt: challenge.approvedAt?.toISOString() ?? null,
@@ -390,12 +394,15 @@ export function boardAuthService(db: Db) {
 
       let boardKeyId = challenge.boardApiKeyId;
       if (!boardKeyId) {
+        const scope: BoardApiKeyScope | null =
+          challenge.requestedAccess === "approval_only" ? "approval_only" : null;
         const createdKey = await tx
           .insert(boardApiKeys)
           .values({
             userId,
             name: challenge.pendingKeyName,
             keyHash: challenge.pendingKeyHash,
+            scope,
             expiresAt: boardApiKeyExpiresAt(),
           })
           .returning()

@@ -436,6 +436,7 @@ describe("agent instructions bundle routes", () => {
       .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
       .send({
         adapterType: "claude_local",
+        replaceAdapterConfig: true,
         adapterConfig: {
           model: "claude-sonnet-4",
         },
@@ -495,6 +496,131 @@ describe("agent instructions bundle routes", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it("does not preserve provider-specific config across Codex to Claude to Codex switches", async () => {
+    const codexAgent = {
+      ...makeAgent(),
+      adapterType: "codex_local",
+      adapterConfig: {
+        model: "gpt-5.4",
+        fastMode: true,
+        env: { SHARED_FLAG: "1" },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(codexAgent);
+
+    const claudeRes = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({
+        adapterType: "claude_local",
+        replaceAdapterConfig: true,
+        adapterConfig: {
+          model: "claude-sonnet-4",
+          permissionMode: "acceptEdits",
+        },
+      }));
+
+    expect(claudeRes.status, JSON.stringify(claudeRes.body)).toBe(200);
+    const claudePatch = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const claudeConfig = claudePatch.adapterConfig as Record<string, unknown>;
+    expect(claudeConfig).toMatchObject({
+      model: "claude-sonnet-4",
+      permissionMode: "acceptEdits",
+      env: { SHARED_FLAG: "1" },
+    });
+    expect(claudeConfig.fastMode).toBeUndefined();
+
+    mockAgentService.getById.mockResolvedValue({
+      ...codexAgent,
+      adapterType: "claude_local",
+      adapterConfig: claudeConfig,
+    });
+    mockAgentService.update.mockClear();
+
+    const codexRes = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({
+        adapterType: "codex_local",
+        adapterConfig: claudeConfig,
+      }));
+
+    expect(codexRes.status, JSON.stringify(codexRes.body)).toBe(200);
+    const codexConfig = (mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>)
+      .adapterConfig as Record<string, unknown>;
+    expect(codexConfig.model).toBeUndefined();
+    expect(codexConfig.permissionMode).toBeUndefined();
+    expect(codexConfig.env).toEqual({ SHARED_FLAG: "1" });
+  });
+
+  it("does not leak provider-specific config through multiple provider switches", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterType: "gemini_local",
+      adapterConfig: {
+        model: "auto",
+        engine: "acp",
+        fastMode: true,
+        cwd: "/workspace/shared",
+        timeoutSec: 120,
+      },
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({
+        adapterType: "codex_local",
+        adapterConfig: {
+          model: "auto",
+          engine: "acp",
+          fastMode: true,
+          cwd: "/workspace/shared",
+          timeoutSec: 120,
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const config = (mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>)
+      .adapterConfig as Record<string, unknown>;
+    expect(config.model).toBeUndefined();
+    expect(config.engine).toBeUndefined();
+    expect(config.fastMode).toBeUndefined();
+    expect(config.cwd).toBe("/workspace/shared");
+    expect(config.timeoutSec).toBe(120);
+  });
+
+  it("preserves cross-provider config and accepts explicit target config on replacement switches", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterType: "claude_local",
+      adapterConfig: {
+        model: "claude-sonnet-4",
+        env: { SHARED_FLAG: "old" },
+        cwd: "/workspace/shared",
+        graceSec: 20,
+      },
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({
+        adapterType: "codex_local",
+        replaceAdapterConfig: true,
+        adapterConfig: {
+          model: "gpt-5.4",
+          env: { SHARED_FLAG: "new" },
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const config = (mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>)
+      .adapterConfig as Record<string, unknown>;
+    expect(config).toMatchObject({
+      model: "gpt-5.4",
+      env: { SHARED_FLAG: "new" },
+      cwd: "/workspace/shared",
+      graceSec: 20,
+    });
   });
 
   it("merges same-adapter config patches so instructions metadata is not dropped", async () => {

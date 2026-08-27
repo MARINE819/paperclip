@@ -12,6 +12,7 @@ import {
   isCloudManagedInstance,
   type CloudInstanceEnv,
 } from "../services/cloud-instance.js";
+import { getHiddenSettings } from "../services/settings-visibility.js";
 import {
   inspectDatabaseBackupHealth,
   type DatabaseBackupHealthStatus,
@@ -19,6 +20,13 @@ import {
   type InspectDatabaseBackupHealthOptions,
 } from "../services/database-backup-health.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { isManagedWorkspaceInstance, resolveWorkspaceReadiness } from "../services/workspace-readiness.js";
+import {
+  resolveWorkspaceReadinessLocalToken,
+  WORKSPACE_READINESS_TOKEN_HEADER,
+  WORKSPACE_READINESS_USER_EMAIL_HEADER,
+  WORKSPACE_READINESS_USER_ID_HEADER,
+} from "../auth/workspace-login-handoff.js";
 import { serverVersion } from "../version.js";
 
 function shouldExposeFullHealthDetails(
@@ -29,15 +37,31 @@ function shouldExposeFullHealthDetails(
   return actorType === "board" || actorType === "agent";
 }
 
-function hasDevServerStatusToken(providedToken: string | undefined) {
-  const expectedToken = process.env.PAPERCLIP_DEV_SERVER_STATUS_TOKEN?.trim();
+function matchesSharedToken(expectedToken: string | undefined | null, providedToken: string | undefined) {
+  const expectedValue = expectedToken?.trim();
   const token = providedToken?.trim();
-  if (!expectedToken || !token) return false;
+  if (!expectedValue || !token) return false;
 
-  const expected = Buffer.from(expectedToken);
+  const expected = Buffer.from(expectedValue);
   const provided = Buffer.from(token);
   if (expected.length !== provided.length) return false;
   return timingSafeEqual(expected, provided);
+}
+
+function hasDevServerStatusToken(providedToken: string | undefined) {
+  return matchesSharedToken(process.env.PAPERCLIP_DEV_SERVER_STATUS_TOKEN, providedToken);
+}
+
+/**
+ * Whether the caller may read this instance's workspace readiness.
+ *
+ * A managed workspace runs in `authenticated` mode, so its own control plane has
+ * no board session against it. The runtime injects a derived probe token into the
+ * guest and presents it here — the same shared-secret shape the dev-server
+ * supervisor already uses, and never a browser-supplied identity header.
+ */
+function hasWorkspaceReadinessToken(providedToken: string | undefined) {
+  return matchesSharedToken(resolveWorkspaceReadinessLocalToken(), providedToken);
 }
 
 function redactedDatabaseBackupWarning(warning: DatabaseBackupHealthWarning): DatabaseBackupHealthWarning {
@@ -73,6 +97,50 @@ function getCloudHealthStatus(env: CloudInstanceEnv) {
   };
 }
 
+type HeartbeatSchedulerReadiness = "ready" | "disabled" | "not_ready";
+
+async function inspectBootstrapStatus(
+  db: Db,
+  deploymentMode: DeploymentMode,
+  runtimeEnv: CloudInstanceEnv,
+) {
+  let bootstrapStatus: "ready" | "bootstrap_pending" = "ready";
+  let bootstrapInviteActive = false;
+
+  // Cloud-managed instances have no first-admin concept: the control
+  // plane owns identity and its trusted-header users are deliberately
+  // never instance_admin, so the role-count gate below would report
+  // bootstrap_pending forever and lock every managed tenant out at the
+  // claim screen. Self-hosted deployments are unaffected.
+  if (deploymentMode === "authenticated" && !isCloudManagedInstance(runtimeEnv)) {
+    const roleCount = await db
+      .select({ count: count() })
+      .from(instanceUserRoles)
+      .where(sql`${instanceUserRoles.role} = 'instance_admin'`)
+      .then((rows) => Number(rows[0]?.count ?? 0));
+    bootstrapStatus = roleCount > 0 ? "ready" : "bootstrap_pending";
+
+    if (bootstrapStatus === "bootstrap_pending") {
+      const now = new Date();
+      const inviteCount = await db
+        .select({ count: count() })
+        .from(invites)
+        .where(
+          and(
+            eq(invites.inviteType, "bootstrap_ceo"),
+            isNull(invites.revokedAt),
+            isNull(invites.acceptedAt),
+            gt(invites.expiresAt, now),
+          ),
+        )
+        .then((rows) => Number(rows[0]?.count ?? 0));
+      bootstrapInviteActive = inviteCount > 0;
+    }
+  }
+
+  return { bootstrapStatus, bootstrapInviteActive };
+}
+
 export function healthRoutes(
   db?: Db,
   opts: {
@@ -83,6 +151,7 @@ export function healthRoutes(
     serverInfo?: ServerInfoSnapshot;
     databaseBackupHealth?: InspectDatabaseBackupHealthOptions;
     runtimeEnv?: CloudInstanceEnv;
+    heartbeatSchedulerStatus?: HeartbeatSchedulerReadiness;
   } = {
     deploymentMode: "local_trusted",
     deploymentExposure: "private",
@@ -91,6 +160,40 @@ export function healthRoutes(
   },
 ) {
   const router = Router();
+
+  router.get("/ready", async (_req, res) => {
+    if (!db) {
+      res.status(503).json({ status: "not_ready", error: "database_unconfigured" });
+      return;
+    }
+
+    try {
+      await db.execute(sql`SELECT 1`);
+    } catch (error) {
+      logger.warn({ err: error }, "Readiness check database probe failed");
+      res.status(503).json({ status: "not_ready", error: "database_unreachable" });
+      return;
+    }
+
+    if (opts.deploymentMode === "authenticated" && !opts.authReady) {
+      res.status(503).json({ status: "not_ready", error: "authentication_not_ready" });
+      return;
+    }
+
+    const runtimeEnv = opts.runtimeEnv ?? process.env;
+    const { bootstrapStatus } = await inspectBootstrapStatus(db, opts.deploymentMode, runtimeEnv);
+    if (bootstrapStatus !== "ready") {
+      res.status(503).json({ status: "not_ready", error: "bootstrap_pending" });
+      return;
+    }
+
+    if ((opts.heartbeatSchedulerStatus ?? "disabled") === "not_ready") {
+      res.status(503).json({ status: "not_ready", error: "heartbeat_scheduler_not_ready" });
+      return;
+    }
+
+    res.json({ status: "ready" });
+  });
 
   router.post("/dev-server/restart", async (req, res) => {
     const actorType = "actor" in req ? req.actor?.type : null;
@@ -134,6 +237,11 @@ export function healthRoutes(
     );
     const runtimeEnv = opts.runtimeEnv ?? process.env;
     const cloud = getCloudHealthStatus(runtimeEnv);
+    // Operator-hidden settings ride every response (like `cloud`): the list
+    // holds UI surface names only, and the settings nav needs it before any
+    // fuller-detail fetch. Omitted entirely when nothing is hidden, so
+    // deployments without the env var keep today's byte-identical responses.
+    const hiddenSettings = [...getHiddenSettings(runtimeEnv)];
     // serverInfo (git SHA + process start) rides on the full-details responses
     // only, so it reaches board/agent actors in authenticated mode or any caller
     // in local_trusted dev — never anonymous authenticated callers. The
@@ -147,6 +255,17 @@ export function healthRoutes(
     const commit = serverInfo.git.available ? serverInfo.git.fullSha : null;
     const exposeDevServerDetails =
       exposeFullDetails || hasDevServerStatusToken(req.get("x-paperclip-dev-server-status-token"));
+    // Workspace readiness names the instance and execution workspace that
+    // answered, so it rides the protected responses only. Public health stays
+    // redacted: an anonymous caller still learns liveness and nothing else.
+    const exposeWorkspaceReadiness =
+      isManagedWorkspaceInstance()
+      && (exposeFullDetails || hasWorkspaceReadinessToken(req.get(WORKSPACE_READINESS_TOKEN_HEADER)));
+    const requestedHandoffUserId = req.get(WORKSPACE_READINESS_USER_ID_HEADER)?.trim();
+    const requestedHandoffUserEmail = req.get(WORKSPACE_READINESS_USER_EMAIL_HEADER)?.trim();
+    const handoffSubject = requestedHandoffUserId && requestedHandoffUserEmail
+      ? { userId: requestedHandoffUserId, email: requestedHandoffUserEmail }
+      : null;
 
     if (!db) {
       res.json(
@@ -158,12 +277,14 @@ export function healthRoutes(
               commit,
               serverInfo,
               ...(cloud ? { cloud } : {}),
+              ...(hiddenSettings.length ? { hiddenSettings } : {}),
             }
           : {
               status: "ok",
               deploymentMode: opts.deploymentMode,
               commit,
               ...(cloud ? { cloud } : {}),
+              ...(hiddenSettings.length ? { hiddenSettings } : {}),
             },
       );
       return;
@@ -173,6 +294,12 @@ export function healthRoutes(
       await db.execute(sql`SELECT 1`);
     } catch (error) {
       logger.warn({ err: error }, "Health check database probe failed");
+      // Carry readiness on the unhealthy response too: the seed phase recorded on
+      // disk is exactly what tells an operator whether this is a half-finished
+      // restore or a database that died after being verified.
+      const workspace = exposeWorkspaceReadiness
+        ? await resolveWorkspaceReadiness({ db, handoffSubject }).catch(() => null)
+        : null;
       res.status(503).json({
         status: "unhealthy",
         version: serverVersion,
@@ -180,44 +307,17 @@ export function healthRoutes(
         commit,
         error: "database_unreachable",
         ...(exposeFullDetails ? { serverInfo } : {}),
+        ...(workspace ? { workspace } : {}),
         ...(cloud ? { cloud } : {}),
       });
       return;
     }
 
-    let bootstrapStatus: "ready" | "bootstrap_pending" = "ready";
-    let bootstrapInviteActive = false;
-    // Cloud-managed instances have no first-admin concept: the control
-    // plane owns identity and its trusted-header users are deliberately
-    // never instance_admin, so the role-count gate below would report
-    // bootstrap_pending forever and lock every managed tenant out at the
-    // claim screen. Self-hosted deployments (neither canonical managed signal)
-    // are unaffected.
-    if (opts.deploymentMode === "authenticated" && !isCloudManagedInstance(runtimeEnv)) {
-      const roleCount = await db
-        .select({ count: count() })
-        .from(instanceUserRoles)
-        .where(sql`${instanceUserRoles.role} = 'instance_admin'`)
-        .then((rows) => Number(rows[0]?.count ?? 0));
-      bootstrapStatus = roleCount > 0 ? "ready" : "bootstrap_pending";
-
-      if (bootstrapStatus === "bootstrap_pending") {
-        const now = new Date();
-        const inviteCount = await db
-          .select({ count: count() })
-          .from(invites)
-          .where(
-            and(
-              eq(invites.inviteType, "bootstrap_ceo"),
-              isNull(invites.revokedAt),
-              isNull(invites.acceptedAt),
-              gt(invites.expiresAt, now),
-            ),
-          )
-          .then((rows) => Number(rows[0]?.count ?? 0));
-        bootstrapInviteActive = inviteCount > 0;
-      }
-    }
+    const { bootstrapStatus, bootstrapInviteActive } = await inspectBootstrapStatus(
+      db,
+      opts.deploymentMode,
+      runtimeEnv,
+    );
 
     const persistedDevServerStatus = readPersistedDevServerStatus();
     let devServer: ReturnType<typeof toDevServerHealthStatus> | undefined;
@@ -235,6 +335,13 @@ export function healthRoutes(
         activeRunCount,
       });
     }
+
+    const workspaceReadiness = exposeWorkspaceReadiness
+      ? await resolveWorkspaceReadiness({ db, handoffSubject }).catch((error) => {
+          logger.warn({ err: error }, "workspace readiness probe failed");
+          return null;
+        })
+      : null;
 
     const databaseBackup = opts.databaseBackupHealth
       ? inspectDatabaseBackupHealth(opts.databaseBackupHealth)
@@ -254,7 +361,12 @@ export function healthRoutes(
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
         ...(redactedWarnings ? { warnings: redactedWarnings } : {}),
         ...(devServer ? { devServer } : {}),
+        // Token-authorized probe on an otherwise redacted response: the control
+        // plane needs readiness without a board session, and nothing else about
+        // this instance becomes visible.
+        ...(workspaceReadiness ? { workspace: workspaceReadiness } : {}),
         ...(cloud ? { cloud } : {}),
+        ...(hiddenSettings.length ? { hiddenSettings } : {}),
       });
       return;
     }
@@ -276,7 +388,9 @@ export function healthRoutes(
       ...(databaseBackup ? { databaseBackup } : {}),
       ...(warnings ? { warnings } : {}),
       ...(devServer ? { devServer } : {}),
+      ...(workspaceReadiness ? { workspace: workspaceReadiness } : {}),
       ...(cloud ? { cloud } : {}),
+      ...(hiddenSettings.length ? { hiddenSettings } : {}),
     });
   });
 

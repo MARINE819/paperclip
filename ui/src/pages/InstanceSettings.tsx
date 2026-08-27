@@ -17,7 +17,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
 }
-
 function humanize(value: string) {
   return value.replaceAll("_", " ");
 }
@@ -172,14 +171,14 @@ export function InstanceSettings() {
           <h1 className="text-lg font-semibold">Scheduler Heartbeats</h1>
         </div>
         <p className="text-sm text-muted-foreground">
-          Agents with a timer heartbeat enabled across all of your companies.
+          Agents with a timer heartbeat enabled across all of your organizations.
         </p>
       </div>
 
       <div className="flex items-center gap-4 text-sm text-muted-foreground">
         <span><span className="font-semibold text-foreground">{activeCount}</span> active</span>
         <span><span className="font-semibold text-foreground">{disabledCount}</span> disabled</span>
-        <span><span className="font-semibold text-foreground">{grouped.length}</span> {grouped.length === 1 ? "company" : "companies"}</span>
+        <span><span className="font-semibold text-foreground">{grouped.length}</span> {grouped.length === 1 ? "organization" : "organizations"}</span>
         {anyEnabled && (
           <Button
             variant="destructive"

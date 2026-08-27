@@ -8,6 +8,7 @@ describe("createApiProxy", () => {
     socket?: { encrypted?: boolean };
   }) {
     const proxy = createApiProxy();
+    expect(proxy["/api"].target).toBe("http://127.0.0.1:3100");
     const proxyEmitter = new EventEmitter();
     proxy["/api"].configure!(proxyEmitter as never, {} as never);
     const setHeader = vi.fn();

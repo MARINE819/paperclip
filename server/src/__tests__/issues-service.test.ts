@@ -2590,9 +2590,63 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     expect(result).toBeTruthy();
     expect(result?.description).toHaveLength(1200);
+    expect(result?.descriptionTruncated).toBe(true);
     expect(result?.executionPolicy).toBeNull();
     expect(result?.executionState).toBeNull();
     expect(result?.executionWorkspaceSettings).toBeNull();
+  });
+
+  it("marks list descriptions as not truncated when they fit the preview limit", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const description = "x".repeat(1200);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Exact preview issue",
+      description,
+      status: "todo",
+      priority: "medium",
+    });
+
+    const [result] = await svc.list(companyId);
+
+    expect(result?.description).toHaveLength(1200);
+    expect(result?.descriptionTruncated).toBe(false);
+  });
+
+  it("marks null list descriptions as not truncated", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Null description issue",
+      description: null,
+      status: "todo",
+      priority: "medium",
+    });
+
+    const [result] = await svc.list(companyId);
+
+    expect(result?.description).toBeNull();
+    expect(result?.descriptionTruncated).toBe(false);
   });
 
   it("does not let description preview truncation split multibyte characters", async () => {
@@ -2620,6 +2674,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     expect(result?.description).toHaveLength(1200);
     expect(result?.description?.endsWith("—")).toBe(true);
+    expect(result?.descriptionTruncated).toBe(true);
   });
 });
 
@@ -4535,6 +4590,13 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         title: "Child A",
         status: "done",
         priority: "medium",
+        // Give the children distinct, ordered issue numbers. The service
+        // sorts direct children by issueNumber, then createdAt. A batched
+        // insert gives every row in the statement the same defaultNow()
+        // createdAt, so without a distinct issueNumber the two children
+        // tie on both sort keys and the database is free to return them
+        // in either order.
+        issueNumber: 1,
       },
       {
         id: childB,
@@ -4543,6 +4605,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         title: "Child B",
         status: "blocked",
         priority: "medium",
+        issueNumber: 2,
       },
     ]);
 

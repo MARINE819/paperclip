@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { IssueAttachment, IssueWorkProduct } from "@paperclipai/shared";
 import {
   documentDisplayTitle,
+  getAttachmentBackedWorkProductAttachmentIds,
   isAgentAttachment,
   selectAgentArtifactAttachments,
   workProductHref,
+  workProductIdFromHash,
 } from "./issue-artifacts";
 
 function makeAttachment(overrides: Partial<IssueAttachment> & { id: string }): IssueAttachment {
@@ -112,6 +114,54 @@ describe("selectAgentArtifactAttachments", () => {
   it("tolerates missing inputs", () => {
     expect(selectAgentArtifactAttachments(null, null)).toEqual([]);
   });
+
+  it("dedupes markdown attachments promoted to work products", () => {
+    // Markdown is excluded from the binary Output surface, so this dedupe must
+    // not depend on getPromotedOutputAttachmentIds (LOOA-1533 duplicate rows).
+    const promotedId = "00000000-0000-4000-8000-000000000002";
+    const promoted = makeAttachment({
+      id: promotedId,
+      createdByAgentId: "agent-1",
+      contentType: "text/markdown",
+      originalFilename: "report.md",
+    });
+    const workProduct = makePromotingWorkProduct(promotedId);
+    workProduct.metadata = {
+      ...(workProduct.metadata as Record<string, unknown>),
+      contentType: "text/markdown",
+      originalFilename: "report.md",
+    };
+    expect(selectAgentArtifactAttachments([promoted], [workProduct])).toEqual([]);
+  });
+});
+
+describe("getAttachmentBackedWorkProductAttachmentIds", () => {
+  it("collects attachment ids across content types", () => {
+    const imageId = "00000000-0000-4000-8000-000000000001";
+    const markdownId = "00000000-0000-4000-8000-000000000002";
+    const markdownWorkProduct = makePromotingWorkProduct(markdownId);
+    markdownWorkProduct.metadata = {
+      ...(markdownWorkProduct.metadata as Record<string, unknown>),
+      contentType: "text/markdown",
+      originalFilename: "report.md",
+    };
+    const ids = getAttachmentBackedWorkProductAttachmentIds([
+      makePromotingWorkProduct(imageId),
+      markdownWorkProduct,
+    ]);
+    expect(ids).toEqual(new Set([imageId, markdownId]));
+  });
+
+  it("ignores non-canonical or non-paperclip work products", () => {
+    const attachmentId = "00000000-0000-4000-8000-000000000003";
+    const foreign = { ...makePromotingWorkProduct(attachmentId), provider: "github" };
+    const invalid = {
+      ...makePromotingWorkProduct(attachmentId),
+      metadata: { attachmentId, openPath: "https://evil.example/content" },
+    };
+    expect(getAttachmentBackedWorkProductAttachmentIds([foreign, invalid])).toEqual(new Set());
+    expect(getAttachmentBackedWorkProductAttachmentIds(null)).toEqual(new Set());
+  });
 });
 
 describe("workProductHref", () => {
@@ -143,6 +193,23 @@ describe("workProductHref", () => {
   it("returns null without url or metadata links", () => {
     expect(workProductHref({ url: null, metadata: null })).toBeNull();
     expect(workProductHref({ url: null, metadata: { attachmentId: "a" } })).toBeNull();
+  });
+});
+
+describe("workProductIdFromHash", () => {
+  it("returns the work-product identifier from an artifact deep link", () => {
+    expect(workProductIdFromHash("#work-product-9a02c2ac-cfa4-45be-9fff-597415f7bb28"))
+      .toBe("9a02c2ac-cfa4-45be-9fff-597415f7bb28");
+  });
+
+  it("leaves recovery and run links untouched", () => {
+    expect(workProductIdFromHash("#recovery-action-29f756da-dde9-4832-bd33-7e54290f3f7f")).toBeNull();
+    expect(workProductIdFromHash("#run-7097daac-bf2b-44a6-9a02-862735b65dd9")).toBeNull();
+  });
+
+  it("fails safely for malformed or path-like artifact identifiers", () => {
+    expect(workProductIdFromHash("#work-product-%E0%A4%A")).toBeNull();
+    expect(workProductIdFromHash("#work-product-..%2Fsecret")).toBeNull();
   });
 });
 

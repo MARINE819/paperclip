@@ -17,6 +17,7 @@ import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@pap
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { isApprovalOnlyBoardKeyRequestAllowed } from "../routes/authz.js";
 
 const CLOUD_TENANT_WRITE_DEBOUNCE_MS = 5_000;
 const CLOUD_TENANT_WRITE_DEBOUNCE_MAX = 1_000;
@@ -46,7 +47,7 @@ function pruneCloudTenantWriteDebounce(
 }
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
-import { forbidden, unprocessable } from "../errors.js";
+import { forbidden, unauthorized, unprocessable } from "../errors.js";
 
 export { isCloudManagedInstance } from "../services/cloud-instance.js";
 
@@ -56,6 +57,20 @@ function hashToken(token: string) {
 
 function normalizeOptionalString(value: string | null | undefined) {
   return value?.trim() || null;
+}
+
+function invalidAgentTokenMessage(token: string) {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as {
+      exp?: unknown;
+    };
+    if (typeof payload.exp === "number" && payload.exp <= Math.floor(Date.now() / 1000)) {
+      return "Expired agent token; obtain fresh credentials and retry";
+    }
+  } catch {
+    // Malformed and incorrectly signed tokens share the generic failure below.
+  }
+  return "Agent token did not verify; obtain fresh credentials and retry";
 }
 
 async function resolveLegacyRunResponsibleUserId(
@@ -191,7 +206,7 @@ interface ActorMiddlewareOptions {
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, _res, next) => {
+  return async (req, res, next) => {
     req.actor =
       opts.deploymentMode === "local_trusted"
         ? {
@@ -207,7 +222,8 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     const runIdHeader = req.header("x-paperclip-run-id");
 
     const authHeader = req.header("authorization");
-    if (!authHeader?.toLowerCase().startsWith("bearer ")) {
+    const hasBearerCredentials = /^bearer(?:\s|$)/i.test(authHeader ?? "");
+    if (!hasBearerCredentials) {
       if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
         const cloudTenantActor = await resolveCloudTenantActor(db, req);
         if (cloudTenantActor) {
@@ -259,9 +275,9 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    const token = authHeader.slice("bearer ".length).trim();
+    const token = authHeader!.slice("bearer".length).trim();
     if (!token) {
-      next();
+      next(unauthorized("Empty bearer token; provide valid agent credentials and retry"));
       return;
     }
 
@@ -269,6 +285,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     if (boardKey) {
       const access = await boardAuth.resolveBoardAccess(boardKey.userId);
       if (access.user) {
+        if (
+          boardKey.scope === "approval_only" &&
+          !isApprovalOnlyBoardKeyRequestAllowed(req.method, req.path)
+        ) {
+          res.status(403).json({
+            error: "This paired device can only access Approval review actions",
+            reason: "board_key_scope_approval_only",
+          });
+          return;
+        }
         await boardAuth.touchBoardApiKey(boardKey.id);
         req.actor = {
           type: "board",
@@ -279,6 +305,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           memberships: access.memberships,
           isInstanceAdmin: access.isInstanceAdmin,
           keyId: boardKey.id,
+          boardKeyScope: boardKey.scope ?? null,
           runId: runIdHeader || undefined,
           source: "board_key",
         };
@@ -297,7 +324,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     if (!key) {
       const claims = verifyLocalAgentJwt(token);
       if (!claims) {
-        next();
+        next(unauthorized(invalidAgentTokenMessage(token)));
         return;
       }
 
@@ -308,12 +335,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         .then((rows) => rows[0] ?? null);
 
       if (!agentRecord || agentRecord.companyId !== claims.company_id) {
-        next();
+        next(unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry"));
         return;
       }
 
-      if (agentRecord.status === "terminated" || agentRecord.status === "pending_approval") {
-        next();
+      if (agentRecord.status === "terminated") {
+        next(unauthorized("Agent is terminated and cannot authenticate"));
+        return;
+      }
+      if (agentRecord.status === "pending_approval") {
+        next(unauthorized("Agent is pending approval and cannot authenticate"));
         return;
       }
 
@@ -375,8 +406,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       .where(eq(agents.id, key.agentId))
       .then((rows) => rows[0] ?? null);
 
-    if (!agentRecord || agentRecord.status === "terminated" || agentRecord.status === "pending_approval") {
-      next();
+    if (!agentRecord || agentRecord.companyId !== key.companyId) {
+      next(unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry"));
+      return;
+    }
+    if (agentRecord.status === "terminated") {
+      next(unauthorized("Agent is terminated and cannot authenticate"));
+      return;
+    }
+    if (agentRecord.status === "pending_approval") {
+      next(unauthorized("Agent is pending approval and cannot authenticate"));
       return;
     }
 

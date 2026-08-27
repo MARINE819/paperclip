@@ -303,11 +303,15 @@ describe("approval routes idempotent retries", () => {
       payload: {},
     });
     mockApprovalService.requestRevision.mockResolvedValue({
-      id: "approval-6",
-      companyId: "company-1",
-      type: "hire_agent",
-      status: "revision_requested",
-      payload: {},
+      approval: {
+        id: "approval-6",
+        companyId: "company-1",
+        type: "hire_agent",
+        status: "revision_requested",
+        payload: {},
+      },
+      applied: true,
+      outcome: "applied",
     });
 
     const res = await request(await createApp())

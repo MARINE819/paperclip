@@ -11,13 +11,20 @@ vi.mock("@/lib/router", () => ({
     to,
     children,
     disableIssueQuicklook,
+    reloadDocument,
     ...props
   }: {
     to: string;
     children: ReactNode;
     disableIssueQuicklook?: boolean;
+    reloadDocument?: boolean;
   }) => (
-    <a href={to} data-disable-issue-quicklook={disableIssueQuicklook ? "true" : undefined} {...props}>
+    <a
+      href={to}
+      data-disable-issue-quicklook={disableIssueQuicklook ? "true" : undefined}
+      data-reload-document={reloadDocument ? "true" : undefined}
+      {...props}
+    >
       {children}
     </a>
   ),
@@ -40,13 +47,51 @@ function makeArtifact(overrides: Partial<CompanyArtifact> = {}): CompanyArtifact
     issue: { id: "issue-1", identifier: "PAP-10306", title: "Landing visuals" },
     project: { id: "proj-1", name: "Paperclip App" },
     createdByAgent: { id: "agent-1", name: "ClaudeCoder" },
-    updatedAt: "2026-06-01T12:00:00.000Z",
+    // Local, not UTC: the card renders "Last edited" from the local calendar
+    // day, and noon UTC is already the 2nd at UTC+14.
+    updatedAt: new Date(2026, 5, 1, 12, 0, 0, 0).toISOString(),
     href: "/issues/PAP-10306#attachment-art-1",
     ...overrides,
   };
 }
 
 describe("ArtifactCard", () => {
+  it("uses the attachment viewer as the primary action for a Markdown work-product card", () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const openPath = "/api/attachments/939bea08-1746-499a-b978-66409f1e5650/content";
+    const contextHref = "/NEX/issues/NEX-92#work-product-9a02c2ac-cfa4-45be-9fff-597415f7bb28";
+
+    flushSync(() => {
+      root.render(
+        <ArtifactCard
+          artifact={makeArtifact({
+            id: "work_product:9a02c2ac-cfa4-45be-9fff-597415f7bb28",
+            source: "work_product",
+            mediaKind: "text",
+            title: "NEX-92 UAT evidence",
+            contentType: "text/markdown",
+            contentPath: openPath,
+            openPath,
+            downloadPath: `${openPath}?download=1`,
+            href: contextHref,
+          })}
+        />,
+      );
+    });
+
+    const primary = container.querySelector<HTMLAnchorElement>('[data-testid="artifact-card"]');
+    expect(primary?.getAttribute("href")).toBe(openPath);
+    expect(primary?.getAttribute("target")).toBe("_blank");
+    expect(primary?.getAttribute("data-reload-document")).toBe("true");
+    expect(container.querySelector<HTMLAnchorElement>('[aria-label="View task context"]')?.getAttribute("href"))
+      .toBe(contextHref);
+
+    flushSync(() => root.unmount());
+    container.remove();
+  });
+
   it("renders an image preview with cover image and links to the issue anchor", () => {
     const markup = renderToStaticMarkup(<ArtifactCard artifact={makeArtifact()} />);
     expect(markup).toContain('href="/issues/PAP-10306#attachment-art-1"');
@@ -69,7 +114,7 @@ describe("ArtifactCard", () => {
         artifact={makeArtifact({
           title: "Social launch clip",
           issue: { id: "issue-2", identifier: "PAP-10370", title: "Make artifact page look like this" },
-          updatedAt: "2025-10-08T12:00:00.000Z",
+          updatedAt: new Date(2025, 9, 8, 12, 0, 0, 0).toISOString(),
           createdByAgent: null,
         })}
       />,

@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
@@ -15,7 +15,15 @@ export function approvalService(db: Db) {
   const canResolveStatuses = new Set(["pending", "revision_requested"]);
   const resolvableStatuses = Array.from(canResolveStatuses);
   type ApprovalRecord = typeof approvals.$inferSelect;
-  type ResolutionResult = { approval: ApprovalRecord; applied: boolean };
+  // "applied" is kept for backward compatibility with existing callers that
+  // only destructure it (agents.ts, plugin-host-services.ts); "outcome" is
+  // additive and lets routes/approvals.ts pick the right HTTP status without
+  // those callers needing any change.
+  type ResolutionOutcome = "applied" | "already_applied" | "conflict" | "expired";
+  type ResolutionResult = { approval: ApprovalRecord; applied: boolean; outcome: ResolutionOutcome };
+  function isExpiredAt(approval: Pick<ApprovalRecord, "expiresAt">, at: Date): boolean {
+    return approval.expiresAt != null && approval.expiresAt.getTime() <= at.getTime();
+  }
 
   function redactApprovalComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
     return {
@@ -48,16 +56,23 @@ export function approvalService(db: Db) {
     decisionNote: string | null | undefined,
   ): Promise<ResolutionResult> {
     const existing = await getExistingApproval(id);
+    const now = new Date();
+
     if (!canResolveStatuses.has(existing.status)) {
       if (existing.status === targetStatus) {
-        return { approval: existing, applied: false };
+        return { approval: existing, applied: false, outcome: "already_applied" };
       }
-      throw unprocessable(
-        `Only pending or revision requested approvals can be ${targetStatus === "approved" ? "approved" : "rejected"}`,
-      );
+      return { approval: existing, applied: false, outcome: "conflict" };
     }
 
-    const now = new Date();
+    // Fail fast on an already-visibly-expired approval before even
+    // attempting the UPDATE — purely an early exit for a clearer code path;
+    // the WHERE clause below re-checks the same condition atomically, so
+    // this early check is not itself the source of correctness.
+    if (isExpiredAt(existing, now)) {
+      return { approval: existing, applied: false, outcome: "expired" };
+    }
+
     const updated = await db
       .update(approvals)
       .set({
@@ -67,19 +82,39 @@ export function approvalService(db: Db) {
         decidedAt: now,
         updatedAt: now,
       })
-      .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
+      .where(
+        and(
+          eq(approvals.id, id),
+          inArray(approvals.status, resolvableStatuses),
+          // Legacy/backward-compat: approvals whose expiresAt was never set
+          // (every pre-existing row, and every non-Risk-Guard type today)
+          // match isNull(...) and are therefore completely unaffected by
+          // this added condition — behavior for them is byte-for-byte the
+          // same as before this change.
+          or(isNull(approvals.expiresAt), gt(approvals.expiresAt, now)),
+        ),
+      )
       .returning()
       .then((rows) => rows[0] ?? null);
 
     if (updated) {
-      return { approval: updated, applied: true };
+      return { approval: updated, applied: true, outcome: "applied" };
     }
 
     const latest = await getExistingApproval(id);
     if (latest.status === targetStatus) {
-      return { approval: latest, applied: false };
+      return { approval: latest, applied: false, outcome: "already_applied" };
+    }
+    if (isExpiredAt(latest, new Date())) {
+      return { approval: latest, applied: false, outcome: "expired" };
+    }
+    if (!canResolveStatuses.has(latest.status)) {
+      return { approval: latest, applied: false, outcome: "conflict" };
     }
 
+    // Should be unreachable: still resolvable and not expired, yet the
+    // UPDATE affected 0 rows. Fail loudly instead of silently misreporting
+    // an outcome — this indicates a real bug if it ever fires.
     throw unprocessable(
       `Only pending or revision requested approvals can be ${targetStatus === "approved" ? "approved" : "rejected"}`,
     );
@@ -141,7 +176,7 @@ export function approvalService(db: Db) {
     },
 
     approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
-      const { approval: updated, applied } = await resolveApproval(
+      const { approval: updated, applied, outcome } = await resolveApproval(
         id,
         "approved",
         decidedByUserId,
@@ -207,11 +242,11 @@ export function approvalService(db: Db) {
         }
       }
 
-      return { approval: updated, applied };
+      return { approval: updated, applied, outcome };
     },
 
     reject: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
-      const { approval: updated, applied } = await resolveApproval(
+      const { approval: updated, applied, outcome } = await resolveApproval(
         id,
         "rejected",
         decidedByUserId,
@@ -226,17 +261,25 @@ export function approvalService(db: Db) {
         }
       }
 
-      return { approval: updated, applied };
+      return { approval: updated, applied, outcome };
     },
 
     requestRevision: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
       const existing = await getExistingApproval(id);
+      const now = new Date();
+
       if (existing.status !== "pending") {
-        throw unprocessable("Only pending approvals can request revision");
+        if (existing.status === "revision_requested") {
+          return { approval: existing, applied: false, outcome: "already_applied" as const };
+        }
+        return { approval: existing, applied: false, outcome: "conflict" as const };
       }
 
-      const now = new Date();
-      return db
+      if (isExpiredAt(existing, now)) {
+        return { approval: existing, applied: false, outcome: "expired" as const };
+      }
+
+      const updated = await db
         .update(approvals)
         .set({
           status: "revision_requested",
@@ -245,9 +288,33 @@ export function approvalService(db: Db) {
           decidedAt: now,
           updatedAt: now,
         })
-        .where(eq(approvals.id, id))
+        .where(
+          and(
+            eq(approvals.id, id),
+            eq(approvals.status, "pending"),
+            or(isNull(approvals.expiresAt), gt(approvals.expiresAt, now)),
+          ),
+        )
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        return { approval: updated, applied: true, outcome: "applied" as const };
+      }
+
+      const latest = await getExistingApproval(id);
+      if (latest.status === "revision_requested") {
+        return { approval: latest, applied: false, outcome: "already_applied" as const };
+      }
+      if (isExpiredAt(latest, new Date())) {
+        return { approval: latest, applied: false, outcome: "expired" as const };
+      }
+      if (latest.status !== "pending") {
+        return { approval: latest, applied: false, outcome: "conflict" as const };
+      }
+
+      // Should be unreachable, same defensive fallback as resolveApproval.
+      throw unprocessable("Only pending approvals can request revision");
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {

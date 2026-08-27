@@ -4,6 +4,33 @@ import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { responsibleUserAuthzShadowMode } from "../services/authorization.js";
 
+/**
+ * Every request an "approval_only"-scoped Board API key (a paired mobile
+ * device, see `boardAuthService.createCliAuthChallenge`) is allowed to make.
+ * Enforced centrally in `actorMiddleware` (server/src/middleware/auth.ts)
+ * before any route handler runs, so a new Approval route added later cannot
+ * accidentally become reachable by an approval-only key without also being
+ * added here. Default is deny: anything not listed is rejected with 403.
+ */
+export const APPROVAL_ONLY_SCOPE_ALLOWLIST: ReadonlyArray<{ method: string; pattern: RegExp }> = [
+  { method: "GET", pattern: /^\/api\/companies\/[^/]+\/approvals$/ },
+  { method: "GET", pattern: /^\/api\/approvals\/[^/]+$/ },
+  { method: "GET", pattern: /^\/api\/approvals\/[^/]+\/issues$/ },
+  { method: "GET", pattern: /^\/api\/approvals\/[^/]+\/comments$/ },
+  { method: "POST", pattern: /^\/api\/approvals\/[^/]+\/approve$/ },
+  { method: "POST", pattern: /^\/api\/approvals\/[^/]+\/reject$/ },
+  { method: "POST", pattern: /^\/api\/approvals\/[^/]+\/request-revision$/ },
+  { method: "POST", pattern: /^\/api\/approvals\/[^/]+\/comments$/ },
+];
+
+export function isApprovalOnlyBoardKeyRequestAllowed(method: string, path: string): boolean {
+  const normalizedMethod = method.toUpperCase();
+  const normalizedPath = path.split("?")[0] ?? path;
+  return APPROVAL_ONLY_SCOPE_ALLOWLIST.some(
+    (entry) => entry.method === normalizedMethod && entry.pattern.test(normalizedPath),
+  );
+}
+
 function throwOrShadowResponsibleUserCompanyAccessDeny(
   req: Request,
   companyId: string,

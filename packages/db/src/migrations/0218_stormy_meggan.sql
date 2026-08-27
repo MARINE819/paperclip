@@ -1,0 +1,1 @@
+ALTER TABLE "board_api_keys" ADD COLUMN "scope" text;

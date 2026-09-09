@@ -19,6 +19,7 @@ import {
 } from "./services/company-import-transfers.js";
 import { companyTransferRunService } from "./services/company-transfer-runs.js";
 import { healthRoutes } from "./routes/health.js";
+import { aiOfficeRoutes } from "./routes/ai-office.js";
 import { cloudRoutes } from "./routes/cloud.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
@@ -417,6 +418,14 @@ export async function createApp(
       heartbeatSchedulerStatus: opts.heartbeatSchedulerStatus,
       companyDeletionEnabled: opts.companyDeletionEnabled,
       databaseBackupHealth: opts.databaseBackupHealth,
+    }),
+  );
+  api.use(
+    "/ai-office",
+    aiOfficeRoutes(db, {
+      databaseBackupHealth: opts.databaseBackupHealth,
+      listenHost: opts.bindHost,
+      listenPort: opts.serverPort,
     }),
   );
   api.use(openApiRoutes());

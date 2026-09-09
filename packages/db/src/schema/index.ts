@@ -180,3 +180,6 @@ export { pluginLogs } from "./plugin_logs.js";
 export { orgUnits } from "./org_units.js";
 export { agentPerformanceReviews } from "./agent_performance_reviews.js";
 export { agentDraftAssets } from "./agent_draft_assets.js";
+export { memoryOperations } from "./memory_operations.js";
+export { knowledgeRecords } from "./knowledge_records.js";
+

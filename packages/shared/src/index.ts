@@ -2569,3 +2569,29 @@ export {
   isPaperclipDevRunnerCommand,
   rewriteUrlHostToLoopback,
 } from "./runtime-exposure/loopback-bind.js";
+
+export {
+  memorySourceTypeSchema,
+  memoryOperationStatusSchema,
+  memoryReviewStateSchema,
+  knowledgeRecordStatusSchema,
+  obsidianSyncStateSchema,
+  createMemoryOperationSchema,
+  updateMemoryOperationSchema,
+  reviewMemoryOperationSchema,
+  promoteMemoryOperationSchema,
+  createKnowledgeRecordSchema,
+  obsidianSyncRequestSchema,
+  extractMemoryOperationCandidateRequestSchema,
+} from "./validators/knowledge.js";
+
+export type {
+  MemorySourceType,
+  MemoryOperationStatus,
+  MemoryReviewState,
+  KnowledgeRecordStatus,
+  ObsidianSyncState,
+  MemoryOperation,
+  KnowledgeRecord,
+} from "./types/knowledge.js";
+

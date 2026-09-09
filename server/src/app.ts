@@ -61,6 +61,7 @@ import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { attentionRoutes } from "./routes/attention.js";
 import { decisionTrainingRoutes } from "./routes/decision-training.js";
+import { knowledgeRoutes } from "./routes/knowledge.js";
 import { decisionRoutes } from "./routes/decisions.js";
 import { decisionQueueRoutes } from "./routes/decision-queues.js";
 import type { DecisionServiceOptions } from "./services/decisions.js";
@@ -107,6 +108,10 @@ import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus } from "./services/activity-log.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
+import { reconcileAutomaticMemoryOperationCandidates } from "./services/memory-candidate-extraction.js";
+import { createFailureCooldownTracker } from "./services/memory-candidate-failure-cooldown.js";
+import { resolveMemoryCandidateReconcilerConfig } from "./services/memory-candidate-reconciler-config.js";
+import { createMemoryCandidateReconcilerScheduler } from "./services/memory-candidate-reconciler-scheduler.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
@@ -535,6 +540,7 @@ export async function createApp(
   api.use(dashboardRoutes(db));
   api.use(attentionRoutes(db));
   api.use(decisionTrainingRoutes(db));
+  api.use(knowledgeRoutes(db));
   api.use(decisionRoutes(db, opts.decisionServiceOptions));
   api.use(decisionQueueRoutes(db));
   api.use(userProfileRoutes(db));
@@ -865,6 +871,36 @@ export async function createApp(
     .finally(() => {
       sweepImportTransferSpools();
     });
+  // Phase 3.0B: durable automatic Memory Operation candidate extraction.
+  // Same shape as the import transfer sweep above (setInterval + `.unref()`
+  // + a startup-once run + swallow-and-log). Disabled by default
+  // (PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED) during implementation
+  // and UAT — see doc/memory-candidate-extraction.md. This never touches
+  // issues.ts or heartbeat.ts: it only re-derives eligibility from current
+  // DB state on each tick.
+  const memoryCandidateReconcilerConfig = resolveMemoryCandidateReconcilerConfig();
+  const memoryCandidateFailureCooldown = createFailureCooldownTracker();
+  const memoryCandidateReconcilerScheduler = createMemoryCandidateReconcilerScheduler({
+    // Merges the process-local cooldown tracker's current size into the
+    // successful result so it rides the scheduler's existing completion log
+    // (`{ result, durationMs }`) with no new business-result field on
+    // `reconcileAutomaticMemoryOperationCandidates` itself and no new query.
+    reconcile: async () => {
+      const result = await reconcileAutomaticMemoryOperationCandidates(db, {
+        batchSize: memoryCandidateReconcilerConfig.batchSize,
+        cooldown: memoryCandidateFailureCooldown,
+      });
+      return { ...result, cooldownMapSize: memoryCandidateFailureCooldown.size() };
+    },
+    intervalMs: memoryCandidateReconcilerConfig.intervalMs,
+    logger,
+    // Best-effort only: read for the tick-failure log, since a rejected
+    // reconcile() above carries no result to merge a size into.
+    getCooldownMapSize: () => memoryCandidateFailureCooldown.size(),
+  });
+  if (memoryCandidateReconcilerConfig.enabled) {
+    memoryCandidateReconcilerScheduler.start();
+  }
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
@@ -936,6 +972,7 @@ export async function createApp(
         clearInterval(importTransferSweepTimer);
         importTransferSweepTimer = null;
       }
+      await memoryCandidateReconcilerScheduler.stop();
       devWatcher?.close();
       viteHtmlRenderer?.dispose();
       void viteDevServer?.close().catch(() => undefined);

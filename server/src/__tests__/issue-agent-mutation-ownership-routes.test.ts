@@ -25,6 +25,7 @@ const mockIssueService = vi.hoisted(() => ({
   getDependencyReadiness: vi.fn(),
   getRelationSummaries: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  listAcceptedPlanDecompositions: vi.fn(async () => []),
   list: vi.fn(),
   listAttachments: vi.fn(),
   listComments: vi.fn(),
@@ -1127,6 +1128,55 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("createdByRunId is not valid for this company");
     expect(mockWorkProductService.createForIssue).not.toHaveBeenCalled();
+  });
+
+  it("blocks an agent from deleting a Work Product created by its own Run", async () => {
+    mockWorkProductService.getById.mockResolvedValue({
+      id: "product-1",
+      issueId,
+      companyId,
+      type: "artifact",
+      createdByRunId: ownerRunId,
+    });
+    const app = await createApp(ownerActor());
+
+    const res = await request(app).delete("/api/work-products/product-1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.reason).toBe("work_product_self_delete_requires_other_actor");
+    expect(mockWorkProductService.remove).not.toHaveBeenCalled();
+  });
+
+  it("allows an agent to delete a Work Product created by a different Run", async () => {
+    mockWorkProductService.getById.mockResolvedValue({
+      id: "product-1",
+      issueId,
+      companyId,
+      type: "artifact",
+      createdByRunId: "77777777-7777-4777-8777-777777777777",
+    });
+    const app = await createApp(ownerActor());
+
+    const res = await request(app).delete("/api/work-products/product-1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockWorkProductService.remove).toHaveBeenCalledWith("product-1");
+  });
+
+  it("allows Human Board to delete a Work Product created by any Run", async () => {
+    mockWorkProductService.getById.mockResolvedValue({
+      id: "product-1",
+      issueId,
+      companyId,
+      type: "artifact",
+      createdByRunId: ownerRunId,
+    });
+    const app = await createApp(boardActor());
+
+    const res = await request(app).delete("/api/work-products/product-1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockWorkProductService.remove).toHaveBeenCalledWith("product-1");
   });
 
   it.each([

@@ -146,6 +146,7 @@ import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/
 import { reconcileDelegatedChildCompletion } from "../services/jarvis-completion-reconciler.js";
 import { runJarvisParentReportAction } from "../services/jarvis-parent-report-action.js";
 import { shouldBlockAgentDelegatedParentCompletion } from "../services/jarvis-parent-completion-guard.js";
+import { shouldBlockAgentSelfActionOnOwnWorkProduct } from "../services/work-product-self-action-guard.js";
 import { submitToJarvis } from "../services/jarvis-delegation-orchestrator.js";
 import { jarvisParentReportActionSchema } from "./jarvis-parent-report-action-schema.js";
 import { submitToJarvisRequestSchema } from "./jarvis-submit-request-schema.js";
@@ -8030,6 +8031,17 @@ export function issueRoutes(
       res.status(404).json({ error: "Work product not found" });
       return;
     }
+    if (shouldBlockAgentSelfActionOnOwnWorkProduct({
+      actorType: req.actor.type,
+      actorRunId: req.actor.runId ?? null,
+      workProductCreatedByRunId: workProduct.createdByRunId ?? null,
+    })) {
+      res.status(403).json({
+        error: "An Agent cannot review/approve a Work Product created by its own Run.",
+        reason: "work_product_self_review_requires_other_actor",
+      });
+      return;
+    }
     const actor = getActorInfo(req);
     const result = await ensureArtifactReviewDocumentForWorkProduct({ issue, workProduct, actor });
     res.status(result.created ? 201 : 200).json(result.document);
@@ -8250,6 +8262,17 @@ export function issueRoutes(
     }
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
+    if (shouldBlockAgentSelfActionOnOwnWorkProduct({
+      actorType: req.actor.type,
+      actorRunId: req.actor.runId ?? null,
+      workProductCreatedByRunId: existing.createdByRunId ?? null,
+    })) {
+      res.status(403).json({
+        error: "An Agent cannot delete a Work Product created by its own Run.",
+        reason: "work_product_self_delete_requires_other_actor",
+      });
+      return;
+    }
     const removed = await workProductsSvc.remove(id);
     if (!removed) {
       res.status(404).json({ error: "Work product not found" });

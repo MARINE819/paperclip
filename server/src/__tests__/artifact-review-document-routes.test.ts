@@ -136,7 +136,7 @@ function createStorageService(): StorageService {
   } as unknown as StorageService;
 }
 
-async function createApp(options?: { companyIds?: string[] }) {
+async function createApp(options?: { companyIds?: string[]; actor?: Record<string, unknown>; db?: unknown }) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -144,7 +144,7 @@ async function createApp(options?: { companyIds?: string[] }) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = options?.actor ?? {
       type: "board",
       userId: "local-board",
       companyIds: options?.companyIds ?? ["company-1"],
@@ -153,9 +153,40 @@ async function createApp(options?: { companyIds?: string[] }) {
     };
     next();
   });
-  app.use("/api", issueRoutes({} as any, createStorageService()));
+  app.use("/api", issueRoutes((options?.db ?? {}) as any, createStorageService()));
   app.use(errorHandler);
   return app;
+}
+
+function agentActor(overrides: Record<string, unknown> = {}) {
+  return {
+    type: "agent",
+    agentId: "66666666-6666-4666-8666-666666666666",
+    companyId: "company-1",
+    source: "agent_key",
+    runId: "77777777-7777-4777-8777-777777777777",
+    ...overrides,
+  };
+}
+
+/**
+ * Minimal db stub satisfying only the one query shape
+ * `assertDeliverableMutationAllowedByRunContext` → `loadActorRunContext`
+ * needs (select heartbeatRuns by id) — this route file otherwise passes a
+ * bare `{}` as db since none of its existing (board-actor) tests reach that
+ * lookup. Not a general-purpose framework: scoped to this one shape only.
+ */
+function agentRunDb(agentId: string, runId: string) {
+  const runRow = { id: runId, companyId: "company-1", agentId, contextSnapshot: {} };
+  return {
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          then: async (resolve: (rows: unknown[]) => unknown) => resolve([runRow]),
+        })),
+      })),
+    })),
+  };
 }
 
 function makeIssue() {
@@ -242,6 +273,43 @@ describe("work product review-document route", () => {
 
     expect(res.status).toBe(404);
     expect(mockEnsureForWorkProduct).not.toHaveBeenCalled();
+  });
+
+  it("blocks an agent from self-reviewing a Work Product created by its own Run", async () => {
+    const agentId = "66666666-6666-4666-8666-666666666666";
+    const runId = "77777777-7777-4777-8777-777777777777";
+    mockWorkProductService.getById.mockResolvedValue(makeWorkProduct({ createdByRunId: runId }));
+
+    const app = await createApp({ actor: agentActor({ agentId, runId }), db: agentRunDb(agentId, runId) });
+    const res = await request(app).post(
+      `/api/issues/${ISSUE_ID}/work-products/${WORK_PRODUCT_ID}/review-document`,
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.reason).toBe("work_product_self_review_requires_other_actor");
+    expect(mockEnsureForWorkProduct).not.toHaveBeenCalled();
+  });
+
+  it("allows an agent to review a Work Product created by a different Run", async () => {
+    const agentId = "66666666-6666-4666-8666-666666666666";
+    const runId = "77777777-7777-4777-8777-777777777777";
+    mockWorkProductService.getById.mockResolvedValue(
+      makeWorkProduct({ createdByRunId: "88888888-8888-4888-8888-888888888888" }),
+    );
+    mockEnsureForWorkProduct.mockResolvedValue({
+      document: makeDocument(),
+      created: true,
+      revisionChanged: true,
+      remappedAnnotations: [],
+    });
+
+    const app = await createApp({ actor: agentActor({ agentId, runId }), db: agentRunDb(agentId, runId) });
+    const res = await request(app).post(
+      `/api/issues/${ISSUE_ID}/work-products/${WORK_PRODUCT_ID}/review-document`,
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockEnsureForWorkProduct).toHaveBeenCalled();
   });
 
   it("materializes the review document and logs document creation", async () => {

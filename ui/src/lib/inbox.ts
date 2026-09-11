@@ -773,6 +773,14 @@ export function getUnreadTouchedIssues(issues: Issue[]): Issue[] {
   return issues.filter((issue) => issue.isUnreadForMe);
 }
 
+export function approvalEffectiveStatus(approval: Approval): string {
+  return (approval as { effectiveStatus?: string }).effectiveStatus ?? approval.status;
+}
+
+export function isActionableApproval(approval: Approval): boolean {
+  return ACTIONABLE_APPROVAL_STATUSES.has(approvalEffectiveStatus(approval));
+}
+
 export function getApprovalsForTab(
   approvals: Approval[],
   tab: InboxTab,
@@ -788,12 +796,12 @@ export function getApprovalsForTab(
   }
   if (tab === "recent") return sortedApprovals;
   if (tab === "unread") {
-    return sortedApprovals.filter((approval) => ACTIONABLE_APPROVAL_STATUSES.has(approval.status));
+    return sortedApprovals.filter((approval) => isActionableApproval(approval));
   }
   if (filter === "all") return sortedApprovals;
 
   return sortedApprovals.filter((approval) => {
-    const isActionable = ACTIONABLE_APPROVAL_STATUSES.has(approval.status);
+    const isActionable = isActionableApproval(approval);
     return filter === "actionable" ? isActionable : !isActionable;
   });
 }
@@ -802,7 +810,7 @@ export function isApprovalVisibleInMine(
   approval: Approval,
   currentUserId?: string | null,
 ): boolean {
-  if (ACTIONABLE_APPROVAL_STATUSES.has(approval.status)) return true;
+  if (isActionableApproval(approval)) return true;
   if (!currentUserId) return false;
   return approval.requestedByUserId === currentUserId || approval.decidedByUserId === currentUserId;
 }
@@ -1283,7 +1291,7 @@ export function computeInboxBadgeData({
   const actionableApprovals = approvals.filter(
     (approval) =>
       isApprovalVisibleInMine(approval, currentUserId) &&
-      ACTIONABLE_APPROVAL_STATUSES.has(approval.status) &&
+      isActionableApproval(approval) &&
       !isInboxEntityDismissed(dismissedAtByKey, `approval:${approval.id}`, approval.updatedAt),
   ).length;
   const failedRuns = getLatestFailedRunsByAgent(heartbeatRuns).filter(

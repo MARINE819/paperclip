@@ -65,15 +65,16 @@ export function Approvals() {
     },
   });
 
+  const isPendingApproval = (a: { status: string; effectiveStatus?: string }) => {
+    const effective = a.effectiveStatus ?? a.status;
+    return effective === "pending" || effective === "revision_requested";
+  };
+
   const filtered = (data ?? [])
-    .filter(
-      (a) => statusFilter === "all" || a.status === "pending" || a.status === "revision_requested",
-    )
+    .filter((a) => statusFilter === "all" || isPendingApproval(a))
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
-  const pendingCount = (data ?? []).filter(
-    (a) => a.status === "pending" || a.status === "revision_requested",
-  ).length;
+  const pendingCount = (data ?? []).filter(isPendingApproval).length;
 
   if (!selectedCompanyId) {
     return <p className="text-sm text-muted-foreground">Select an organization first.</p>;

@@ -507,6 +507,14 @@ const manifest: PaperclipPluginManifestV1 = {
       companyResolution: { from: "body", key: "companyId" }
     },
     {
+      routeKey: "ingest-source",
+      method: "POST",
+      path: "/ingest",
+      auth: "board-or-agent",
+      capability: "api.routes.register",
+      companyResolution: { from: "body", key: "companyId" }
+    },
+    {
       routeKey: "spaces",
       method: "GET",
       path: "/spaces",

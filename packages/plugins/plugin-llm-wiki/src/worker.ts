@@ -1017,6 +1017,41 @@ const plugin = definePlugin({
       };
     }
 
+    if (input.routeKey === "ingest-source") {
+      const body = input.body as Record<string, unknown> | null;
+      const companyId = input.companyId;
+      const wikiId = stringField(body?.wikiId);
+      const spaceSlug = stringField(body?.spaceSlug);
+      const sourceType = stringField(body?.sourceType) ?? "text";
+      const title = stringField(body?.title) ?? sourceType.toUpperCase();
+      const contents = typeof body?.contents === "string" ? body.contents : "";
+      const url = stringField(body?.url);
+      const captured = await captureWikiSource(ctx, {
+        companyId,
+        wikiId,
+        spaceSlug,
+        sourceType,
+        title,
+        url,
+        contents,
+        rawPath: stringField(body?.rawPath),
+        metadata: typeof body?.metadata === "object" && body.metadata != null ? body.metadata as Record<string, unknown> : null,
+      });
+      const op = await createOperationIssue(ctx, {
+        companyId,
+        wikiId,
+        spaceSlug,
+        operationType: "ingest",
+        title: `Ingest ${sourceType}: ${title}`,
+        prompt: [
+          `Ingest a captured source from raw/${captured.rawPath.replace(/^raw\//, "")}.`,
+          url ? `Source URL: ${url}` : null,
+          "Follow the installed wiki-ingest skill: read the raw file end to end, summarise into wiki/sources/<slug>.md, update related entity/concept/synthesis pages, refresh wiki/index.md, and append wiki/log.md.",
+        ].filter(Boolean).join("\n"),
+      });
+      return { status: 201, body: { status: "ok", source: captured, operation: op } };
+    }
+
     if (input.routeKey === "operations") {
       return {
         body: await listOperations(ctx, {

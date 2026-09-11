@@ -3427,6 +3427,56 @@ Duplicate headings receive stable suffixes.
     ]));
   });
 
+  it("exposes ingest-source over the HTTP api route with the same capture+operation behavior", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.seed({ agents: [wikiMaintainerAgent()] });
+    const writes: Array<{ path: string; contents: string }> = [];
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      writes.push({ path: relativePath, contents });
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+    const response = await plugin.definition.onApiRequest!({
+      routeKey: "ingest-source",
+      method: "POST",
+      path: "/ingest",
+      params: {},
+      query: {},
+      body: {
+        wikiId: "engineering",
+        sourceType: "url",
+        title: "Standalone Plugin Notes",
+        url: "https://example.test/wiki",
+        contents: "# Standalone Plugin Notes\n\nKeep wiki behavior in the plugin package.",
+        rawPath: "raw/standalone-plugin-notes.md",
+        metadata: { importedBy: "alpha-verification" },
+      },
+      actor: { actorType: "user", actorId: "test-actor" },
+      companyId: COMPANY_ID,
+      headers: {},
+    });
+
+    expect(response.status).toBe(201);
+    const body = response.body as {
+      status: string;
+      source: { rawPath: string; title: string; hash: string };
+      operation: { operationId: string; issue: { originKind: string; assigneeAgentId: string | null } };
+    };
+    expect(body.status).toBe("ok");
+    expect(body.source.rawPath).toBe("raw/standalone-plugin-notes.md");
+    expect(body.source.title).toBe("Standalone Plugin Notes");
+    expect(body.source.hash).toHaveLength(64);
+    expect(writes).toEqual([
+      expect.objectContaining({
+        path: "raw/standalone-plugin-notes.md",
+        contents: expect.stringContaining("Keep wiki behavior in the plugin package."),
+      }),
+    ]);
+    expect(body.operation.issue.originKind).toBe(`${OPERATION_ORIGIN_KIND}:ingest`);
+    expect(body.operation.issue.assigneeAgentId).toBe(wikiMaintainerAgent().id);
+  });
+
   it("rejects oversized source capture before raw writes or operation creation", async () => {
     const harness = createTestHarness({ manifest, config: { maxSourceBytes: 16 } });
     harness.seed({ agents: [wikiMaintainerAgent()] });

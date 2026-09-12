@@ -16297,8 +16297,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(approvals.companyId, agent.companyId),
               eq(approvals.type, "request_board_approval"),
               eq(approvals.status, "approved"),
+              isNull(approvals.consumedAt),
             ),
           )
+          .orderBy(desc(approvals.createdAt))
           .limit(1)
           .then((rows) => rows[0] ?? null)
         : await db
@@ -16311,8 +16313,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(approvals.status, "approved"),
               sql`${approvals.payload} ->> 'source' = 'risk_guard'`,
               eq(approvals.taskFingerprint, canonicalFingerprint),
+              isNull(approvals.consumedAt),
             ),
           )
+          .orderBy(desc(approvals.createdAt))
           .limit(1)
           .then((rows) => rows[0] ?? null);
 

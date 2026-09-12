@@ -324,6 +324,10 @@ export function approvalService(db: Db) {
       }
 
       const now = new Date();
+      if (isExpiredAt(existing, now)) {
+        throw unprocessable("Expired approvals cannot be resubmitted");
+      }
+
       return db
         .update(approvals)
         .set({
@@ -334,9 +338,21 @@ export function approvalService(db: Db) {
           decidedAt: null,
           updatedAt: now,
         })
-        .where(eq(approvals.id, id))
+        .where(
+          and(
+            eq(approvals.id, id),
+            eq(approvals.status, "revision_requested"),
+            or(isNull(approvals.expiresAt), gt(approvals.expiresAt, now)),
+          ),
+        )
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => {
+          const updated = rows[0];
+          if (!updated) {
+            throw unprocessable("Expired approvals cannot be resubmitted");
+          }
+          return updated;
+        });
     },
 
     listComments: async (approvalId: string) => {

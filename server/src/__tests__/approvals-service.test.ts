@@ -24,9 +24,10 @@ type ApprovalRecord = {
   status: string;
   payload: Record<string, unknown>;
   requestedByAgentId: string | null;
+  expiresAt?: Date | null;
 };
 
-function createApproval(status: string): ApprovalRecord {
+function createApproval(status: string, expiresAt?: Date | null): ApprovalRecord {
   return {
     id: "approval-1",
     companyId: "company-1",
@@ -34,6 +35,7 @@ function createApproval(status: string): ApprovalRecord {
     status,
     payload: { agentId: "agent-1" },
     requestedByAgentId: "requester-1",
+    expiresAt: expiresAt ?? null,
   };
 }
 
@@ -165,5 +167,45 @@ describe("approvalService.findOpenHireApprovalForAgent", () => {
     const result = await svc.findOpenHireApprovalForAgent("company-1", "agent-1");
 
     expect(result).toBeNull();
+  });
+});
+
+describe("approvalService.resubmit", () => {
+  it("rejects resubmitting an expired revision_requested approval", async () => {
+    const expiredApproval = createApproval("revision_requested", new Date(Date.now() - 60_000));
+    const dbStub = createDbStub([[expiredApproval]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.resubmit("approval-1")).rejects.toThrow(
+      "Expired approvals cannot be resubmitted",
+    );
+    expect(dbStub.returning).not.toHaveBeenCalled();
+  });
+
+  it("resubmits an unexpired revision_requested approval to pending", async () => {
+    const futureExpiry = new Date(Date.now() + 60_000);
+    const validApproval = createApproval("revision_requested", futureExpiry);
+    const resubmittedApproval = {
+      ...validApproval,
+      status: "pending",
+    };
+    const dbStub = createDbStub([[validApproval]], [resubmittedApproval]);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.resubmit("approval-1");
+
+    expect(result.status).toBe("pending");
+    expect(dbStub.returning).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects resubmission when approval status is not revision_requested", async () => {
+    const pendingApproval = createApproval("pending");
+    const dbStub = createDbStub([[pendingApproval]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.resubmit("approval-1")).rejects.toThrow(
+      "Only revision requested approvals can be resubmitted",
+    );
+    expect(dbStub.returning).not.toHaveBeenCalled();
   });
 });

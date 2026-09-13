@@ -1,4 +1,4 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gt, gte, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
@@ -50,7 +50,13 @@ export function dashboardService(db: Db) {
       const pendingApprovals = await db
         .select({ count: sql<number>`count(*)` })
         .from(approvals)
-        .where(and(eq(approvals.companyId, companyId), eq(approvals.status, "pending")))
+        .where(
+          and(
+            eq(approvals.companyId, companyId),
+            eq(approvals.status, "pending"),
+            or(isNull(approvals.expiresAt), gt(approvals.expiresAt, new Date())),
+          ),
+        )
         .then((rows) => Number(rows[0]?.count ?? 0));
 
       const agentCounts: Record<string, number> = {

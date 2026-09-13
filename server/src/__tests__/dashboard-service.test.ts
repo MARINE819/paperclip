@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, approvals, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -48,6 +48,7 @@ describeEmbeddedPostgres("dashboard service", () => {
 
   afterEach(async () => {
     await db.delete(heartbeatRuns);
+    await db.delete(approvals);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -236,5 +237,60 @@ describeEmbeddedPostgres("dashboard service", () => {
     });
     // process_lost kills that recovered must not leak into the failed breakdown.
     expect(bucket?.failedByErrorCode.process_lost).toBeUndefined();
+  });
+
+  it("counts unexpired pending approvals but excludes expired pending approvals", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Approval Test Co",
+      issuePrefix: `AC${companyId.replace(/-/g, "").slice(0, 4).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const now = Date.now();
+    await db.insert(approvals).values([
+      // 1. Unexpired (legacy/default without expiresAt: expiresAt IS NULL) -> Included
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "pending",
+        payload: {},
+        expiresAt: null,
+      },
+      // 2. Unexpired pending (expiresAt > now) -> Included
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "pending",
+        payload: {},
+        expiresAt: new Date(now + 60 * 60 * 1000),
+      },
+      // 3. Expired pending (expiresAt <= now) -> Excluded
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "pending",
+        payload: {},
+        expiresAt: new Date(now - 60 * 1000),
+      },
+      // 4. Non-pending status (approved, expiresAt > now) -> Excluded
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "approved",
+        payload: {},
+        expiresAt: new Date(now + 60 * 60 * 1000),
+      },
+    ]);
+
+    const svc = dashboardService(db);
+    const summary = await svc.summary(companyId);
+
+    expect(summary.pendingApprovals).toBe(2);
   });
 });

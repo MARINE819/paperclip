@@ -16373,6 +16373,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(approvals.companyId, agent.companyId),
                 eq(approvals.type, "request_board_approval"),
                 inArray(approvals.status, ["pending", "revision_requested"]),
+                or(
+                  isNull(approvals.expiresAt),
+                  gt(approvals.expiresAt, new Date()),
+                ),
                 sql`${approvals.payload} ->> 'source' = 'risk_guard'`,
                 eq(approvals.taskFingerprint, canonicalFingerprint),
                 linkedApprovalCondition,

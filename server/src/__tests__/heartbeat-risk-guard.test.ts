@@ -792,4 +792,103 @@ describeEmbeddedPostgres("Heartbeat Risk Guard — Approval Lifecycle Security i
     const allApprovals = await findRiskGuardApproval(companyId, issueId);
     expect(allApprovals.length).toBe(1);
   }, 20_000);
+
+  async function seedCompanyAndAgentWithoutIssues(label: string) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: `${label} Company`,
+      issuePrefix: `LC${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: `${label}Codex`,
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+        },
+      },
+      permissions: {},
+    });
+    return { companyId, agentId };
+  }
+
+  it("IDLE-01: generic timer wake with no actionable work uses official skipped lifecycle", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgentWithoutIssues("Idle01");
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "scheduled_interval",
+    });
+
+    expect(queued).toBeNull();
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(0);
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    const companyApprovals = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(companyApprovals).toHaveLength(0);
+  }, 20_000);
+
+  it("REPEAT-01: repeated generic timer wakes continue to skip without accumulating runs or approvals", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgentWithoutIssues("Repeat01");
+    const heartbeat = heartbeatService(db);
+
+    for (let i = 0; i < 3; i++) {
+      const queued = await heartbeat.wakeup(agentId, {
+        source: "timer",
+        triggerDetail: "scheduled_interval",
+      });
+      expect(queued).toBeNull();
+    }
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(0);
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    const companyApprovals = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(companyApprovals).toHaveLength(0);
+  }, 20_000);
+
+  it("WORK-01: timer wake with assigned actionable work is not skipped and preserves Risk Guard approval", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue("Work01");
+    await db
+      .update(agents)
+      .set({
+        runtimeConfig: {
+          heartbeat: {
+            enabled: true,
+          },
+        },
+      })
+      .where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "scheduled_interval",
+      payload: { issueId, prompt: "Change production security permissions for customer accounts." },
+    });
+
+    expect(queued).not.toBeNull();
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished!.status).toBe("failed");
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    const issueApprovalRows = await findRiskGuardApproval(companyId, issueId);
+    expect(issueApprovalRows).toHaveLength(1);
+    expect(issueApprovalRows[0].status).toBe("pending");
+  }, 20_000);
 });

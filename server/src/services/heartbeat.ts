@@ -18380,7 +18380,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       !wakeCommentId &&
       !readNonEmptyString(enrichedContextSnapshot.taskId) &&
       !readNonEmptyString(enrichedContextSnapshot.taskKey);
-    if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
+    const shouldSkipNoWorkTimer =
+      (policy.skipTimerWhenNoActionableWork || agent.adapterType === "codex_local") &&
+      genericTimerWake &&
+      !(await hasActionableTimerWork(agent));
+    if (shouldSkipNoWorkTimer) {
       await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
         reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
       });

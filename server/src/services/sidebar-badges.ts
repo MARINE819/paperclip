@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, not } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, not, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, heartbeatRuns } from "@paperclipai/db";
 import type { SidebarBadges } from "@paperclipai/shared";
@@ -39,6 +39,7 @@ export function sidebarBadgeService(db: Db) {
           and(
             eq(approvals.companyId, companyId),
             inArray(approvals.status, ACTIONABLE_APPROVAL_STATUSES),
+            or(isNull(approvals.expiresAt), gt(approvals.expiresAt, new Date())),
           ),
         )
         .then((rows) =>

@@ -269,4 +269,78 @@ describeEmbeddedPostgres("inbox dismissals", () => {
       joinRequests: 0,
     });
   });
+
+  it("counts unexpired actionable approvals and excludes expired pending/revision_requested approvals from badge counts", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Badge Test Co",
+      issuePrefix: `BC${companyId.replace(/-/g, "").slice(0, 4).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const now = Date.now();
+    await db.insert(approvals).values([
+      // 1. Unexpired pending without expiresAt (expiresAt IS NULL) -> Included
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "pending",
+        payload: {},
+        expiresAt: null,
+      },
+      // 2. Unexpired pending with future expiresAt -> Included
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "pending",
+        payload: {},
+        expiresAt: new Date(now + 60 * 60 * 1000),
+      },
+      // 3. Unexpired revision_requested with future expiresAt -> Included
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "revision_requested",
+        payload: {},
+        expiresAt: new Date(now + 60 * 60 * 1000),
+      },
+      // 4. Expired pending (expiresAt <= now) -> Excluded
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "pending",
+        payload: {},
+        expiresAt: new Date(now - 60 * 1000),
+      },
+      // 5. Expired revision_requested (expiresAt <= now) -> Excluded
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "revision_requested",
+        payload: {},
+        expiresAt: new Date(now - 60 * 1000),
+      },
+      // 6. Non-actionable status (approved, future expiresAt) -> Excluded
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "approved",
+        payload: {},
+        expiresAt: new Date(now + 60 * 60 * 1000),
+      },
+    ]);
+
+    const badges = await badgesSvc.get(companyId);
+
+    // Only #1, #2, #3 should be counted
+    expect(badges.approvals).toBe(3);
+    expect(badges.inbox).toBe(3);
+  });
 });

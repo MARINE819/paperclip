@@ -2045,4 +2045,69 @@ describeEmbeddedPostgres("attention service", () => {
     }
     expect(byKey.get(`approval:${queueApprovalId}`)).toMatchObject({ shelf: true, retentionDays: 10 });
   });
+
+  it("excludes expired approvals from actionable attention cards", async () => {
+    const { companyId } = await seedCompany("ATE");
+    const now = new Date();
+    const future = new Date(now.getTime() + 60 * 60 * 1000);
+    const past = new Date(now.getTime() - 60 * 60 * 1000);
+
+    const activeApprovalId = randomUUID();
+    const noExpiryApprovalId = randomUUID();
+    const expiredApprovalId = randomUUID();
+    const approvedApprovalId = randomUUID();
+
+    await db.insert(approvals).values([
+      {
+        id: activeApprovalId,
+        companyId,
+        type: "hire_agent",
+        status: "pending",
+        payload: { title: "Hire Active" },
+        expiresAt: future,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: noExpiryApprovalId,
+        companyId,
+        type: "hire_agent",
+        status: "pending",
+        payload: { title: "Hire No Expiry" },
+        expiresAt: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: expiredApprovalId,
+        companyId,
+        type: "hire_agent",
+        status: "pending",
+        payload: { title: "Hire Expired" },
+        expiresAt: past,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: approvedApprovalId,
+        companyId,
+        type: "hire_agent",
+        status: "approved",
+        payload: { title: "Hire Approved" },
+        expiresAt: future,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const approvalItems = feed.items.filter((item) => item.sourceKind === "approval");
+    const approvalItemIds = approvalItems.map((item) => item.subject.id);
+
+    expect(approvalItemIds).toContain(activeApprovalId);
+    expect(approvalItemIds).toContain(noExpiryApprovalId);
+    expect(approvalItemIds).not.toContain(expiredApprovalId);
+    expect(approvalItemIds).not.toContain(approvedApprovalId);
+    expect(feed.countsBySourceKind.approval).toBe(2);
+  });
 });

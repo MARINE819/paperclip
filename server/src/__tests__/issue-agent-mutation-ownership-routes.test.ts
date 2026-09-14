@@ -2045,6 +2045,25 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("allows safe hand-back when a governed approval is expired", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }),
+    );
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId: peerAgentId,
+      returnOwnerAgentId: ownerAgentId,
+    });
+    mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([{ status: "pending", effectiveStatus: "expired" }]);
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+      .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
   it("uses the authorization decision path for assignment changes", async () => {
     const decide = vi.fn(async () => ({
       allowed: false,

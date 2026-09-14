@@ -146,7 +146,8 @@ export function ApprovalDetail() {
 
   const payload = approval.payload as Record<string, unknown>;
   const linkedAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
-  const isActionable = approval.status === "pending" || approval.status === "revision_requested";
+  const effectiveStatus = (approval as { effectiveStatus?: string }).effectiveStatus ?? approval.status;
+  const isActionable = effectiveStatus === "pending" || effectiveStatus === "revision_requested";
   const isBudgetApproval = approval.type === "budget_override_required";
   const TypeIcon = typeIcon[approval.type] ?? defaultTypeIcon;
   const showApprovedBanner = searchParams.get("resolved") === "approved" && approval.status === "approved";
@@ -207,7 +208,7 @@ export function ApprovalDetail() {
               <p className="text-xs text-muted-foreground font-mono">{approval.id}</p>
             </div>
           </div>
-          <StatusBadge status={approval.status} />
+          <StatusBadge status={effectiveStatus} />
         </div>
         <div className="text-sm space-y-1">
           {approval.requestedByAgentId && (
@@ -281,12 +282,12 @@ export function ApprovalDetail() {
               </Button>
             </>
           )}
-          {isBudgetApproval && approval.status === "pending" && (
+          {isBudgetApproval && effectiveStatus === "pending" && (
             <p className="text-sm text-muted-foreground">
               Resolve this budget stop from the budget controls on <Link to="/costs" className="underline underline-offset-2">/costs</Link>.
             </p>
           )}
-          {approval.status === "pending" && (
+          {effectiveStatus === "pending" && (
             <Button
               size="sm"
               variant="outline"
@@ -296,7 +297,7 @@ export function ApprovalDetail() {
               Request revision
             </Button>
           )}
-          {approval.status === "revision_requested" && (
+          {effectiveStatus === "revision_requested" && (
             <Button
               size="sm"
               variant="outline"

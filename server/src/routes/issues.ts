@@ -3284,7 +3284,10 @@ export function issueRoutes(
       }
 
       const approvals = await issueApprovalsSvc.listApprovalsForIssue(issue.id);
-      if (approvals.some((approval) => approval.status === "pending" || approval.status === "revision_requested")) {
+      if (approvals.some((approval) => {
+        const status = approval.effectiveStatus ?? approval.status;
+        return status === "pending" || status === "revision_requested";
+      })) {
         return "Recovery action became stale because the source issue now has a pending approval.";
       }
     }
@@ -3581,7 +3584,7 @@ export function issueRoutes(
     if (pendingInteractions.length > 0) return null;
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
-    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return null;
+    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.effectiveStatus ?? approval.status)))) return null;
 
     throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
       code: "invalid_issue_disposition",
@@ -5306,7 +5309,7 @@ export function issueRoutes(
       }
     }
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.issue.id);
-    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) {
+    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.effectiveStatus ?? approval.status)))) {
       throw conflict("Safe recovery hand-back cannot bypass a pending governed approval", {
         code: "recovery_governed_approval_pending",
         issueId: input.issue.id,

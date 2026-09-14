@@ -123,7 +123,13 @@ export function approvalService(db: Db) {
   return {
     list: (companyId: string, status?: string) => {
       const conditions = [eq(approvals.companyId, companyId)];
-      if (status) conditions.push(eq(approvals.status, status));
+      if (status) {
+        conditions.push(eq(approvals.status, status));
+        if (status === "pending" || status === "revision_requested") {
+          const notExpired = or(isNull(approvals.expiresAt), gt(approvals.expiresAt, new Date()));
+          if (notExpired) conditions.push(notExpired);
+        }
+      }
       return db.select().from(approvals).where(and(...conditions));
     },
 

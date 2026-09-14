@@ -266,4 +266,80 @@ describeEmbeddedPostgres("approval idempotency HTTP contract (200/409/410, dupli
     expect(res.body).not.toHaveProperty("actorIdentity");
     expect(res.body).not.toHaveProperty("requestFingerprint");
   });
+
+  it("excludes expired approvals from list when filtered by actionable status (pending, revision_requested) but retains them in all", async () => {
+    const { company } = await seedCompanyAndAgent();
+    const now = new Date();
+    const future = new Date(now.getTime() + 60 * 60 * 1000);
+    const past = new Date(now.getTime() - 60 * 60 * 1000);
+
+    const activePending = await seedApproval({
+      status: "pending",
+      expiresAt: future,
+      payload: { title: "active pending" },
+    });
+    const noExpiryPending = await seedApproval({
+      status: "pending",
+      expiresAt: null,
+      payload: { title: "no expiry pending" },
+    });
+    const expiredPending = await seedApproval({
+      status: "pending",
+      expiresAt: past,
+      payload: { title: "expired pending" },
+    });
+    const activeRevision = await seedApproval({
+      status: "revision_requested",
+      expiresAt: future,
+      payload: { title: "active revision" },
+    });
+    const expiredRevision = await seedApproval({
+      status: "revision_requested",
+      expiresAt: past,
+      payload: { title: "expired revision" },
+    });
+    const approved = await seedApproval({
+      status: "approved",
+      expiresAt: future,
+      payload: { title: "approved" },
+    });
+
+    const app = await createApp();
+
+    // A. status=pending
+    const pendingRes = await request(app).get(`/api/companies/${company.id}/approvals?status=pending`);
+    expect(pendingRes.status).toBe(200);
+    const pendingIds = pendingRes.body.map((item: { id: string }) => item.id);
+    expect(pendingIds).toContain(activePending.id);
+    expect(pendingIds).toContain(noExpiryPending.id);
+    expect(pendingIds).not.toContain(expiredPending.id);
+    expect(pendingIds).not.toContain(approved.id);
+    expect(pendingIds).not.toContain(activeRevision.id);
+    expect(pendingRes.body.every((item: { effectiveStatus: string }) => item.effectiveStatus === "pending")).toBe(true);
+
+    // B. status=revision_requested
+    const revisionRes = await request(app).get(`/api/companies/${company.id}/approvals?status=revision_requested`);
+    expect(revisionRes.status).toBe(200);
+    const revisionIds = revisionRes.body.map((item: { id: string }) => item.id);
+    expect(revisionIds).toContain(activeRevision.id);
+    expect(revisionIds).not.toContain(expiredRevision.id);
+    expect(revisionIds).not.toContain(activePending.id);
+    expect(revisionRes.body.every((item: { effectiveStatus: string }) => item.effectiveStatus === "revision_requested")).toBe(true);
+
+    // C. status omitted (All)
+    const allRes = await request(app).get(`/api/companies/${company.id}/approvals`);
+    expect(allRes.status).toBe(200);
+    const allIds = allRes.body.map((item: { id: string }) => item.id);
+    expect(allIds).toContain(activePending.id);
+    expect(allIds).toContain(noExpiryPending.id);
+    expect(allIds).toContain(expiredPending.id);
+    expect(allIds).toContain(activeRevision.id);
+    expect(allIds).toContain(expiredRevision.id);
+    expect(allIds).toContain(approved.id);
+
+    const expiredPendingItem = allRes.body.find((item: { id: string }) => item.id === expiredPending.id);
+    expect(expiredPendingItem.effectiveStatus).toBe("expired");
+    const expiredRevisionItem = allRes.body.find((item: { id: string }) => item.id === expiredRevision.id);
+    expect(expiredRevisionItem.effectiveStatus).toBe("expired");
+  });
 });

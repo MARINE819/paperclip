@@ -173,13 +173,30 @@ describeEmbeddedPostgres("consumeApproval (embedded Postgres)", () => {
     expect(result.outcome).toBe("approval_not_approved");
   });
 
-  it("rejects consuming an approval whose expiresAt has already passed", async () => {
+  it("consumes an approved approval even if initial decision expiresAt has already passed", async () => {
     await seedCompanyAndAgent();
     const approval = await seedApproval({ expiresAt: new Date(Date.now() - 1000) });
     const runId = await seedRun();
 
     const result = await consumeApproval(db, { approvalId: approval.id, runId, expectedTaskFingerprint: "fp-1" });
-    expect(result.outcome).toBe("approval_expired");
+    expect(result.outcome).toBe("consumed");
+    expect(result.approval?.consumedByRunId).toBe(runId);
+    const [row] = await db.select().from(approvals).where(eq(approvals.id, approval.id));
+    expect(row.consumedAt).not.toBeNull();
+    expect(row.consumedByRunId).toBe(runId);
+  });
+
+  it("consumes an approved approval when expiresAt is null", async () => {
+    await seedCompanyAndAgent();
+    const approval = await seedApproval({ expiresAt: null });
+    const runId = await seedRun();
+
+    const result = await consumeApproval(db, { approvalId: approval.id, runId, expectedTaskFingerprint: "fp-1" });
+    expect(result.outcome).toBe("consumed");
+    expect(result.approval?.consumedByRunId).toBe(runId);
+    const [row] = await db.select().from(approvals).where(eq(approvals.id, approval.id));
+    expect(row.consumedAt).not.toBeNull();
+    expect(row.consumedByRunId).toBe(runId);
   });
 
   it("rejects consuming an approval with a mismatched fingerprint", async () => {

@@ -146,8 +146,6 @@ export async function consumeApproval(
         eq(approvals.id, input.approvalId),
         eq(approvals.status, "approved"),
         isNull(approvals.consumedAt),
-        isNotNull(approvals.expiresAt),
-        gt(approvals.expiresAt, now),
         eq(approvals.taskFingerprint, input.expectedTaskFingerprint),
         isNull(approvals.supersededByApprovalId),
       ),
@@ -170,9 +168,6 @@ export async function consumeApproval(
   }
   if (existing.status !== "approved") {
     return { outcome: "approval_not_approved", approval: existing };
-  }
-  if (!existing.expiresAt || existing.expiresAt.getTime() <= now.getTime()) {
-    return { outcome: "approval_expired", approval: existing };
   }
   if (existing.taskFingerprint !== input.expectedTaskFingerprint) {
     return { outcome: "fingerprint_mismatch", approval: existing };

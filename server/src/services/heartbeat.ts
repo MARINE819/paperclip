@@ -16285,6 +16285,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // A high-risk run may proceed only with an explicit board approval that
       // is linked to this exact issue. An unrelated or merely pending approval
       // must never authorize execution.
+      const rootRunId = await resolveRetryChainRootRunId(run);
       const approvedRiskGuardApproval = issueId
         ? await db
           .select({ id: approvals.id })
@@ -16297,7 +16298,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(approvals.companyId, agent.companyId),
               eq(approvals.type, "request_board_approval"),
               eq(approvals.status, "approved"),
-              isNull(approvals.consumedAt),
+              or(
+                isNull(approvals.consumedAt),
+                eq(approvals.consumedByRunId, rootRunId),
+              ),
             ),
           )
           .orderBy(desc(approvals.createdAt))
@@ -16313,7 +16317,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(approvals.status, "approved"),
               sql`${approvals.payload} ->> 'source' = 'risk_guard'`,
               eq(approvals.taskFingerprint, canonicalFingerprint),
-              isNull(approvals.consumedAt),
+              or(
+                isNull(approvals.consumedAt),
+                eq(approvals.consumedByRunId, rootRunId),
+              ),
             ),
           )
           .orderBy(desc(approvals.createdAt))
@@ -16330,8 +16337,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // no gap between "checked valid" and "consumed" for a concurrent run to
       // exploit. Retries in the same retry chain reuse the chain's root run
       // id, so a genuine retry is an idempotent re-consume, never a rejection.
-      const rootRunId = approvedRiskGuardApproval ? await resolveRetryChainRootRunId(run) : null;
-      const consumeResult = approvedRiskGuardApproval && rootRunId
+      const consumeResult = approvedRiskGuardApproval
         ? await consumeApproval(db, {
             approvalId: approvedRiskGuardApproval.id,
             runId: rootRunId,

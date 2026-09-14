@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactEventPayload } from "../redaction.js";
+import { effectiveApprovalStatus } from "./approval-lifecycle.js";
 
 interface LinkActor {
   agentId?: string | null;
@@ -57,6 +58,8 @@ export function issueApprovalService(db: Db) {
           decisionNote: approvals.decisionNote,
           decidedByUserId: approvals.decidedByUserId,
           decidedAt: approvals.decidedAt,
+          expiresAt: approvals.expiresAt,
+          consumedAt: approvals.consumedAt,
           createdAt: approvals.createdAt,
           updatedAt: approvals.updatedAt,
         })
@@ -67,6 +70,7 @@ export function issueApprovalService(db: Db) {
       return result.map((approval) => ({
         ...approval,
         payload: redactEventPayload(approval.payload) ?? {},
+        effectiveStatus: effectiveApprovalStatus(approval),
       }));
     },
 

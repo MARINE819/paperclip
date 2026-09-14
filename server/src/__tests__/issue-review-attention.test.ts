@@ -17,6 +17,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueService } from "../services/issues.js";
+import { issueApprovalService } from "../services/issue-approvals.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -259,5 +260,100 @@ describeEmbeddedPostgres("issue review attention", () => {
       ...baseWake,
       status: "queued",
     })).resolves.toBeDefined();
+  });
+
+  it("computes effectiveStatus correctly for issue approvals including expired states", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await insertReview({
+      companyId,
+      agentId,
+      identifier: "RVA-TEST",
+    });
+
+    const now = Date.now();
+    const futureDate = new Date(now + 60_000);
+    const pastDate = new Date(now - 60_000);
+
+    const testApprovals = [
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "pending" as const,
+        payload: { title: "Future Pending" },
+        expiresAt: futureDate,
+        expectedEffective: "pending",
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "pending" as const,
+        payload: { title: "Expired Pending" },
+        expiresAt: pastDate,
+        expectedEffective: "expired",
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "revision_requested" as const,
+        payload: { title: "Expired Revision Requested" },
+        expiresAt: pastDate,
+        expectedEffective: "expired",
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "pending" as const,
+        payload: { title: "Null Expiry Pending" },
+        expiresAt: null,
+        expectedEffective: "pending",
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        type: "request_board_approval",
+        status: "approved" as const,
+        payload: { title: "Approved" },
+        expiresAt: pastDate,
+        expectedEffective: "approved",
+      },
+    ];
+
+    for (const item of testApprovals) {
+      await db.insert(approvals).values({
+        id: item.id,
+        companyId: item.companyId,
+        type: item.type,
+        status: item.status,
+        payload: item.payload,
+        expiresAt: item.expiresAt,
+      });
+      await db.insert(issueApprovals).values({
+        companyId,
+        issueId,
+        approvalId: item.id,
+      });
+    }
+
+    const issueApprovalSvc = issueApprovalService(db);
+    const result = await issueApprovalSvc.listApprovalsForIssue(issueId);
+
+    expect(result).toHaveLength(5);
+    const byId = new Map(result.map((a) => [a.id, a]));
+
+    for (const item of testApprovals) {
+      const found = byId.get(item.id);
+      expect(found).toBeDefined();
+      expect(found?.status).toBe(item.status);
+      expect(found?.effectiveStatus).toBe(item.expectedEffective);
+      if (item.expiresAt) {
+        expect(found?.expiresAt).toEqual(item.expiresAt);
+      } else {
+        expect(found?.expiresAt).toBeNull();
+      }
+    }
   });
 });

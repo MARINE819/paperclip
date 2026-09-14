@@ -20,6 +20,7 @@ function statusIcon(status: string) {
   if (status === "rejected") return <XCircle className="h-3.5 w-3.5 text-red-600 dark:text-red-400" />;
   if (status === "revision_requested") return <Clock className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />;
   if (status === "pending") return <Clock className="h-3.5 w-3.5 text-yellow-600 dark:text-yellow-400" />;
+  if (status === "expired") return <XCircle className="h-3.5 w-3.5 text-muted-foreground" />;
   return null;
 }
 
@@ -46,10 +47,11 @@ export function ApprovalCard({
   const Icon = typeIcon[approval.type] ?? defaultTypeIcon;
   const kindLabel = typeLabel[approval.type] ?? approval.type;
   const subject = approvalSubject(payload);
+  const effective = (approval as { effectiveStatus?: string }).effectiveStatus ?? approval.status;
   const showResolutionButtons =
     Boolean(onApprove && onReject) &&
     approval.type !== "budget_override_required" &&
-    (approval.status === "pending" || approval.status === "revision_requested");
+    (effective === "pending" || effective === "revision_requested");
   const hasFooter = showResolutionButtons || Boolean(detailLink || onOpen);
 
   return (
@@ -88,8 +90,8 @@ export function ApprovalCard({
         </div>
         <div className="shrink-0">
           <div className="inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-background/80 px-2.5 py-1 text-xs text-muted-foreground">
-            {statusIcon(approval.status)}
-            <span className="capitalize">{approval.status.replace(/_/g, " ")}</span>
+            {statusIcon(effective)}
+            <span className="capitalize">{effective.replace(/_/g, " ")}</span>
           </div>
         </div>
       </div>

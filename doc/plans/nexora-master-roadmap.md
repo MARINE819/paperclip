@@ -1,3 +1,6 @@
+> ⚠️ **LEGACY / NON-CANONICAL DOCUMENT**
+> This document uses a 15-phase structure that is **not** the canonical NEXORA Master 1차 Stage 1–10 framework fixed by the 2026-09-17 CEO decision. For current Master 1 Stage 1–10 closure status, see `doc/plans/nexora-master1-canonical-status.md`. This document's body is preserved as-is for historical reference and is not updated further as a closure source of truth.
+
 # NEXORA Master Roadmap
 
 **Created:** 2026-08-31

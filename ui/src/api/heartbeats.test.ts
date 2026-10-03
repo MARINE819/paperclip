@@ -47,3 +47,16 @@ describe("heartbeatsApi.liveRunsForCompany", () => {
     expect(mockApi.get).toHaveBeenCalledWith("/companies/company-1/live-runs?minCount=50&limit=50");
   });
 });
+
+describe("heartbeatsApi.neuralRoutes", () => {
+  beforeEach(() => {
+    mockApi.get.mockReset();
+    mockApi.get.mockResolvedValue([]);
+  });
+
+  it("requests the dedicated Neural telemetry contract, never reusing /live-runs", async () => {
+    await heartbeatsApi.neuralRoutes("company-1");
+
+    expect(mockApi.get).toHaveBeenCalledWith("/companies/company-1/neural-routes");
+  });
+});

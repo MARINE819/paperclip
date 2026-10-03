@@ -84,6 +84,36 @@ export interface HeartbeatRunListOptions {
   summary?: boolean;
 }
 
+/**
+ * JARVIS Neural Command Interface (Phase 2B MVP) — truthful, additive-only
+ * routing telemetry from GET /companies/:companyId/neural-routes. One row per
+ * agent (active run first, otherwise that agent's latest terminal run).
+ * routedExecutor is the router's primary selection; actualExecutor is the
+ * executor whose attempt actually produced the terminal adapterResult (they
+ * diverge only when a bounded fallback to a different executor occurred).
+ * provider/model/actualExecutor are null until a terminal adapterResult
+ * exists — never fabricated for a still-active run.
+ */
+export interface NeuralRouteTelemetry {
+  runId: string;
+  companyId: string;
+  agentId: string;
+  routedExecutor: string | null;
+  actualExecutor: string | null;
+  routingReason: string | null;
+  status: string;
+  startedAt: string | null;
+  source: "live";
+  taskId?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  fixedRoutingReason?: string | null;
+  executorWasRedirected?: boolean;
+  updatedAt?: string | null;
+  finishedAt?: string | null;
+  errorCode?: string | null;
+}
+
 export const heartbeatsApi = {
   list: (companyId: string, agentId?: string, limit?: number, options: HeartbeatRunListOptions = {}) => {
     const searchParams = new URLSearchParams();
@@ -136,4 +166,6 @@ export const heartbeatsApi = {
   },
   listInstanceSchedulerAgents: () =>
     api.get<InstanceSchedulerHeartbeatAgent[]>("/instance/scheduler-heartbeats"),
+  neuralRoutes: (companyId: string) =>
+    api.get<NeuralRouteTelemetry[]>(`/companies/${companyId}/neural-routes`),
 };

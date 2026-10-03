@@ -264,6 +264,15 @@ describeEmbeddedPostgres("heartbeat list", () => {
         summary: "completed",
         stdout: oversizedStdout,
         nestedHuge: { payload: oversizedNestedPayload },
+        // Neural telemetry (Phase 2B MVP) — must survive the same oversized
+        // truncation path as the legacy summary fields above.
+        routedExecutor: "codex_local",
+        actualExecutor: "claude_local",
+        executorWasRedirected: false,
+        routingReasonFull: "runtime_discovery",
+        fixedRoutingReason: null,
+        provider: "anthropic",
+        model: "claude-sonnet-5",
       },
     });
 
@@ -275,6 +284,12 @@ describeEmbeddedPostgres("heartbeat list", () => {
       truncated: true,
       truncationReason: "oversized_result_json",
       stdoutTruncated: true,
+      routedExecutor: "codex_local",
+      actualExecutor: "claude_local",
+      executorWasRedirected: false,
+      routingReasonFull: "runtime_discovery",
+      provider: "anthropic",
+      model: "claude-sonnet-5",
     });
     expect(typeof result?.stdout).toBe("string");
     expect((result?.stdout as string).length).toBeLessThan(oversizedStdout.length);

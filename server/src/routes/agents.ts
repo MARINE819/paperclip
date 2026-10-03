@@ -5251,6 +5251,69 @@ export function agentRoutes(
     }))));
   });
 
+  // Neural Command Interface (Phase 2B MVP): truthful, additive-only routing
+  // telemetry. Does not reuse or alter /live-runs' column set or semantics —
+  // this is a dedicated contract, one row per agent, selected by the same
+  // "active first, otherwise latest terminal" convention /live-runs already
+  // uses for its historical-padding fallback, so the result never depends on
+  // accidental DB row ordering.
+  router.get("/companies/:companyId/neural-routes", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const activeStatusPriority = sql<number>`case when ${heartbeatRuns.status} in ('queued', 'running') then 0 else 1 end`;
+
+    const rows = await db
+      .selectDistinctOn([heartbeatRuns.agentId], {
+        runId: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+        updatedAt: heartbeatRuns.updatedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+        errorCode: heartbeatRuns.errorCode,
+        taskId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'taskId'`.as("taskId"),
+        routedExecutor: sql<string | null>`${heartbeatRuns.resultJson} ->> 'routedExecutor'`.as("routedExecutor"),
+        actualExecutor: sql<string | null>`${heartbeatRuns.resultJson} ->> 'actualExecutor'`.as("actualExecutor"),
+        executorWasRedirected: sql<boolean | null>`(${heartbeatRuns.resultJson} ->> 'executorWasRedirected')::boolean`.as("executorWasRedirected"),
+        routingReason: sql<string | null>`${heartbeatRuns.resultJson} ->> 'routingReason'`.as("routingReason"),
+        fixedRoutingReason: sql<string | null>`${heartbeatRuns.resultJson} ->> 'fixedRoutingReason'`.as("fixedRoutingReason"),
+        provider: sql<string | null>`${heartbeatRuns.resultJson} ->> 'provider'`.as("provider"),
+        model: sql<string | null>`${heartbeatRuns.resultJson} ->> 'model'`.as("model"),
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId))
+      .orderBy(
+        heartbeatRuns.agentId,
+        activeStatusPriority,
+        desc(heartbeatRuns.createdAt),
+        desc(heartbeatRuns.id),
+      );
+
+    res.json(
+      rows.map((row) => ({
+        runId: row.runId,
+        companyId: row.companyId,
+        agentId: row.agentId,
+        routedExecutor: row.routedExecutor ?? null,
+        actualExecutor: row.actualExecutor ?? null,
+        routingReason: row.routingReason ?? null,
+        status: row.status,
+        startedAt: row.startedAt ? row.startedAt.toISOString() : null,
+        source: "live" as const,
+        taskId: row.taskId ?? null,
+        provider: row.provider ?? null,
+        model: row.model ?? null,
+        fixedRoutingReason: row.fixedRoutingReason ?? null,
+        executorWasRedirected: row.executorWasRedirected ?? undefined,
+        updatedAt: row.updatedAt ? row.updatedAt.toISOString() : null,
+        finishedAt: row.finishedAt ? row.finishedAt.toISOString() : null,
+        errorCode: row.errorCode ?? null,
+      })),
+    );
+  });
+
   router.get("/heartbeat-runs/:runId", async (req, res) => {
     const runId = req.params.runId as string;
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");

@@ -263,6 +263,15 @@ import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
+import { resolveRoutedModel, type RouteModelResult } from "./model-router.js";
+import {
+  resolveExecutionRoute,
+  classifyExecutionFailure,
+  nextFallbackCandidate,
+  type ExecutionRouteResult,
+  type ExecutionCandidate,
+} from "./execution-router.js";
+import { getExecutorByType } from "./executor-registry.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -338,8 +347,10 @@ import { serverVersion } from "../version.js";
 import { executeNativeCodexRunner } from "./native-runtime/native-codex-runner.js";
 import { prepareNativeHeartbeatRun } from "./native-runtime/prepare-native-run.js";
 import {
+  NATIVE_RUNTIME_RESOLVER_VERSION,
   NativeRunnerSelectionError,
   resolveHeartbeatRuntimeMode,
+  type HeartbeatRuntimeResolution,
 } from "./native-runtime/runtime-mode.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
@@ -692,6 +703,16 @@ function readHeartbeatRunErrorFamily(
   }
   return null;
 }
+
+// errorFamily values that must keep the agent "idle" on a "failed" run
+// outcome, rather than "error" — these describe conditions where the run
+// stopped for a reason outside the agent's own health (a human decision is
+// pending, an upstream quota was hit) and the agent should look ready for its
+// next heartbeat instead of surfacing a false "something is broken" signal.
+// "human_intervention_required" is set by the Risk Guard interception branch
+// (see interceptedByRiskGuard below) — the agent isn't broken, it's correctly
+// waiting on a board approval or an authorization envelope.
+const KEEP_IDLE_ERROR_FAMILIES = new Set(["provider_quota", "human_intervention_required"]);
 
 function isMaxTurnExhaustionRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
@@ -2467,7 +2488,14 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
         ),
         'truncated', true,
         'truncationReason', 'oversized_result_json',
-        'originalSizeBytes', pg_column_size(${heartbeatRuns.resultJson})
+        'originalSizeBytes', pg_column_size(${heartbeatRuns.resultJson}),
+        'routedExecutor', ${heartbeatRuns.resultJson} -> 'routedExecutor',
+        'actualExecutor', ${heartbeatRuns.resultJson} -> 'actualExecutor',
+        'executorWasRedirected', ${heartbeatRuns.resultJson} -> 'executorWasRedirected',
+        'routingReasonFull', ${heartbeatRuns.resultJson} -> 'routingReasonFull',
+        'fixedRoutingReason', ${heartbeatRuns.resultJson} -> 'fixedRoutingReason',
+        'provider', ${heartbeatRuns.resultJson} -> 'provider',
+        'model', ${heartbeatRuns.resultJson} -> 'model'
       )
     )
   end
@@ -2647,6 +2675,7 @@ type SessionCompactionDecision = {
 
 interface ParsedIssueAssigneeAdapterOverrides {
   modelProfile: ModelProfileKey | null;
+  modelTier: "T1" | "T2" | "T3" | "T4" | null;
   adapterConfig: Record<string, unknown> | null;
   useProjectWorkspace: boolean | null;
 }
@@ -3639,6 +3668,96 @@ function readAgentRuntimeModelProfile(
   };
 }
 
+// NEXORA Stage 7: thin wrapper over the pure model-router service so the
+// routing decision itself stays independently unit-testable, the same way
+// resolveModelProfileApplication below is tested apart from the dispatch
+// call site that invokes it.
+export function resolveEffectiveModelSelection(input: {
+  runtimeConfigModel: unknown;
+  agentAdapterType: string | null | undefined;
+  modelTier: "T1" | "T2" | "T3" | "T4" | null | undefined;
+  // Effective adapter config's provider (e.g. paperclip_runner's
+  // adapterConfig.provider). Only used to decide whether paperclip_runner is
+  // allowed to look up codex_local's registry rows for tier/default routing
+  // — the returned adapterType always stays paperclip_runner regardless.
+  effectiveAdapterConfigProvider?: unknown;
+}): RouteModelResult {
+  const agentAdapterType = input.agentAdapterType ?? null;
+  const provider = readNonEmptyString(input.effectiveAdapterConfigProvider) ?? "codex";
+  const registryAdapterType =
+    agentAdapterType === "paperclip_runner" && provider === "codex"
+      ? "codex_local"
+      : agentAdapterType;
+  return resolveRoutedModel({
+    agentRuntimeConfigModel: readNonEmptyString(input.runtimeConfigModel),
+    agentAdapterType,
+    registryAdapterType,
+    tierInput: input.modelTier ?? null,
+  });
+}
+
+// Intelligent Execution Router wrapper for the dispatch call site: computes
+// the full dynamic executor/provider/model decision and reduces it to the
+// same RouteModelResult shape resolveEffectiveModelSelection already
+// returned, so every existing consumer of `modelRoutingResult` at the
+// dispatch site keeps working unchanged. The richer ExecutionRouteResult
+// (taskProfile, executorCandidates, fallbackChain, etc.) is returned
+// alongside for observability logging only — it does not change dispatch
+// control flow in this batch (see docs/investigations for why physically
+// redirecting which adapter module executes, and live fallback retry, are
+// deferred rather than wired at this call site this batch).
+export async function resolveDynamicExecutionRoute(input: {
+  runtimeConfig: Record<string, unknown>;
+  // The agent's own AgentRuntimeConfig column (packages/shared/src/types/agent.ts) —
+  // pin semantics are a routing-behavior toggle (like modelProfiles, which also
+  // lives here), deliberately read from THIS field rather than the
+  // dispatch-time effective `runtimeConfig` above (which, despite the name, is
+  // actually derived from agent.adapterConfig — see resolveExecutionRunAdapterConfig's
+  // call chain). model/provider stay sourced from the effective config, matching
+  // resolveEffectiveModelSelection's pre-existing, unchanged behavior.
+  agentRuntimeConfig?: unknown;
+  agentAdapterType: string | null | undefined;
+  modelTier: "T1" | "T2" | "T3" | "T4" | null | undefined;
+  effectiveAdapterConfigProvider?: unknown;
+  issueTitle?: string | null;
+  issueDescription?: string | null;
+}): Promise<{ modelRoutingResult: RouteModelResult; executionRoute: ExecutionRouteResult }> {
+  const agentAdapterType = input.agentAdapterType ?? null;
+  const provider = readNonEmptyString(input.effectiveAdapterConfigProvider) ?? "codex";
+  const registryAdapterTypeOverride =
+    agentAdapterType === "paperclip_runner" && provider === "codex" ? "codex_local" : null;
+  const parsedAgentRuntimeConfig = parseObject(input.agentRuntimeConfig);
+  const executionRoute = await resolveExecutionRoute({
+    agentAdapterType,
+    runtimeConfigModel: readNonEmptyString(input.runtimeConfig.model),
+    humanModelTier: input.modelTier ?? null,
+    registryAdapterTypeOverride,
+    pinState: {
+      executorPinned: parsedAgentRuntimeConfig.executorPinned === true,
+      adapterPinned: parsedAgentRuntimeConfig.adapterPinned === true,
+      providerPinned: parsedAgentRuntimeConfig.providerPinned === true,
+    },
+    taskProfileInput: {
+      title: input.issueTitle ?? null,
+      description: input.issueDescription ?? null,
+    },
+  });
+  // "runtime_discovery" is not a valid RouteModelResult["reason"] value (that
+  // type stays fixed to model-router.ts's 4 legacy values for every existing
+  // consumer, e.g. resultJson.routingReason) — mapped down to "tier_routing",
+  // the same pattern previously used for the now-removed "dynamic_selection".
+  const reason: RouteModelResult["reason"] =
+    executionRoute.routingReason === "runtime_discovery" ? "tier_routing" : executionRoute.routingReason;
+  const modelRoutingResult: RouteModelResult = {
+    model: executionRoute.selectedModel,
+    provider: executionRoute.selectedProvider,
+    adapterType: executionRoute.selectedExecutor,
+    tier: executionRoute.tier,
+    reason,
+  };
+  return { modelRoutingResult, executionRoute };
+}
+
 export function resolveModelProfileApplication(input: {
   adapterModelProfiles: AdapterModelProfileDefinition[];
   agentRuntimeConfig: unknown;
@@ -4141,6 +4260,10 @@ function parseIssueAssigneeAdapterOverrides(
   const modelProfile = MODEL_PROFILE_KEYS.includes(parsed.modelProfile as ModelProfileKey)
     ? parsed.modelProfile as ModelProfileKey
     : null;
+  const modelTier =
+    parsed.modelTier === "T1" || parsed.modelTier === "T2" || parsed.modelTier === "T3" || parsed.modelTier === "T4"
+      ? parsed.modelTier
+      : null;
   const parsedAdapterConfig = parseObject(parsed.adapterConfig);
   const adapterConfig =
     Object.keys(parsedAdapterConfig).length > 0 ? parsedAdapterConfig : null;
@@ -4148,9 +4271,10 @@ function parseIssueAssigneeAdapterOverrides(
     typeof parsed.useProjectWorkspace === "boolean"
       ? parsed.useProjectWorkspace
       : null;
-  if (!modelProfile && !adapterConfig && useProjectWorkspace === null) return null;
+  if (!modelProfile && !modelTier && !adapterConfig && useProjectWorkspace === null) return null;
   return {
     modelProfile,
+    modelTier,
     adapterConfig,
     useProjectWorkspace,
   };
@@ -6295,6 +6419,11 @@ export function buildPaperclipTaskMarkdown(input: {
   // false builds the compact variant used for resume deltas, where the session
   // already received the description with the assignment.
   includeDescription?: boolean;
+  // The wake request's own payload.prompt (context.prompt), if any — an
+  // explicit, this-run-only instruction distinct from the issue's durable
+  // title/description. Previously used only for Risk Guard's taskText/
+  // fingerprint, never surfaced to the agent itself.
+  explicitPrompt?: string | null;
 }) {
   const quoteTaskScalar = (value: string) => JSON.stringify(value);
   const fenceTaskText = (value: string) => {
@@ -6315,7 +6444,8 @@ export function buildPaperclipTaskMarkdown(input: {
       input.interaction.status === "accepted" &&
       issue?.workMode === "planning"
     ));
-  if (!issue && !wakeComment) return null;
+  const explicitPrompt = input.explicitPrompt?.trim() || null;
+  if (!issue && !wakeComment && !explicitPrompt) return null;
 
   const lines = [
     "Paperclip task context:",
@@ -6381,6 +6511,9 @@ export function buildPaperclipTaskMarkdown(input: {
   }
   if (wakeComment?.body.trim()) {
     lines.push("", "Latest wake comment:", fenceTaskText(wakeComment.body.trim()));
+  }
+  if (explicitPrompt) {
+    lines.push("", "Explicit wake instruction for this run:", fenceTaskText(explicitPrompt));
   }
   lines.push("", "Use this task context as the current assignment.");
   return lines.join("\n");
@@ -14531,6 +14664,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       acceptedPlanContinuation:
         readNonEmptyString(context.workspaceRefreshReason) === "accepted_plan_confirmation"
         && Object.keys(parseObject(context.acceptedPlanWakeRouting)).length === 0,
+      explicitPrompt: readNonEmptyString(context.prompt),
     };
     const taskMarkdown = buildPaperclipTaskMarkdown(taskMarkdownInput);
     const taskMarkdownCompact = buildPaperclipTaskMarkdown({ ...taskMarkdownInput, includeDescription: false });
@@ -16039,7 +16173,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
-      const runtimeResolution = resolveHeartbeatRuntimeMode({
+      // Intelligent Execution Router: computed ONCE here, before runtime-mode
+      // resolution and adapter binding, so selectedExecutor can actually
+      // determine which adapter module executes — not just be logged
+      // alongside a dispatch that still silently used agent.adapterType.
+      // Reused (not recomputed) by the native/legacy branches below.
+      const dynamicExecutionRoute = await resolveDynamicExecutionRoute({
+        runtimeConfig,
+        agentRuntimeConfig: agent.runtimeConfig,
+        agentAdapterType: agent.adapterType,
+        modelTier: issueAssigneeOverrides?.modelTier ?? null,
+        effectiveAdapterConfigProvider: runtimeConfig.provider,
+        issueTitle: issueRef?.title ?? null,
+        issueDescription: readNonEmptyString(context.paperclipTaskMarkdown),
+      });
+      const effectiveDispatchAdapterType =
+        dynamicExecutionRoute.executionRoute.selectedExecutor ?? agent.adapterType;
+      const executorWasRedirected = effectiveDispatchAdapterType !== agent.adapterType;
+      // Neural telemetry (Phase 2B): observational tracking only, never read by
+      // dispatch control flow. Starts equal to the routed primary executor and
+      // is advanced to each fallback candidate's executorType below — after the
+      // fallback loop exits (success, exhaustion, or non-retryable break) this
+      // holds whichever executor's attempt actually produced the terminal
+      // adapterResult, which effectiveDispatchAdapterType alone cannot (it is
+      // fixed at the primary selection and never updated across fallback).
+      let actualDispatchExecutorType: string | null = effectiveDispatchAdapterType;
+      logger.info(
+        { runId: run.id, executionRoute: dynamicExecutionRoute.executionRoute, executorWasRedirected },
+        "Intelligent Execution Router: route resolved.",
+      );
+
+      const resolvedRuntimeMode = resolveHeartbeatRuntimeMode({
         persisted: {
           runtimeMode: run.runtimeMode,
           runtimeModeResolvedAt: run.runtimeModeResolvedAt,
@@ -16051,7 +16215,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue: issueRef ? { workMode: issueRef.workMode } : null,
         executionTarget,
       });
-      const adapter = getServerAdapter(agent.adapterType);
+      // The native runner coordinator is Codex-specific machinery tied to the
+      // AGENT'S OWN original adapterType (paperclip_runner/codex) — it has no
+      // equivalent for a different executor. When the router genuinely
+      // redirects to a different executor than the agent's own, dispatch must
+      // always go through the generic legacy adapter.execute() path for that
+      // OTHER executor, never the native path. This is a no-op in the
+      // overwhelmingly common case (executorWasRedirected is false whenever
+      // the agent's own executor is itself eligible, per execution-router.ts's
+      // incumbency rule), so today's real native-runner behavior is unchanged.
+      const runtimeResolution: HeartbeatRuntimeResolution = executorWasRedirected
+        ? { kind: "legacy", resolverVersion: NATIVE_RUNTIME_RESOLVER_VERSION, reason: "direct_adapter" }
+        : resolvedRuntimeMode;
+      const adapter = getServerAdapter(effectiveDispatchAdapterType);
       const localAgentJwtScope =
         issueRef?.workMode === "skill_test"
           ? { kind: "skill_test" as const, issueId: issueRef.id }
@@ -16302,6 +16478,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 isNull(approvals.consumedAt),
                 eq(approvals.consumedByRunId, rootRunId),
               ),
+              or(
+                isNull(approvals.expiresAt),
+                gt(approvals.expiresAt, new Date()),
+              ),
             ),
           )
           .orderBy(desc(approvals.createdAt))
@@ -16320,6 +16500,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               or(
                 isNull(approvals.consumedAt),
                 eq(approvals.consumedByRunId, rootRunId),
+              ),
+              or(
+                isNull(approvals.expiresAt),
+                gt(approvals.expiresAt, new Date()),
               ),
             ),
           )
@@ -16352,13 +16536,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "Risk guard approval failed atomic consume re-validation; re-intercepting.",
         );
       }
+      const isGenericEmptyTimerWake =
+        !issueId &&
+        !taskText.trim() &&
+        (run.invocationSource === "timer" || readNonEmptyString(context.wakeReason) === "heartbeat_timer");
+
       const interceptedByRiskGuard =
+        !isGenericEmptyTimerWake &&
         (risk === "HIGH" || risk === "UNKNOWN") &&
-        agent.adapterType === "codex_local" &&
         !executionAuthorized;
 
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
-      if (interceptedByRiskGuard) {
+      let modelRoutingResult: RouteModelResult | null = null;
+      if (isGenericEmptyTimerWake) {
+        adapterResult = {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          summary: "Generic timer heartbeat completed: no actionable task assigned.",
+          resultJson: {
+            skipped: true,
+            reason: "heartbeat.timer.empty_task_text",
+          },
+        };
+        await recordWorkspaceFinalize("succeeded");
+      } else if (interceptedByRiskGuard) {
         const approval = await db.transaction(async (tx) => {
           const lockKey = `risk-guard-approval:${agent.companyId}:${issueId ?? "unscoped"}:${canonicalFingerprint}`;
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
@@ -16502,6 +16704,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             promptMetrics: { promptChars: prompt.length },
             context: { provider: "codex", protocolVersion: 1 },
           });
+          // Reuses the route computed once above (never recomputed here) —
+          // this branch is only reachable when executorWasRedirected is
+          // false, so its selectedExecutor always equals agent.adapterType.
+          modelRoutingResult = dynamicExecutionRoute.modelRoutingResult;
+          if (modelRoutingResult.reason === "no_route_available") {
+            // Fail-closed: this agent's adapterType has no explicit model
+            // and no registry coverage. Never substitute another adapter's
+            // model. Reuses the existing configuration-incomplete failure
+            // contract (isConfigurationIncompleteFailedRun) instead of
+            // calling the adapter at all.
+            adapterResult = {
+              exitCode: 1,
+              errorCode: "model_not_found",
+              errorMessage: `No routable model for adapterType "${agent.adapterType}": no explicit runtimeConfig.model and no registry default for this adapter.`,
+              summary: "Execution blocked: no compatible model available for this agent's adapter.",
+              resultJson: {},
+            } as any;
+          } else {
           adapterResult = await executeNativeCodexRunner({
             db,
             companyId: agent.companyId,
@@ -16515,7 +16735,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             itemId: native.itemId,
             cwd: executionWorkspace.cwd,
             prompt,
-            model: readNonEmptyString(runtimeConfig.model),
+            model: modelRoutingResult.model,
             resumeProviderSessionId: runtimeSessionIdForAdapter,
             completionContract: native.completionContract,
             timeoutMs,
@@ -16523,7 +16743,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             onLog,
             onSpawn,
           });
+          }
         } else {
+          // Reuses the route computed once above (never recomputed here).
+          modelRoutingResult = dynamicExecutionRoute.modelRoutingResult;
+          if (modelRoutingResult.reason === "no_route_available") {
+            // Fail-closed: same contract as the native branch above. Never
+            // call the adapter with no routable model.
+            adapterResult = {
+              exitCode: 1,
+              errorCode: "model_not_found",
+              errorMessage: `No routable model for adapterType "${agent.adapterType}": no explicit runtimeConfig.model and no registry default for this adapter.`,
+              summary: "Execution blocked: no compatible model available for this agent's adapter.",
+              resultJson: {},
+            } as any;
+          } else {
+          if (modelRoutingResult.model) {
+            runtimeConfig.model = modelRoutingResult.model;
+          }
+          if (modelRoutingResult.provider) {
+            runtimeConfig.provider = modelRoutingResult.provider;
+          }
+          // Intelligent Execution Router: every dispatched attempt (primary
+          // and each fallback) gets its own frozen-at-call-time config copy
+          // carrying the FULL (executor, provider, model) tuple for that
+          // specific candidate — never a config object shared/mutated across
+          // attempts. This is what actually prevents a fallback attempt from
+          // silently retaining a previous attempt's stale provider value,
+          // beyond just updating the shared runtimeConfig for downstream
+          // visibility (logging/resultJson, which still reflect the latest
+          // attempt exactly as they did before this batch).
+          // Captured once, before any attempt mutates runtimeConfig.command, so a
+          // human's own explicit command override (e.g. a custom launcher) for the
+          // agent's OWN adapter is never lost after a cross-executor fallback
+          // attempt has overwritten it below.
+          const agentConfiguredCommand = readNonEmptyString(runtimeConfig.command) ?? null;
+          const buildAttemptConfig = (
+            model: string | null,
+            providerForAttempt: string | null,
+            executorTypeForAttempt?: string | null,
+          ) => {
+            if (model) runtimeConfig.model = model;
+            if (providerForAttempt) runtimeConfig.provider = providerForAttempt;
+            // Machine-local binary path override (see ExecutorRecord.binaryPath):
+            // only applies when this attempt actually targets a DIFFERENT
+            // executor than the agent's own adapterType — never let one
+            // cross-executor attempt's override leak into another attempt
+            // against the agent's own executor, and never let it persist
+            // across a subsequent attempt against yet another executor that
+            // has no binaryPath of its own.
+            const binaryPathOverride =
+              executorTypeForAttempt && executorTypeForAttempt !== agent.adapterType
+                ? getExecutorByType(executorTypeForAttempt)?.binaryPath ?? null
+                : null;
+            if (binaryPathOverride) {
+              runtimeConfig.command = binaryPathOverride;
+            } else if (agentConfiguredCommand) {
+              runtimeConfig.command = agentConfiguredCommand;
+            } else {
+              delete runtimeConfig.command;
+            }
+            return { ...runtimeConfig };
+          };
           const adapterContext = { ...context };
           const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
             db,
@@ -16542,13 +16823,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (managedMcpConfig) {
             adapterContext.paperclipManagedMcp = managedMcpConfig;
           }
-          adapterResult = await adapter.execute({
+          const dispatchWithAdapter = (targetAdapter: typeof adapter, attemptConfig: Record<string, unknown>) => targetAdapter.execute({
             runId: run.id,
             agent,
             runtime: runtimeForAdapter,
-            config: runtimeConfig,
+            config: attemptConfig,
             context: adapterContext,
-            runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
+            runtimeCommandSpec: targetAdapter.getRuntimeCommandSpec?.(attemptConfig) ?? null,
             executionTarget,
             executionTransport: remoteExecution
               ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
@@ -16568,6 +16849,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             onSpawn,
             authToken: authToken ?? undefined,
           });
+          adapterResult = await dispatchWithAdapter(
+            adapter,
+            buildAttemptConfig(modelRoutingResult.model, modelRoutingResult.provider, effectiveDispatchAdapterType),
+          );
+          // Intelligent Execution Router: bounded fallback re-dispatch. Only
+          // ever has a candidate to advance to when the primary selection
+          // came from genuine dynamic cross-executor scoring (fallbackChain
+          // is always empty for the fixed/pinned/explicit-override paths) —
+          // this fallback loop is active whenever multiple eligible
+          // confirmed-working executors are available, and is fully real and
+          // exercised by execution-router.test.ts's pure unit tests plus the
+          // dispatch-level tests in heartbeat-execution-router-dispatch.test.ts.
+          let fallbackAttemptsMade = 0;
+          while (classifyExecutionFailure(adapterResult.errorCode) === "retryable") {
+            const nextCandidate: ExecutionCandidate | null = nextFallbackCandidate(
+              dynamicExecutionRoute.executionRoute,
+              fallbackAttemptsMade,
+            );
+            if (!nextCandidate) break;
+            fallbackAttemptsMade += 1;
+            logger.warn(
+              {
+                runId: run.id,
+                fallbackAttempt: fallbackAttemptsMade,
+                previousErrorCode: adapterResult.errorCode,
+                nextCandidate,
+              },
+              "Intelligent Execution Router: retryable failure, advancing to next bounded fallback candidate.",
+            );
+            const fallbackAdapter = getServerAdapter(nextCandidate.executorType);
+            // Fresh attempt-scoped config carrying this candidate's OWN
+            // (provider, model) — never the previous attempt's stale values.
+            actualDispatchExecutorType = nextCandidate.executorType;
+            adapterResult = await dispatchWithAdapter(
+              fallbackAdapter,
+              buildAttemptConfig(nextCandidate.model, nextCandidate.provider, nextCandidate.executorType),
+            );
+          }
+          }
         }
         // Adapter returned cleanly, which means its workspace-restore finally
         // block also ran without throwing. Record the workspace_finalize
@@ -16803,6 +17123,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: {
                 ...parseObject(adapterResult.resultJson),
                 configFreshness: configFreshnessResultMetadata,
+                routingTier: modelRoutingResult?.tier ?? null,
+                routingReason: modelRoutingResult?.reason ?? null,
+                // Neural telemetry (Phase 2B), additive only — legacy
+                // routingTier/routingReason above are left byte-for-byte
+                // unchanged for existing consumers.
+                routedExecutor: effectiveDispatchAdapterType ?? null,
+                actualExecutor: actualDispatchExecutorType ?? null,
+                executorWasRedirected,
+                routingReasonFull: dynamicExecutionRoute.executionRoute.routingReason ?? null,
+                fixedRoutingReason: dynamicExecutionRoute.executionRoute.fixedRoutingReason ?? null,
+                provider: readNonEmptyString(adapterResult.provider) ?? null,
+                model: readNonEmptyString(adapterResult.model) ?? null,
               },
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
@@ -17025,7 +17357,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         {
           keepIdleOnFailure:
             outcome === "failed" &&
-            ((finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota") ||
+            ((finalizedRun
+                ? KEEP_IDLE_ERROR_FAMILIES.has(readHeartbeatRunErrorFamily(finalizedRun) ?? "")
+                : runErrorCode === "provider_quota") ||
               isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         },
@@ -17940,11 +18274,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      // Risk Guard's human-intervention interception is an intentional,
+      // fail-closed stop awaiting Human Approval — not an execution failure.
+      // Treating it as one here would make this run's own finalization
+      // auto-dispatch an "assignment_recovery" child for the same still-todo
+      // issue/agent, which re-enters Risk Guard immediately and mints a
+      // second approval for what is logically the same pending request.
+      const isHumanInterventionRequiredRun = readHeartbeatRunErrorFamily(run) === "human_intervention_required";
       const issueNeedsImmediateRecovery =
         (issue.status === "todo" || issue.status === "in_progress") &&
         !issue.assigneeUserId &&
         issue.assigneeAgentId === run.agentId &&
-        (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
+        (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled") &&
+        !isHumanInterventionRequiredRun;
 
       if (
         readNonEmptyString(parseObject(run.contextSnapshot).retryReason) ===

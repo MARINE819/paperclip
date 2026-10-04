@@ -110,6 +110,10 @@ export const companiesApi = {
       >
     >,
   ) => api.patch<Company>(`/companies/${companyId}`, data),
+  emergencyPause: (companyId: string) =>
+    api.post<Company>(`/companies/${companyId}/emergency-pause`, {}),
+  emergencyResume: (companyId: string, data: { resumeToken: string }) =>
+    api.post<Company>(`/companies/${companyId}/emergency-resume`, data),
   updateBranding: (companyId: string, data: UpdateCompanyBranding) =>
     api.patch<Company>(`/companies/${companyId}/branding`, data),
   archive: (companyId: string) => api.post<Company>(`/companies/${companyId}/archive`, {}),

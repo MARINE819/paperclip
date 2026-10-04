@@ -21,6 +21,47 @@ import type {
 } from "@paperclipai/shared";
 import { api } from "./client";
 
+/** Safe, read-only F-02 projection. No value, hash, or version payload fields. */
+export type SecretsRegistryEntryType = "secret" | "agent_api_key" | "board_api_key";
+
+export interface SecretsRegistryEntry {
+  id: string;
+  type: SecretsRegistryEntryType;
+  provider: string | null;
+  ownerType: "company" | "user" | "agent";
+  ownerId: string;
+  scope: string;
+  status: string;
+  maskedIdentifier: string | null;
+  label: string | null;
+  createdAt: string;
+  updatedAt: string | null;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  createdBy: string | null;
+}
+
+export interface SecretsRegistryListResponse {
+  entries: SecretsRegistryEntry[];
+}
+
+export interface SecretsRegistryDetailResponse {
+  entry: SecretsRegistryEntry;
+}
+
+export const secretsRegistryApi = {
+  list: (companyId: string, type?: SecretsRegistryEntryType) => {
+    const params = new URLSearchParams({ companyId });
+    if (type) params.set("type", type);
+    return api.get<SecretsRegistryListResponse>(`/secrets?${params.toString()}`);
+  },
+  get: (companyId: string, id: string) =>
+    api.get<SecretsRegistryDetailResponse>(
+      `/secrets/${encodeURIComponent(id)}?${new URLSearchParams({ companyId }).toString()}`,
+    ),
+};
+
 export interface SecretUsageResponse {
   secretId: string;
   bindings: CompanySecretUsageBinding[];

@@ -14,6 +14,41 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * `fetch()` throws a bare TypeError ("Failed to fetch" in Chrome, "Load
+ * failed" in Safari) when the browser never got an HTTP response at all —
+ * the server was unreachable, the connection was reset, etc. Without this
+ * class that network-layer failure was indistinguishable from any other
+ * thrown error once it reached a component, so callers had no way to show
+ * "connection lost" instead of surfacing the raw browser error string.
+ * Deliberately a sibling of `ApiError`, not a replacement — `ApiError`'s
+ * shape/contract (status, body) is unchanged for actual HTTP error responses.
+ */
+export class NetworkError extends Error {
+  cause: unknown;
+
+  constructor(message: string, cause: unknown) {
+    super(message);
+    this.name = "NetworkError";
+    this.cause = cause;
+  }
+}
+
+/**
+ * User-facing text for an error that reached a query's error state. A
+ * `NetworkError` (the browser never got an HTTP response — the raw
+ * "Failed to fetch"/"Load failed" case) always gets a stable, friendly
+ * connectivity message instead of that browser string. Any other error
+ * (typically `ApiError`) keeps showing its own `.message`, since that text
+ * usually carries real, useful backend-provided detail.
+ */
+export function describeApiError(error: unknown, fallback: string): string {
+  if (error instanceof NetworkError) {
+    return "서버에 연결할 수 없습니다. 네트워크 상태를 확인해 주세요. 자동으로 다시 시도합니다.";
+  }
+  return error instanceof Error ? error.message : fallback;
+}
+
 export interface RequestOptions {
   /** Abort signal wired through to `fetch` and coalescing (per-caller). */
   signal?: AbortSignal;
@@ -46,11 +81,32 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   applyObservabilityHeaders(headers);
 
-  const res = await fetch(`${BASE}${path}`, {
-    headers,
-    credentials: "include",
-    ...init,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      headers,
+      credentials: "include",
+      ...init,
+    });
+  } catch (networkError) {
+    // An intentional cancellation (coalescing, unmount, caller abort) is not
+    // a connectivity failure — preserve it exactly as callers already expect.
+    if (networkError instanceof DOMException && networkError.name === "AbortError") {
+      throw networkError;
+    }
+    // eslint-disable-next-line no-console
+    console.error("[api] request failed at the network layer (no HTTP response)", {
+      method: init?.method ?? "GET",
+      requestUrl: `${BASE}${path}`,
+      online: typeof navigator !== "undefined" ? navigator.onLine : "(no navigator)",
+      errorName: networkError instanceof Error ? networkError.name : typeof networkError,
+      errorMessage: networkError instanceof Error ? networkError.message : String(networkError),
+    });
+    throw new NetworkError(
+      "Unable to reach the server. Check your connection and try again.",
+      networkError,
+    );
+  }
   if (!res.ok) {
     const errorBody = await res.json().catch(() => null);
     throw new ApiError(

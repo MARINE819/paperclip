@@ -9,6 +9,7 @@ import {
   Search,
   SquarePen,
   Network,
+  Building2,
   Boxes,
   Repeat,
   Layers,
@@ -275,6 +276,7 @@ export function Sidebar() {
 
         <SidebarSection label="Organization" collapsible={{ open: companyOpen, onOpenChange: setCompanyOpen }}>
           <SidebarNavItem to="/org" label="Org" icon={Network} />
+          <SidebarNavItem to="/ai-office" label="AI Office" icon={Building2} />
           {showApps ? <SidebarNavItem to="/apps" label="Apps" icon={AppWindow} /> : null}
           <SidebarNavItem to="/timeline" label="Timeline" icon={GanttChartSquare} />
           <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />

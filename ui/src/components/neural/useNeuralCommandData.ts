@@ -2,6 +2,9 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { heartbeatsApi } from "@/api/heartbeats";
 import {
+  type CeoBriefingSummary,
+  type JarvisCoreState,
+  type JarvisReturnLoopData,
   type NeuralAgentSummary,
   type NeuralDataSource,
   type NeuralDataState,
@@ -38,8 +41,33 @@ export interface UseNeuralCommandDataOptions {
   pendingApprovals?: Array<{
     id: string;
     type: string;
+    status?: string;
+    effectiveStatus?: string;
     requestedByAgentId?: string | null;
   }>;
+  /**
+   * Pre-aggregated task counts from the dashboard API (tasks.done, tasks.blocked).
+   * Passed from parent to avoid duplicate network queries. null indicates loading/unknown.
+   */
+  completedCount?: number | null;
+  blockedCount?: number | null;
+  pendingApprovalCount?: number | null;
+  /**
+   * Optional pre-fetched knowledge records for Obsidian linkage.
+   */
+  knowledgeRecords?: Array<{
+    id: string;
+    title: string;
+    obsidianPath: string | null;
+    obsidianSyncState: "synced" | "pending" | "failed" | "skipped";
+    obsidianSyncedAt: string | null;
+    sourceRunId: string | null;
+    sourceAgentId: string | null;
+  }>;
+  /**
+   * UI-only voice state ("listening" | "processing" | "idle") from VoiceCommandBar.
+   */
+  voiceState?: string;
   isLoading?: boolean;
   error?: Error | string | null;
   selectedTeamId?: string | null;
@@ -131,7 +159,10 @@ export function useNeuralCommandData(
 
     const liveRunAgentIds = new Set(liveRuns.map((r) => r.agentId));
     const pendingApprovalAgentIds = new Set(
-      pendingApprovals.map((a) => a.requestedByAgentId).filter((id): id is string => Boolean(id)),
+      pendingApprovals
+        .filter((a) => a.effectiveStatus === "pending")
+        .map((a) => a.requestedByAgentId)
+        .filter((id): id is string => Boolean(id)),
     );
 
     // Case B: If orgUnits exist, map each orgUnit to a NeuralTeam
@@ -288,6 +319,157 @@ export function useNeuralCommandData(
     return "시뮬레이션 픽스처 (백엔드 연동 대기)";
   }, [source]);
 
+  // 8. CEO Briefing: derived strictly from pre-aggregated dashboard values passed from parent
+  const ceoBriefing: CeoBriefingSummary = useMemo(() => {
+    // Preserve null when loading or unknown — never convert to 0
+    const completedCount =
+      options.completedCount !== undefined ? options.completedCount : null;
+    const blockedCount =
+      options.blockedCount !== undefined ? options.blockedCount : null;
+    const pendingApprovalCount =
+      options.pendingApprovalCount !== undefined
+        ? options.pendingApprovalCount
+        : null;
+
+    const latestRunning = liveRuns.find((r) => r.triggerDetail || r.currentStatusMessage);
+    const recentActivity = latestRunning
+      ? (latestRunning.triggerDetail ?? latestRunning.currentStatusMessage ?? null)
+      : null;
+
+    return {
+      completedCount,
+      blockedCount,
+      pendingApprovalCount,
+      recentActivity,
+    };
+  }, [options.completedCount, options.blockedCount, options.pendingApprovalCount, liveRuns]);
+
+  // 9. Return Loop: strictly terminal runs only (never speculative active runs)
+  const recentReturnLoop: JarvisReturnLoopData | null = useMemo(() => {
+    const liveTelemetry = neuralRoutesQuery.data ?? [];
+    const terminalTelemetry = liveTelemetry.filter(
+      (r) =>
+        r.finishedAt &&
+        (r.status === "succeeded" || r.status === "failed" || r.status === "timed_out"),
+    );
+
+    if (terminalTelemetry.length > 0) {
+      const latest = [...terminalTelemetry].sort(
+        (a, b) => new Date(b.finishedAt!).getTime() - new Date(a.finishedAt!).getTime(),
+      )[0]!;
+
+      const agent = agents.find((a) => a.id === latest.agentId);
+      // Strictly match sourceRunId === latest.runId. Never link past runs of the same agent.
+      const matchingKnowledge = (options.knowledgeRecords ?? []).find(
+        (k) => k.sourceRunId && k.sourceRunId === latest.runId,
+      );
+
+      // Preserve actual terminal status: succeeded | failed | timed_out
+      const terminalStatus =
+        latest.status === "succeeded"
+          ? ("succeeded" as const)
+          : latest.status === "timed_out"
+            ? ("timed_out" as const)
+            : ("failed" as const);
+
+      return {
+        runId: latest.runId,
+        status: terminalStatus,
+        finishedAt: latest.finishedAt!,
+        agentId: latest.agentId,
+        agentName: agent?.name ?? "에이전트",
+        taskTitle: latest.taskId
+          ? `작업 ID: ${latest.taskId} (ID 기준 표기)`
+          : "작업 정보 미기록 (백엔드 미기록)",
+        routedExecutor: latest.routedExecutor ?? null,
+        actualExecutor: latest.actualExecutor ?? null,
+        provider: latest.provider ?? null,
+        model: latest.model ?? null,
+        errorCode: latest.errorCode ?? null,
+        obsidianPath: matchingKnowledge?.obsidianPath ?? null,
+        obsidianSyncState: matchingKnowledge?.obsidianSyncState ?? null,
+        obsidianSyncedAt: matchingKnowledge?.obsidianSyncedAt ?? null,
+      };
+    }
+
+    if (!backendTelemetryConfirmed) {
+      const fixtureDone = [...routesByAgentId.values()].find((r) => r.status === "done");
+      if (fixtureDone) {
+        return {
+          runId: fixtureDone.id,
+          status: "succeeded",
+          finishedAt: new Date().toISOString(),
+          agentId: fixtureDone.agentId,
+          agentName: fixtureDone.agentName,
+          taskTitle: fixtureDone.taskTitle,
+          routedExecutor: fixtureDone.executor,
+          actualExecutor: fixtureDone.executor,
+          provider: fixtureDone.provider,
+          model: fixtureDone.model,
+          errorCode: null,
+          obsidianPath: null,
+          obsidianSyncState: null,
+          obsidianSyncedAt: null,
+        };
+      }
+    }
+
+    return null;
+  }, [
+    neuralRoutesQuery.data,
+    backendTelemetryConfirmed,
+    routesByAgentId,
+    agents,
+    options.knowledgeRecords,
+  ]);
+
+  // 10. Truthful 8-State derivation (listening/planning/dispatching are UI-only)
+  const jarvisState: JarvisCoreState = useMemo(() => {
+    // 1. UI-only: Voice listening
+    if (options.voiceState === "listening") return "listening";
+    // UI-only: Voice processing / planning
+    if (options.voiceState === "processing") return "planning";
+
+    // 2. Pending Approval: strictly effectiveStatus === "pending"
+    const hasActivePendingApprovals = pendingApprovals.some(
+      (a) => a.effectiveStatus === "pending",
+    );
+    if (hasActivePendingApprovals) return "approval";
+
+    // 3. Error
+    const hasFailedRoute = [...routesByAgentId.values()].some(
+      (r) => r.status === "failed",
+    );
+    if (hasFailedRoute) return "error";
+
+    // 4. Dispatching (UI-only for queued runs waiting in scheduler queue)
+    const hasQueuedRun = (neuralRoutesQuery.data ?? []).some((r) => r.status === "queued");
+    if (hasQueuedRun) return "dispatching";
+
+    // 5. Working
+    const hasRunningRun =
+      liveRuns.length > 0 || [...routesByAgentId.values()].some((r) => r.status === "running");
+    if (hasRunningRun) return "working";
+
+    // 6. Done (recent terminal succeeded run within last 60 seconds)
+    if (recentReturnLoop?.status === "succeeded") {
+      const diffMs = Date.now() - new Date(recentReturnLoop.finishedAt).getTime();
+      if (diffMs < 60_000) {
+        return "done";
+      }
+    }
+
+    // 7. Idle
+    return "idle";
+  }, [
+    options.voiceState,
+    pendingApprovals,
+    routesByAgentId,
+    neuralRoutesQuery.data,
+    liveRuns,
+    recentReturnLoop,
+  ]);
+
   return {
     state,
     source,
@@ -298,5 +480,9 @@ export function useNeuralCommandData(
     activeRoute,
     sourceLabel,
     error: errorMessage,
+    jarvisState,
+    ceoBriefing,
+    recentReturnLoop,
   };
 }
+

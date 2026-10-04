@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Mic, MicOff } from "lucide-react";
 import { voiceApi, type VoiceCommandResponse } from "@/api/voice";
 import { Button } from "@/components/ui/button";
@@ -40,7 +40,7 @@ function isSpeechSynthesisSupported(): boolean {
   return typeof window !== "undefined" && "speechSynthesis" in window;
 }
 
-type VoiceBarState =
+export type VoiceBarState =
   | "unsupported"
   | "idle"
   | "listening"
@@ -68,15 +68,20 @@ function isApprovalRequested(response: VoiceCommandResponse): boolean {
 
 export interface VoiceCommandBarProps {
   companyId: string;
+  onStateChange?: (state: VoiceBarState) => void;
 }
 
-export function VoiceCommandBar({ companyId }: VoiceCommandBarProps) {
+export function VoiceCommandBar({ companyId, onStateChange }: VoiceCommandBarProps) {
   const supported = useRef(getSpeechRecognitionConstructor() !== null).current;
   const ttsSupported = useRef(isSpeechSynthesisSupported()).current;
   const [state, setState] = useState<VoiceBarState>(supported ? "idle" : "unsupported");
   const [resultText, setResultText] = useState<string | null>(null);
   const [ttsEnabled, setTtsEnabled] = useState(false);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+
+  useEffect(() => {
+    onStateChange?.(state);
+  }, [state, onStateChange]);
 
   const speak = useCallback(
     (text: string) => {

@@ -262,6 +262,81 @@ export interface NeuralAgentSummary {
   lastHeartbeatAt?: string | Date | null;
 }
 
+/**
+ * 8-State lifecycle for JARVIS Central Core.
+ *
+ * NOTE on Backend Contract Truthfulness:
+ * - UI-ONLY STATES:
+ *   - "listening": Derived exclusively from active voice input (VoiceCommandBar state === "listening"). Not a backend status.
+ *   - "planning": Derived exclusively from client voice processing (VoiceCommandBar state === "processing") or local context. Not a backend status.
+ *   - "dispatching": Derived from heartbeat_runs.status === "queued" (waiting for agent process wake/pickup). UI-only label for queued runs; not a native backend "dispatching" enum.
+ *
+ * - BACKEND-LINKED STATES:
+ *   - "working": Derived from active heartbeat_runs (status === "running").
+ *   - "approval": Derived from real pending approvals (approvalsApi / pendingApprovals).
+ *   - "error": Derived from real failed/timed_out terminal runs or agent error condition. Preserves original error code.
+ *   - "done": Derived from real terminal succeeded runs (heartbeat_runs.status === "succeeded").
+ *   - "idle": When no active runs, pending approvals, or voice activities exist.
+ */
+export type JarvisCoreState =
+  | "idle"
+  | "listening"
+  | "planning"
+  | "dispatching"
+  | "working"
+  | "approval"
+  | "error"
+  | "done";
+
+export const JARVIS_CORE_STATE_LABELS: Record<JarvisCoreState, string> = {
+  idle: "명령 대기",
+  listening: "음성 청취 중 (UI 전용)",
+  planning: "명령 계획/분해 (UI 전용)",
+  dispatching: "에이전트 배치 중 (대기열 기반 UI 전용)",
+  working: "작업 수행 중",
+  approval: "결재 승인 대기",
+  error: "이상 감지",
+  done: "정상 완료",
+};
+
+/**
+ * CEO Briefing Summary:
+ * Strict rule: Factual, backend-verified business task aggregates aligned with dashboard semantics.
+ * - completedCount: Factual count of business issues with status === "done" (NOT run-level succeeded count).
+ * - blockedCount: Factual count of business issues with status === "blocked" (NOT agent errors or approvals).
+ * - pendingApprovalCount: Factual count of active pending approvals from approvals API (excluding expired/consumed).
+ * Note: failedCount is deliberately omitted because the backend has no task-level FAILED aggregate contract yet.
+ */
+export interface CeoBriefingSummary {
+  completedCount: number | null;
+  blockedCount: number | null;
+  pendingApprovalCount: number | null;
+  recentActivity?: string | null;
+}
+
+/**
+ * JarvisReturnLoopData:
+ * Strictly populated from TERMINAL runs only (finishedAt !== null, status in "succeeded" | "failed" | "timed_out").
+ * NEVER used for active/queued runs to guess or speculate routedExecutor/provider/model.
+ */
+export interface JarvisReturnLoopData {
+  runId: string;
+  status: "succeeded" | "failed" | "timed_out";
+  finishedAt: string;
+  agentId: string;
+  agentName: string;
+  taskTitle: string;
+  routedExecutor: string | null;
+  actualExecutor: string | null;
+  provider: string | null;
+  model: string | null;
+  errorCode: string | null;
+  executionDurationMs?: number | null;
+  obsidianPath?: string | null;
+  obsidianSyncState?: "synced" | "pending" | "failed" | "skipped" | null;
+  obsidianSyncedAt?: string | null;
+}
+
 export interface NeuralViewModel {
   state: NeuralDataState;
   source: NeuralDataSource;
@@ -272,6 +347,9 @@ export interface NeuralViewModel {
   activeRoute: NeuralExecutionRoute | null;
   sourceLabel: string;
   error?: string | null;
+  jarvisState: JarvisCoreState;
+  ceoBriefing: CeoBriefingSummary;
+  recentReturnLoop: JarvisReturnLoopData | null;
 }
 
 export interface NeuralRouteNormalizer<TRaw = unknown> {

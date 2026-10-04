@@ -13,6 +13,8 @@ import { AgentStatusNode } from "./AgentStatusNode";
 import { ExecutionRoutePanel } from "./ExecutionRoutePanel";
 import { MobileNeuralNavigator } from "./MobileNeuralNavigator";
 import { BackendPendingBanner } from "./ExecutionRouteNodes";
+import { NeuralSignalOverlay } from "./NeuralSignalOverlay";
+import { JarvisReturnLoopPanel } from "./JarvisReturnLoopPanel";
 import { useNeuralCommandData } from "./useNeuralCommandData";
 
 export interface JarvisNeuralCommandInterfaceProps {
@@ -37,8 +39,24 @@ export interface JarvisNeuralCommandInterfaceProps {
   pendingApprovals?: Array<{
     id: string;
     type: string;
+    status?: string;
+    effectiveStatus?: string;
     requestedByAgentId?: string | null;
   }>;
+  completedCount?: number | null;
+  blockedCount?: number | null;
+  pendingApprovalCount?: number | null;
+  knowledgeRecords?: Array<{
+    id: string;
+    title: string;
+    obsidianPath: string | null;
+    obsidianSyncState: "synced" | "pending" | "failed" | "skipped";
+    obsidianSyncedAt: string | null;
+    sourceRunId: string | null;
+    sourceAgentId: string | null;
+  }>;
+  voiceState?: string;
+  onNavigateToKnowledgeTab?: () => void;
   isLoading?: boolean;
   error?: Error | string | null;
   sourceOverride?: NeuralDataSource;
@@ -57,6 +75,12 @@ export function JarvisNeuralCommandInterface({
   orgUnits = [],
   liveRuns = [],
   pendingApprovals = [],
+  completedCount,
+  blockedCount,
+  pendingApprovalCount,
+  knowledgeRecords,
+  voiceState,
+  onNavigateToKnowledgeTab,
   isLoading = false,
   error = null,
   sourceOverride,
@@ -72,6 +96,11 @@ export function JarvisNeuralCommandInterface({
     orgUnits,
     liveRuns,
     pendingApprovals,
+    completedCount,
+    blockedCount,
+    pendingApprovalCount,
+    knowledgeRecords,
+    voiceState,
     isLoading,
     error,
     selectedTeamId,
@@ -89,6 +118,9 @@ export function JarvisNeuralCommandInterface({
     activeRoute,
     sourceLabel,
     backendIntegrationPending,
+    jarvisState,
+    ceoBriefing,
+    recentReturnLoop,
   } = viewModel;
 
   const selectedTeam = teams.find((t) => t.id === selectedTeamId) ?? teams[0] ?? null;
@@ -187,47 +219,73 @@ export function JarvisNeuralCommandInterface({
       ) : (
         <>
           {/* Desktop / Tablet Neural Graph Layout */}
-          <div className="hidden md:flex flex-col gap-6">
-        {/* Top Tier: Central Core & Overview Stats */}
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-          <div className="lg:col-span-1">
-            <CentralJarvisCore
-              status={activeRoute?.status ?? "idle"}
-              teamCount={teams.length}
-              agentCount={agents.length > 0 ? agents.length : 5}
-              activeTaskCount={teams.reduce((acc, t) => acc + t.activeTaskCount, 0)}
-              pendingApprovalCount={teams.filter((t) => t.hasApprovalWaiting).length}
-              isSelected={selectedAgentId === "agent-jarvis-core"}
-              onClick={() => {
-                setSelectedTeamId("team-exec");
-                setSelectedAgentId("agent-jarvis-core");
-              }}
+          <div className="relative hidden md:flex flex-col gap-6">
+            <NeuralSignalOverlay
+              jarvisState={jarvisState}
+              activeTeamName={selectedTeam?.name}
+              activeAgentName={activeRoute?.agentName}
+              terminalExecutor={recentReturnLoop?.actualExecutor ?? recentReturnLoop?.routedExecutor}
+              terminalProvider={recentReturnLoop?.provider}
+              terminalModel={recentReturnLoop?.model}
+              isReturnFlowActive={recentReturnLoop?.status === "succeeded"}
             />
-          </div>
 
-          {/* Team Ring Clustered around Core */}
-          <div className="flex flex-col justify-between gap-3 rounded-2xl border border-border bg-card p-4 lg:col-span-2">
-            <div className="flex items-center justify-between border-b pb-2">
-              <span className="font-semibold text-xs tracking-wider text-muted-foreground uppercase">
-                부서 / 조직 네트워크 (Team Ring)
-              </span>
-              <span className="text-xs text-muted-foreground">
-                팀 클릭 시 소속 에이전트 표시
-              </span>
+            {/* Top Tier: Central Core & Overview Stats */}
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-3 z-10">
+              <div className="lg:col-span-1">
+                <CentralJarvisCore
+                  status={jarvisState}
+                  teamCount={teams.length}
+                  agentCount={agents.length}
+                  activeTaskCount={teams.reduce((acc, t) => acc + t.activeTaskCount, 0)}
+                  pendingApprovalCount={ceoBriefing.pendingApprovalCount}
+                  isSelected={selectedAgentId === "agent-jarvis-core"}
+                  currentTaskTitle={activeRoute?.taskTitle}
+                  currentTeamName={activeRoute?.teamName}
+                  currentAgentName={activeRoute?.agentName}
+                  terminalRunId={recentReturnLoop?.runId}
+                  terminalExecutor={recentReturnLoop?.actualExecutor ?? recentReturnLoop?.routedExecutor}
+                  terminalProvider={recentReturnLoop?.provider}
+                  terminalModel={recentReturnLoop?.model}
+                  onClick={() => {
+                    setSelectedTeamId("team-exec");
+                    setSelectedAgentId("agent-jarvis-core");
+                  }}
+                />
+              </div>
+
+              {/* Team Ring Clustered around Core */}
+              <div className="flex flex-col justify-between gap-3 rounded-2xl border border-border bg-card p-4 lg:col-span-2">
+                <div className="flex items-center justify-between border-b pb-2">
+                  <span className="font-semibold text-xs tracking-wider text-muted-foreground uppercase">
+                    부서 / 조직 네트워크 (Team Ring)
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    팀 클릭 시 소속 에이전트 표시
+                  </span>
+                </div>
+                <TeamRing
+                  teams={teams}
+                  selectedTeamId={selectedTeamId}
+                  onSelectTeam={(teamId) => {
+                    setSelectedTeamId(teamId);
+                    const team = teams.find((t) => t.id === teamId);
+                    if (team && team.agentIds.length > 0) {
+                      setSelectedAgentId(team.agentIds[0]!);
+                    }
+                  }}
+                />
+              </div>
             </div>
-            <TeamRing
-              teams={teams}
-              selectedTeamId={selectedTeamId}
-              onSelectTeam={(teamId) => {
-                setSelectedTeamId(teamId);
-                const team = teams.find((t) => t.id === teamId);
-                if (team && team.agentIds.length > 0) {
-                  setSelectedAgentId(team.agentIds[0]!);
-                }
-              }}
-            />
-          </div>
-        </div>
+
+            {/* Middle Tier 1: CEO Briefing & Return Loop Panel */}
+            <div className="z-10">
+              <JarvisReturnLoopPanel
+                ceoBriefing={ceoBriefing}
+                returnLoopData={recentReturnLoop}
+                onNavigateToKnowledgeTab={onNavigateToKnowledgeTab}
+              />
+            </div>
 
         {/* Middle Tier: Agent Roster for Selected Team */}
         <div className="flex flex-col gap-3">
@@ -275,7 +333,7 @@ export function JarvisNeuralCommandInterface({
       </div>
 
       {/* Mobile Staged Navigation Layout */}
-      <div className="flex md:hidden flex-col">
+      <div className="flex md:hidden flex-col gap-4">
         <MobileNeuralNavigator
           teams={teams}
           agents={agents.length > 0 ? agents : [
@@ -290,6 +348,12 @@ export function JarvisNeuralCommandInterface({
           selectedAgentId={selectedAgentId}
           onSelectTeam={setSelectedTeamId}
           onSelectAgent={setSelectedAgentId}
+        />
+
+        <JarvisReturnLoopPanel
+          ceoBriefing={ceoBriefing}
+          returnLoopData={recentReturnLoop}
+          onNavigateToKnowledgeTab={onNavigateToKnowledgeTab}
         />
       </div>
         </>

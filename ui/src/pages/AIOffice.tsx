@@ -8,6 +8,8 @@ import { approvalsApi } from "@/api/approvals";
 import { costsApi } from "@/api/costs";
 import { aiOfficeApi } from "@/api/aiOffice";
 import { companiesApi } from "@/api/companies";
+import { dashboardApi } from "@/api/dashboard";
+import { knowledgeApi } from "@/api/knowledge";
 import { describeApiError } from "@/api/client";
 import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
@@ -25,7 +27,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { DecisionQueueRail } from "@/components/DecisionQueueRail";
 import { ActivityFeed } from "@/components/ActivityFeed";
-import { VoiceCommandBar } from "@/components/VoiceCommandBar";
+import { VoiceCommandBar, type VoiceBarState } from "@/components/VoiceCommandBar";
 import { AIOfficeEvalLab } from "@/components/AIOfficeEvalLab";
 import { AIOfficeIncidentLab } from "@/components/AIOfficeIncidentLab";
 import { AIOfficeBackupDrLab } from "@/components/AIOfficeBackupDrLab";
@@ -161,6 +163,7 @@ export function AIOffice() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [controlCenterTab, setControlCenterTab] = useControlCenterTab("sre");
   const [viewMode, setViewMode] = useAIOfficeViewMode("floor");
+  const [voiceState, setVoiceState] = useState<VoiceBarState>("idle");
 
   useEffect(() => {
     setBreadcrumbs([{ label: "AI Office" }]);
@@ -217,6 +220,20 @@ export function AIOffice() {
   const quotaWindowsQuery = useQuery({
     queryKey: ["ai-office-2d-quota", selectedCompanyId],
     queryFn: () => costsApi.quotaWindows(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+    refetchInterval: 30_000,
+  });
+
+  const dashboardQuery = useQuery({
+    queryKey: ["ai-office-dashboard-summary", selectedCompanyId],
+    queryFn: () => dashboardApi.summary(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+    refetchInterval: 30_000,
+  });
+
+  const knowledgeQuery = useQuery({
+    queryKey: ["ai-office-knowledge-records", selectedCompanyId],
+    queryFn: () => knowledgeApi.listKnowledgeRecords(selectedCompanyId!, { limit: 500 }),
     enabled: !!selectedCompanyId,
     refetchInterval: 30_000,
   });
@@ -418,6 +435,18 @@ export function AIOffice() {
           orgUnits={orgUnitsQuery.data ?? []}
           liveRuns={liveRunsQuery.data ?? []}
           pendingApprovals={pendingApprovalsQuery.data ?? []}
+          completedCount={dashboardQuery.isLoading ? null : (dashboardQuery.data?.tasks.done ?? null)}
+          blockedCount={dashboardQuery.isLoading ? null : (dashboardQuery.data?.tasks.blocked ?? null)}
+          pendingApprovalCount={
+            pendingApprovalsQuery.isLoading
+              ? null
+              : (pendingApprovalsQuery.data?.filter(
+                  (a) => (a as { effectiveStatus?: string }).effectiveStatus === "pending",
+                ).length ?? null)
+          }
+          knowledgeRecords={knowledgeQuery.data ?? []}
+          voiceState={voiceState}
+          onNavigateToKnowledgeTab={() => setControlCenterTab("knowledge")}
           isLoading={agentsQuery.isLoading || orgUnitsQuery.isLoading}
           error={agentsQuery.error || orgUnitsQuery.error}
           companyId={selectedCompanyId}
@@ -831,7 +860,11 @@ export function AIOffice() {
         <CardHeader>
           <CardTitle className="text-sm">Voice / JARVIS 음성 명령</CardTitle>
         </CardHeader>
-        <CardContent>{selectedCompanyId ? <VoiceCommandBar companyId={selectedCompanyId} /> : null}</CardContent>
+        <CardContent>
+          {selectedCompanyId ? (
+            <VoiceCommandBar companyId={selectedCompanyId} onStateChange={setVoiceState} />
+          ) : null}
+        </CardContent>
       </Card>
     </div>
   );

@@ -4,7 +4,11 @@ import { issueService } from "./issues.js";
 import { documentService } from "./documents.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { getAgentByIdForDelegation, listCompanyAgentsForDelegation } from "./jarvis-agent-directory.js";
-import { selectDeterministicSpecialist, type JarvisAgentRejection } from "./jarvis-agent-selector.js";
+import {
+  selectDeterministicSpecialist,
+  selectDeterministicReviewer,
+  type JarvisAgentRejection,
+} from "./jarvis-agent-selector.js";
 import {
   JARVIS_DELEGATION_PLAN_SCHEMA_VERSION,
   assertSingleSpecialistPlan,
@@ -86,7 +90,8 @@ export type SubmitToJarvisRejectionReason =
   | "invalid_plan"
   | "plan_limits_violated"
   | "not_single_specialist"
-  | "no_eligible_specialist";
+  | "no_eligible_specialist"
+  | "no_eligible_reviewer";
 
 export interface SubmitToJarvisFailure {
   ok: false;
@@ -106,6 +111,7 @@ export interface SubmitToJarvisSuccess {
   childIssueId: string;
   parentBlockerAdded: boolean;
   selectedAgentId: string;
+  reviewerAgentId?: string | null;
   intakeFingerprint: string;
   planFingerprint: string;
   reasonCodes: string[];
@@ -257,6 +263,26 @@ export async function submitToJarvis(
     };
   }
 
+  let selectedReviewerId: string | null = null;
+  if (plan.reviewRequired) {
+    const reviewerSelection = selectDeterministicReviewer({
+      companyId,
+      jarvisAgentId,
+      executorAgentId: selection.selectedAgentId,
+      candidates: companyAgents,
+    });
+    if (reviewerSelection.blocked || !reviewerSelection.selectedAgentId) {
+      return {
+        ok: false,
+        reason: "no_eligible_reviewer",
+        detail: "No eligible independent reviewer agent was found for this task. The executor cannot self-review.",
+        parentIssueId: parentIssue.id,
+        rejectedAgents: reviewerSelection.rejected,
+      };
+    }
+    selectedReviewerId = reviewerSelection.selectedAgentId;
+  }
+
   // 8/9/10. The Board-submitted plan is itself the Human approval boundary.
   // Persist it through Paperclip's canonical plan-document + accepted
   // request_confirmation contract, then use the existing accepted-plan
@@ -331,6 +357,7 @@ export async function submitToJarvis(
       description: task.instructions,
       status: CHILD_ISSUE_STATUS,
       assigneeAgentId: selection.selectedAgentId,
+      reviewPolicy: plan.reviewRequired ? "not_creator" : null,
       acceptanceCriteria: plan.acceptanceCriteria,
       blockParentUntilDone: true,
       idempotencyKey: planFingerprint,
@@ -366,11 +393,13 @@ export async function submitToJarvis(
     childIssueId: childIssue.id,
     parentBlockerAdded: true,
     selectedAgentId: selection.selectedAgentId,
+    reviewerAgentId: selectedReviewerId,
     intakeFingerprint,
     planFingerprint,
     reasonCodes: [
       parentIssueDeduplicated ? "parent_issue_reused" : "parent_issue_created",
       ...selection.reasonCodes,
+      ...(selectedReviewerId ? ["independent_reviewer_selected"] : []),
       "child_issue_created",
       "accepted_plan_recorded",
       "parent_blocked_until_child_done",

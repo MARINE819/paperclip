@@ -348,3 +348,83 @@ describe("submitToJarvis — wakeup is injectable and optional", () => {
     );
   });
 });
+
+describe("submitToJarvis — reviewRequired and independent reviewer selection", () => {
+  const REVIEWER_ID = "agent-reviewer";
+
+  it("selects an independent reviewer and sets reviewPolicy to not_creator when reviewRequired=true", async () => {
+    mockListCompanyAgentsForDelegation.mockResolvedValue([
+      agent({ id: JARVIS_ID }),
+      agent({ id: SPECIALIST_ID, priority: 1 }),
+      agent({ id: REVIEWER_ID, priority: 2 }),
+    ]);
+
+    const result = await submitToJarvis(
+      FAKE_DB,
+      baseInput({ plan: validPlan({ reviewRequired: true }) }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected success");
+    expect(result.selectedAgentId).toBe(SPECIALIST_ID);
+    expect(result.reviewerAgentId).toBe(REVIEWER_ID);
+    expect(mockDecomposeAcceptedPlan).toHaveBeenCalledWith(
+      "parent-issue-1",
+      expect.objectContaining({
+        children: [
+          expect.objectContaining({
+            reviewPolicy: "not_creator",
+          }),
+        ],
+      }),
+    );
+  });
+
+  it("fails closed with no_eligible_reviewer when reviewRequired=true but no independent reviewer is available", async () => {
+    // Only JARVIS and the specialist exist
+    mockListCompanyAgentsForDelegation.mockResolvedValue([
+      agent({ id: JARVIS_ID }),
+      agent({ id: SPECIALIST_ID }),
+    ]);
+
+    const result = await submitToJarvis(
+      FAKE_DB,
+      baseInput({ plan: validPlan({ reviewRequired: true }) }),
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(result.reason).toBe("no_eligible_reviewer");
+    expect(result.parentIssueId).toBe("parent-issue-1");
+    expect(mockDecomposeAcceptedPlan).not.toHaveBeenCalled();
+  });
+
+  it("preserves reviewPolicy=null and selects no reviewer when reviewRequired is false or omitted", async () => {
+    mockListCompanyAgentsForDelegation.mockResolvedValue([
+      agent({ id: JARVIS_ID }),
+      agent({ id: SPECIALIST_ID, priority: 1 }),
+      agent({ id: REVIEWER_ID, priority: 2 }),
+    ]);
+
+    const result = await submitToJarvis(
+      FAKE_DB,
+      baseInput({ plan: validPlan({ reviewRequired: false }) }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected success");
+    expect(result.reviewerAgentId).toBeNull();
+    expect(mockDecomposeAcceptedPlan).toHaveBeenCalledWith(
+      "parent-issue-1",
+      expect.objectContaining({
+        children: [
+          expect.objectContaining({
+            reviewPolicy: null,
+          }),
+        ],
+      }),
+    );
+  });
+});
+
+

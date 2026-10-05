@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { selectDeterministicSpecialist, type JarvisSelectableAgent } from "./jarvis-agent-selector.js";
+import {
+  selectDeterministicSpecialist,
+  selectDeterministicReviewer,
+  type JarvisSelectableAgent,
+} from "./jarvis-agent-selector.js";
 
 const COMPANY = "company-1";
 const JARVIS_ID = "agent-jarvis";
@@ -172,5 +176,64 @@ describe("selectDeterministicSpecialist", () => {
     });
     expect(first.selectedAgentId).toBe(second.selectedAgentId);
     expect(first.selectedAgentId).toBe("agent-a");
+  });
+
+  it("excludes explicitly specified agent IDs", () => {
+    const result = selectDeterministicSpecialist({
+      companyId: COMPANY,
+      jarvisAgentId: JARVIS_ID,
+      candidates: [agent({ id: "agent-a" }), agent({ id: "agent-b" })],
+      task: { requiredCapabilities: [] },
+      excludeAgentIds: ["agent-a"],
+    });
+    expect(result.selectedAgentId).toBe("agent-b");
+    expect(result.rejected).toContainEqual(
+      expect.objectContaining({ agentId: "agent-a", reason: "is_excluded" }),
+    );
+  });
+});
+
+describe("selectDeterministicReviewer", () => {
+  it("excludes both JARVIS and the executor from reviewer selection", () => {
+    const result = selectDeterministicReviewer({
+      companyId: COMPANY,
+      jarvisAgentId: JARVIS_ID,
+      executorAgentId: "agent-executor",
+      candidates: [
+        agent({ id: JARVIS_ID }),
+        agent({ id: "agent-executor" }),
+        agent({ id: "agent-reviewer" }),
+      ],
+    });
+    expect(result.blocked).toBe(false);
+    expect(result.selectedAgentId).toBe("agent-reviewer");
+  });
+
+  it("fails closed when only JARVIS and executor exist in company", () => {
+    const result = selectDeterministicReviewer({
+      companyId: COMPANY,
+      jarvisAgentId: JARVIS_ID,
+      executorAgentId: "agent-executor",
+      candidates: [
+        agent({ id: JARVIS_ID }),
+        agent({ id: "agent-executor" }),
+      ],
+    });
+    expect(result.blocked).toBe(true);
+    expect(result.selectedAgentId).toBeNull();
+    expect(result.reasonCodes).toEqual(["no_eligible_agent"]);
+  });
+
+  it("ranks eligible reviewers deterministically by priority and availability", () => {
+    const result = selectDeterministicReviewer({
+      companyId: COMPANY,
+      jarvisAgentId: JARVIS_ID,
+      executorAgentId: "agent-executor",
+      candidates: [
+        agent({ id: "agent-reviewer-busy", priority: 1, hasActiveRun: true }),
+        agent({ id: "agent-reviewer-idle", priority: 5, hasActiveRun: false }),
+      ],
+    });
+    expect(result.selectedAgentId).toBe("agent-reviewer-idle");
   });
 });

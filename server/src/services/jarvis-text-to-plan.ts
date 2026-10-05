@@ -80,17 +80,22 @@ export interface BuildMinimalDelegationPlanResult {
  * anything validateDelegationPlan itself would reject — never returns a
  * best-effort plan the caller didn't ask for.
  */
-export function buildMinimalDelegationPlanFromText(requestText: string): BuildMinimalDelegationPlanResult {
+export function buildMinimalDelegationPlanFromText(
+  requestText: string,
+  options?: { reviewRequired?: boolean },
+): BuildMinimalDelegationPlanResult {
   const trimmed = requestText?.trim();
   if (!trimmed) {
     return { ok: false, plan: null, errors: ["requestText is required and cannot be blank."] };
   }
 
+  const reviewRequired = options?.reviewRequired ?? false;
   const taskClass = classifyTaskClass(trimmed.toLowerCase());
   const plan: SubmitToJarvisPlanInput = {
     objective: trimmed,
     acceptanceCriteria: ["The requested task is completed as described in the request text."],
     evidenceRequirements: ["work_product"],
+    reviewRequired,
     taskClass,
     tasks: [
       {
@@ -113,7 +118,7 @@ export function buildMinimalDelegationPlanFromText(requestText: string): BuildMi
     constraints: [],
     acceptanceCriteria: plan.acceptanceCriteria,
     evidenceRequirements: plan.evidenceRequirements,
-    reviewRequired: false,
+    reviewRequired,
     taskClass: plan.taskClass,
     tasks: plan.tasks,
     memoryRefs: [],

@@ -36,6 +36,7 @@ export interface JarvisDelegationTaskRequirements {
 export type JarvisAgentRejectionReason =
   | "different_company"
   | "is_orchestrator"
+  | "is_excluded"
   | "not_assignable"
   | "missing_required_capability";
 
@@ -87,10 +88,12 @@ export function selectDeterministicSpecialist(input: {
   jarvisAgentId: string;
   candidates: JarvisSelectableAgent[];
   task: JarvisDelegationTaskRequirements;
+  excludeAgentIds?: string[];
 }): JarvisAgentSelectionResult {
-  const { companyId, jarvisAgentId, candidates, task } = input;
+  const { companyId, jarvisAgentId, candidates, task, excludeAgentIds } = input;
   const rejected: JarvisAgentRejection[] = [];
   const eligible: JarvisSelectableAgent[] = [];
+  const excludedSet = new Set(excludeAgentIds ?? []);
 
   for (const candidate of candidates) {
     if (candidate.companyId !== companyId) {
@@ -106,6 +109,14 @@ export function selectDeterministicSpecialist(input: {
         agentId: candidate.id,
         reason: "is_orchestrator",
         detail: "JARVIS cannot assign the delegated task to itself; the executor must be independent of the orchestrator.",
+      });
+      continue;
+    }
+    if (excludedSet.has(candidate.id)) {
+      rejected.push({
+        agentId: candidate.id,
+        reason: "is_excluded",
+        detail: "Agent is excluded from selection (e.g. executor cannot review its own work or orchestrator excluded).",
       });
       continue;
     }
@@ -166,4 +177,33 @@ export function selectDeterministicSpecialist(input: {
     ],
     rejected,
   };
+}
+
+/**
+ * Deterministically select an independent reviewer agent.
+ * Enforces segregation of duties:
+ * - Reviewer cannot be JARVIS (orchestrator)
+ * - Reviewer cannot be the executor (specialist who did the work)
+ * - Any additional excluded agents are respected
+ */
+export function selectDeterministicReviewer(input: {
+  companyId: string;
+  jarvisAgentId: string;
+  executorAgentId: string;
+  candidates: JarvisSelectableAgent[];
+  task?: JarvisDelegationTaskRequirements;
+  excludeAgentIds?: string[];
+}): JarvisAgentSelectionResult {
+  const exclude = new Set([
+    input.jarvisAgentId,
+    input.executorAgentId,
+    ...(input.excludeAgentIds ?? []),
+  ]);
+  return selectDeterministicSpecialist({
+    companyId: input.companyId,
+    jarvisAgentId: input.jarvisAgentId,
+    candidates: input.candidates,
+    task: input.task ?? { requiredCapabilities: [] },
+    excludeAgentIds: Array.from(exclude),
+  });
 }

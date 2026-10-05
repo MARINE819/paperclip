@@ -148,6 +148,7 @@ import { runJarvisParentReportAction } from "../services/jarvis-parent-report-ac
 import { shouldBlockAgentDelegatedParentCompletion } from "../services/jarvis-parent-completion-guard.js";
 import { shouldBlockAgentSelfActionOnOwnWorkProduct } from "../services/work-product-self-action-guard.js";
 import { submitToJarvis } from "../services/jarvis-delegation-orchestrator.js";
+import { buildMinimalDelegationPlanFromText } from "../services/jarvis-text-to-plan.js";
 import { jarvisParentReportActionSchema } from "./jarvis-parent-report-action-schema.js";
 import { submitToJarvisRequestSchema } from "./jarvis-submit-request-schema.js";
 import {
@@ -6352,6 +6353,23 @@ export function issueRoutes(
         res.status(403).json({ error: "Delegating to JARVIS requires a Human board actor." });
         return;
       }
+      // M2-06: a full plan from the caller always wins unchanged (existing
+      // behavior). Only when it is omitted do we derive a minimal one from
+      // requestText -- never silently replacing a caller-supplied plan, and
+      // never inventing one when the translator itself fails closed.
+      let plan = req.body.plan;
+      if (!plan) {
+        const derived = buildMinimalDelegationPlanFromText(req.body.requestText);
+        if (!derived.ok || !derived.plan) {
+          res.status(422).json({
+            error: "Could not derive a delegation plan from requestText.",
+            reason: "invalid_text_for_plan",
+            planErrors: derived.errors,
+          });
+          return;
+        }
+        plan = derived.plan;
+      }
       const result = await submitToJarvis(
         db,
         {
@@ -6363,7 +6381,7 @@ export function issueRoutes(
           sourceRef: req.body.sourceRef ?? null,
           idempotencyKey: req.body.idempotencyKey ?? null,
           depthBelowParent: req.body.depthBelowParent,
-          plan: req.body.plan,
+          plan,
         },
         { wakeup: heartbeat.wakeup },
       );

@@ -297,4 +297,78 @@ describeEmbeddedPostgres("POST /companies/:companyId/jarvis/submit", () => {
 
     expect(res.body.name).toBe("Existing route smoke test");
   });
+
+  describe("M2-06 text-only submission (plan omitted)", () => {
+    it("derives a minimal plan from requestText and completes exactly like a full-plan submission", async () => {
+      const company = await seedCompany();
+      const jarvis = await seedAgent(company.id, "JARVIS");
+      const specialist = await seedAgent(company.id, "Specialist");
+      const app = createApp();
+
+      const res = await request(app)
+        .post(`/api/companies/${company.id}/jarvis/submit`)
+        .send({ jarvisAgentId: jarvis.id, requestText: "Fix the flaky login test" })
+        .expect(201);
+
+      expect(res.body.ok).toBe(true);
+      expect(res.body.selectedAgentId).toBe(specialist.id);
+
+      const [childRow] = await db.select().from(issues).where(eq(issues.id, res.body.childIssueId));
+      expect(childRow.assigneeAgentId).toBe(specialist.id);
+      expect(childRow.status).toBe("todo");
+    });
+
+    it("a full caller-supplied plan still wins unchanged when both plan and requestText are present", async () => {
+      const company = await seedCompany();
+      const jarvis = await seedAgent(company.id, "JARVIS");
+      await seedAgent(company.id, "Specialist");
+      const app = createApp();
+
+      const res = await request(app)
+        .post(`/api/companies/${company.id}/jarvis/submit`)
+        .send({ jarvisAgentId: jarvis.id, requestText: "Fix the flaky login test", plan: validPlanBody() })
+        .expect(201);
+
+      expect(res.body.ok).toBe(true);
+      const [parentRow] = await db.select().from(issues).where(eq(issues.id, res.body.parentIssueId));
+      expect(parentRow.assigneeAgentId).toBe(jarvis.id);
+    });
+
+    it("fails closed with 400 for whitespace-only requestText and no plan -- creates no Issue", async () => {
+      // Enforced at the route-schema layer (requestText: z.string().trim().min(1)),
+      // which already guarantees buildMinimalDelegationPlanFromText's own
+      // fail-closed branch (unit-tested directly in jarvis-text-to-plan.test.ts)
+      // can never see blank input through this real HTTP path -- this test
+      // proves the end-to-end route behavior, not just the unit in isolation.
+      const company = await seedCompany();
+      const jarvis = await seedAgent(company.id, "JARVIS");
+      const app = createApp();
+
+      await request(app)
+        .post(`/api/companies/${company.id}/jarvis/submit`)
+        .send({ jarvisAgentId: jarvis.id, requestText: "   " })
+        .expect(400);
+
+      const rows = await db.select().from(issues).where(eq(issues.companyId, company.id));
+      expect(rows).toHaveLength(0);
+    });
+
+    it("rejects submission from an agent actor even for a text-only request (Human-only enforcement unchanged)", async () => {
+      const company = await seedCompany();
+      const jarvis = await seedAgent(company.id, "JARVIS");
+      const requester = await seedAgent(company.id, "Requesting Agent");
+      const app = createApp();
+      const token = createLocalAgentJwt(requester.id, company.id, "codex_local", "00000000-0000-0000-0000-000000000000");
+      if (!token) throw new Error("expected a local agent JWT to be issued in this test environment");
+
+      await request(app)
+        .post(`/api/companies/${company.id}/jarvis/submit`)
+        .set("Authorization", `Bearer ${token}`)
+        .send({ jarvisAgentId: jarvis.id, requestText: "Fix the flaky login test" })
+        .expect(403);
+
+      const rows = await db.select().from(issues).where(eq(issues.companyId, company.id));
+      expect(rows).toHaveLength(0);
+    });
+  });
 });

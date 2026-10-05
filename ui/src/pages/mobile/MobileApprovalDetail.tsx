@@ -8,7 +8,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ShieldCheck, ShieldAlert, ChevronDown, ChevronUp, Lock, RefreshCw } from "lucide-react";
-import { webauthnMock } from "../../lib/mobile/webauthn-mock";
+import { startAuthentication, browserSupportsWebAuthn } from "@simplewebauthn/browser";
+import { webauthnApi } from "../../api/webauthn";
 
 export function MobileApprovalDetail() {
   const { approvalId } = useParams<{ approvalId: string }>();
@@ -18,6 +19,7 @@ export function MobileApprovalDetail() {
   const [isCommandsOpen, setIsCommandsOpen] = useState(false);
   const [decisionNote, setDecisionNote] = useState("");
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [approvalToken, setApprovalToken] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isAuthProcessing, setIsAuthProcessing] = useState(false);
 
@@ -36,7 +38,12 @@ export function MobileApprovalDetail() {
   };
 
   const approveMutation = useMutation({
-    mutationFn: () => approvalsApi.approve(approvalId!, decisionNote.trim() || undefined),
+    mutationFn: () =>
+      approvalsApi.approve(
+        approvalId!,
+        decisionNote.trim() || undefined,
+        approvalToken ? { approvalToken } : undefined,
+      ),
     onSuccess: () => {
       setErrorMsg(null);
       refresh();
@@ -76,16 +83,40 @@ export function MobileApprovalDetail() {
     setIsAuthProcessing(true);
     setErrorMsg(null);
 
-    const challenge = `[결재 승인 챌린지]\n요청 ID: ${approval.id}\n유형: ${approval.type}`;
     try {
-      const result = await webauthnMock.authenticate(challenge);
-      if (result.success) {
+      if (!browserSupportsWebAuthn()) {
+        setErrorMsg("이 브라우저 또는 기기는 WebAuthn 생체 인증을 지원하지 않습니다.");
+        return;
+      }
+
+      // 1. Get authentication options for purpose: "approval_decision" bound to approval.id
+      const options = await webauthnApi.getAuthenticationOptions(approval.companyId, {
+        purpose: "approval_decision",
+        bindingId: approval.id,
+      });
+
+      // 2. Trigger native Face ID / Touch ID / Passkey via @simplewebauthn/browser
+      const authResponse = await startAuthentication({ optionsJSON: options });
+
+      // 3. Verify response with server and obtain 60s TTL approvalToken
+      const verifyResult = await webauthnApi.verifyAuthentication(approval.companyId, {
+        purpose: "approval_decision",
+        bindingId: approval.id,
+        response: authResponse,
+      });
+
+      if (verifyResult.verified && verifyResult.approvalToken) {
+        setApprovalToken(verifyResult.approvalToken);
         setIsAuthenticated(true);
       } else {
-        setErrorMsg(result.error ?? "생체 인증 실패");
+        setErrorMsg("생체 인증 검증에 실패했습니다.");
       }
-    } catch (e) {
-      setErrorMsg("인증 런타임 오류가 발생했습니다.");
+    } catch (e: any) {
+      if (e?.name === "NotAllowedError") {
+        setErrorMsg("생체 인증이 취소되었습니다.");
+      } else {
+        setErrorMsg(e instanceof Error ? e.message : "생체 인증 런타임 오류가 발생했습니다.");
+      }
     } finally {
       setIsAuthProcessing(false);
     }
@@ -93,7 +124,7 @@ export function MobileApprovalDetail() {
 
   if (isLoading) {
     return (
-      <div className="flex h-[60vh] flex-col items-center justify-center p-6 text-center animate-pulse">
+      <div className="flex min-h-72 flex-col items-center justify-center p-6 text-center animate-pulse">
         <RefreshCw className="h-8 w-8 text-muted-foreground/35 animate-spin mb-2" />
         <p className="text-xs text-muted-foreground">승인 내역 불러오는 중...</p>
       </div>
@@ -175,7 +206,7 @@ export function MobileApprovalDetail() {
             {isCommandsOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
           </button>
           {isCommandsOpen && (
-            <pre className="mt-2 p-2.5 rounded bg-muted font-mono text-[10px] text-muted-foreground overflow-x-auto max-h-36 whitespace-pre-wrap border border-border/40">
+            <pre className="mt-2 p-2.5 rounded bg-muted font-mono text-xs text-muted-foreground overflow-x-auto max-h-36 whitespace-pre-wrap border border-border/40">
               {proposedCommands.join("\n")}
             </pre>
           )}
@@ -199,7 +230,7 @@ export function MobileApprovalDetail() {
       {/* 5. Masked Secrets Check */}
       <Card className="p-3 border-border/60 shadow-sm space-y-2">
         <h5 className="text-xs font-bold text-foreground">인증 정보 보호 상태</h5>
-        <div className="text-[11px] font-mono text-muted-foreground space-y-1 bg-muted/40 p-2 rounded">
+        <div className="text-xs font-mono text-muted-foreground space-y-1 bg-muted/40 p-2 rounded">
           <div>JWT_SECRET: <span className="text-red-500 font-bold">***[SECURE_MASKED]***</span></div>
           <div>DATABASE_URL: <span className="text-red-500 font-bold">***[SECURE_MASKED]***</span></div>
         </div>
@@ -228,7 +259,7 @@ export function MobileApprovalDetail() {
               {isAuthProcessing ? "바이오 챌린지 검증 중..." : "Face ID / 기기 생체 인증 수행"}
             </Button>
           ) : (
-            <div className="bg-green-500/10 p-2 rounded border border-green-500/20 text-[11px] text-green-700 font-bold text-center">
+            <div className="bg-green-500/10 p-2 rounded border border-green-500/20 text-xs text-green-700 font-bold text-center">
               생체인증 완료 (결정 승인 가드 해제됨)
             </div>
           )}

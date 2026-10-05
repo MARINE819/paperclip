@@ -25,6 +25,7 @@ import {
   fingerprintStatus,
   requestFingerprintFor,
 } from "../services/approval-lifecycle.js";
+import { approvalService } from "../services/approvals.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -70,6 +71,20 @@ describe("approval-lifecycle pure functions", () => {
     const now = new Date();
     expect(effectiveApprovalStatus({ status: "approved", expiresAt: null, consumedAt: now }, now)).toBe("consumed");
     expect(effectiveApprovalStatus({ status: "approved", expiresAt: null, consumedAt: null }, now)).toBe("approved");
+  });
+
+  it("effectiveApprovalStatus: approved + unconsumed + past expiresAt is expired", () => {
+    const now = new Date("2026-01-01T00:00:00Z");
+    const past = new Date("2025-12-31T23:00:00Z");
+    const future = new Date("2026-01-01T01:00:00Z");
+    expect(effectiveApprovalStatus({ status: "approved", expiresAt: past, consumedAt: null }, now)).toBe("expired");
+    expect(effectiveApprovalStatus({ status: "approved", expiresAt: future, consumedAt: null }, now)).toBe("approved");
+  });
+
+  it("effectiveApprovalStatus: consumed takes priority over expiresAt — a consumed approval is never reported expired", () => {
+    const now = new Date("2026-01-01T00:00:00Z");
+    const past = new Date("2025-12-31T23:00:00Z");
+    expect(effectiveApprovalStatus({ status: "approved", expiresAt: past, consumedAt: past }, now)).toBe("consumed");
   });
 
   it("effectiveApprovalStatus: tolerates undefined expiresAt/consumedAt (hand-stubbed rows) without throwing", () => {
@@ -173,17 +188,16 @@ describeEmbeddedPostgres("consumeApproval (embedded Postgres)", () => {
     expect(result.outcome).toBe("approval_not_approved");
   });
 
-  it("consumes an approved approval even if initial decision expiresAt has already passed", async () => {
+  it("rejects consuming an approved approval whose expiresAt has already passed", async () => {
     await seedCompanyAndAgent();
     const approval = await seedApproval({ expiresAt: new Date(Date.now() - 1000) });
     const runId = await seedRun();
 
     const result = await consumeApproval(db, { approvalId: approval.id, runId, expectedTaskFingerprint: "fp-1" });
-    expect(result.outcome).toBe("consumed");
-    expect(result.approval?.consumedByRunId).toBe(runId);
+    expect(result.outcome).toBe("approval_expired");
     const [row] = await db.select().from(approvals).where(eq(approvals.id, approval.id));
-    expect(row.consumedAt).not.toBeNull();
-    expect(row.consumedByRunId).toBe(runId);
+    expect(row.consumedAt).toBeNull();
+    expect(row.consumedByRunId).toBeNull();
   });
 
   it("consumes an approved approval when expiresAt is null", async () => {
@@ -280,6 +294,17 @@ describeEmbeddedPostgres("consumeApproval (embedded Postgres)", () => {
     expect(result.outcome).toBe("approval_not_approved");
     const [row] = await db.select().from(approvals).where(eq(approvals.id, approval.id));
     expect(row.consumedAt).toBeNull();
+  });
+
+  it("list() returns approvals newest-created-first", async () => {
+    await seedCompanyAndAgent();
+    const older = await seedApproval({ createdAt: new Date(Date.now() - 60_000) });
+    const newest = await seedApproval({ createdAt: new Date(Date.now() - 1_000) });
+    const middle = await seedApproval({ createdAt: new Date(Date.now() - 30_000) });
+
+    const rows = await approvalService(db).list(companyId);
+
+    expect(rows.map((row) => row.id)).toEqual([newest.id, middle.id, older.id]);
   });
 });
 

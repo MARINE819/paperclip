@@ -129,7 +129,19 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
     });
 
     const heartbeat = heartbeatService(db);
-    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    // A fully empty contextSnapshot ({}) with source "on_demand" classifies as
+    // risk "UNKNOWN" (classifyPreExecutionRisk sees an empty taskText) and is
+    // not covered by the timer-only isGenericEmptyTimerWake exemption, so the
+    // Pre-Execution Risk Guard intercepts the run before it ever reaches
+    // adapter.execute() — never exercising the native-isolation path this
+    // test actually targets. A minimal, explicitly low-risk prompt keeps this
+    // test on the codex_local dispatch path it is meant to verify.
+    const queued = await heartbeat.invoke(
+      agentId,
+      "on_demand",
+      { prompt: "Summarize recent activity." },
+      "manual",
+    );
     expect(queued).not.toBeNull();
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
 

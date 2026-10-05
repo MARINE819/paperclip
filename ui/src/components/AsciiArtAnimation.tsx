@@ -42,14 +42,19 @@ interface Clip {
   height: number;
 }
 
-function measureChar(container: HTMLElement): { w: number; h: number } {
+// Measures into a dedicated span parented to document.body — never to preEl,
+// which the animation loop below continuously overwrites via `textContent`.
+// The span sets every font metric explicitly (it never inherits from its
+// parent), so document.body is exactly as accurate as preEl for this and
+// carries no risk of the animation loop clearing it out from under us.
+function measureChar(): { w: number; h: number } {
   const span = document.createElement("span");
   span.textContent = "M";
   span.style.cssText =
-    "position:absolute;visibility:hidden;white-space:pre;font-size:11px;font-family:monospace;line-height:1;";
-  container.appendChild(span);
+    "position:absolute;top:-9999px;left:-9999px;visibility:hidden;white-space:pre;font-size:11px;font-family:monospace;line-height:1;";
+  document.body.appendChild(span);
   const rect = span.getBoundingClientRect();
-  container.removeChild(span);
+  document.body.removeChild(span);
   return { w: rect.width, h: rect.height };
 }
 
@@ -303,7 +308,7 @@ export function AsciiArtAnimation() {
     }
 
     const observer = new ResizeObserver(() => {
-      const size = measureChar(preEl);
+      const size = measureChar();
       charW = size.w;
       charH = size.h;
       rebuildGrid();
@@ -322,7 +327,7 @@ export function AsciiArtAnimation() {
     };
     motionMedia.addEventListener("change", onMotionChange);
 
-    const charSize = measureChar(preEl);
+    const charSize = measureChar();
     charW = charSize.w;
     charH = charSize.h;
     rebuildGrid();

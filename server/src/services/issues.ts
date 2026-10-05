@@ -131,6 +131,8 @@ import {
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import { evaluateEvidenceAcceptance } from "./jarvis-evidence-acceptance.js";
+import { workProductService } from "./work-products.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -7671,6 +7673,16 @@ export function issueService(db: Db) {
 
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
+      }
+      if (actorAgentId && issueData.status === "done" && existing.status !== "done") {
+        const workProducts = await workProductService(dbOrTx).listForIssue(id);
+        const evidence = evaluateEvidenceAcceptance({ childIssueId: id, workProducts });
+        if (workProducts.length === 0 || !evidence.accepted) {
+          throw conflict(
+            "Agent-initiated completion requires at least one accepted work product as evidence.",
+            { code: "agent_done_requires_evidence", reasonCodes: evidence.reasonCodes, problems: evidence.problems },
+          );
+        }
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {

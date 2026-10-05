@@ -11,7 +11,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ShieldCheck, ShieldAlert, ShieldX, Clock, RefreshCw, Power } from "lucide-react";
-import { webauthnMock } from "../../lib/mobile/webauthn-mock";
+import { startAuthentication, browserSupportsWebAuthn } from "@simplewebauthn/browser";
+import { webauthnApi } from "../../api/webauthn";
 
 export function MobileApprovalConsole() {
   const { selectedCompanyId, selectedCompany } = useCompany();
@@ -33,46 +34,111 @@ export function MobileApprovalConsole() {
     refetchInterval: 15000, // Poll every 15s for PC online status
   });
 
-  // Query approvals
+  // Query approvals — history tab uses the full unfiltered list (its own
+  // filter below already excludes raw status "pending"/"revision_requested",
+  // so stale/expired rows never leak into it).
   const { data: approvals, isLoading: isLoadingApprovals, refetch: refetchApprovals } = useQuery({
     queryKey: queryKeys.approvals.list(selectedCompanyId || ""),
     queryFn: () => approvalsApi.list(selectedCompanyId || ""),
     enabled: !!selectedCompanyId,
   });
 
-  const updateCompanyMutation = useMutation({
-    mutationFn: (data: { status: "active" | "paused" }) =>
-      companiesApi.update(selectedCompanyId!, data),
+  // Pending tab uses the server's effectiveStatus-aware filter (same pattern
+  // as AIOfficeStatus.tsx) instead of a raw-status client filter — a raw
+  // filter on `approvals` above would count long-expired approvals as still
+  // "pending", which is exactly the bug this replaces.
+  const {
+    data: pendingStatusApprovals,
+    isLoading: isLoadingPending,
+    refetch: refetchPending,
+  } = useQuery({
+    queryKey: queryKeys.approvals.list(selectedCompanyId || "", "pending"),
+    queryFn: () => approvalsApi.list(selectedCompanyId || "", "pending"),
+    enabled: !!selectedCompanyId,
+  });
+  const {
+    data: revisionRequestedApprovals,
+    isLoading: isLoadingRevisionRequested,
+    refetch: refetchRevisionRequested,
+  } = useQuery({
+    queryKey: queryKeys.approvals.list(selectedCompanyId || "", "revision_requested"),
+    queryFn: () => approvalsApi.list(selectedCompanyId || "", "revision_requested"),
+    enabled: !!selectedCompanyId,
+  });
+
+  const emergencyPauseMutation = useMutation({
+    mutationFn: () => companiesApi.emergencyPause(selectedCompanyId!),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["company", selectedCompanyId] });
       queryClient.invalidateQueries({ queryKey: ["companies"] });
       setIsEmergencyActionPending(false);
     },
     onError: (err) => {
-      setErrorMsg(err instanceof Error ? err.message : "긴급 조치 변경 실패");
+      setErrorMsg(err instanceof Error ? err.message : "긴급 중지 실행 실패");
       setIsEmergencyActionPending(false);
-    }
+    },
+  });
+
+  const emergencyResumeMutation = useMutation({
+    mutationFn: (data: { resumeToken: string }) =>
+      companiesApi.emergencyResume(selectedCompanyId!, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["company", selectedCompanyId] });
+      queryClient.invalidateQueries({ queryKey: ["companies"] });
+      setIsEmergencyActionPending(false);
+    },
+    onError: (err) => {
+      setErrorMsg(err instanceof Error ? err.message : "긴급 중지 해제 실패");
+      setIsEmergencyActionPending(false);
+    },
   });
 
   const handleEmergencyToggle = async () => {
-    if (!selectedCompany) return;
+    if (!selectedCompany || !selectedCompanyId) return;
     const isCurrentlyPaused = selectedCompany.status === "paused";
-    const targetStatus = isCurrentlyPaused ? "active" : "paused";
-    const challengeText = `회사 전체 긴급 중지 상태를 '${isCurrentlyPaused ? "정상 운영" : "긴급 중지"}'(으)로 전환합니다.`;
 
     setIsEmergencyActionPending(true);
     setErrorMsg(null);
 
+    if (!isCurrentlyPaused) {
+      emergencyPauseMutation.mutate();
+      return;
+    }
+
     try {
-      const authResult = await webauthnMock.authenticate(challengeText);
-      if (authResult.success) {
-        updateCompanyMutation.mutate({ status: targetStatus });
+      if (!browserSupportsWebAuthn()) {
+        setErrorMsg("이 브라우저 또는 기기는 WebAuthn 생체 인증을 지원하지 않습니다.");
+        setIsEmergencyActionPending(false);
+        return;
+      }
+
+      const options = await webauthnApi.getAuthenticationOptions(selectedCompanyId, {
+        purpose: "emergency_resume",
+      });
+
+      const authResponse = await startAuthentication({ optionsJSON: options });
+
+      const verifyResult = await webauthnApi.verifyAuthentication(selectedCompanyId, {
+        purpose: "emergency_resume",
+        response: authResponse,
+      });
+
+      if (verifyResult.verified && verifyResult.resumeToken) {
+        emergencyResumeMutation.mutate({ resumeToken: verifyResult.resumeToken });
       } else {
-        setErrorMsg(authResult.error ?? "생체 인증이 취소되었습니다.");
+        setErrorMsg("생체 인증 검증에 실패했습니다.");
         setIsEmergencyActionPending(false);
       }
-    } catch (e) {
-      setErrorMsg("인증 진행 중 에러가 발생했습니다.");
+    } catch (e: unknown) {
+      const isNotAllowed =
+        e instanceof Error
+          ? e.name === "NotAllowedError"
+          : Boolean(e && typeof e === "object" && Reflect.get(e, "name") === "NotAllowedError");
+      if (isNotAllowed) {
+        setErrorMsg("생체 인증이 취소되었습니다.");
+      } else {
+        setErrorMsg(e instanceof Error ? e.message : "생체 인증 런타임 오류가 발생했습니다.");
+      }
       setIsEmergencyActionPending(false);
     }
   };
@@ -80,11 +146,13 @@ export function MobileApprovalConsole() {
   const handleManualRefresh = () => {
     refetchHealth();
     refetchApprovals();
+    refetchPending();
+    refetchRevisionRequested();
   };
 
   if (!selectedCompanyId) {
     return (
-      <div className="flex h-[60vh] flex-col items-center justify-center p-6 text-center">
+      <div className="flex min-h-72 flex-col items-center justify-center p-6 text-center">
         <ShieldX className="h-12 w-12 text-muted-foreground/40 mb-3" />
         <p className="text-sm font-medium text-muted-foreground">회사를 먼저 선택해 주세요.</p>
       </div>
@@ -94,11 +162,18 @@ export function MobileApprovalConsole() {
   const isPcOnline = health?.status === "ok";
   const isPaused = selectedCompany?.status === "paused";
 
-  // Filter approvals
-  const pendingApprovals = (approvals ?? [])
-    .filter((a) => a.status === "pending" || a.status === "revision_requested")
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  // Pending: server-filtered (effectiveStatus-aware) so an approval whose
+  // TTL already lapsed is never counted as still awaiting action here — see
+  // isLoadingPending/isLoadingRevisionRequested above.
+  const pendingApprovals = [...(pendingStatusApprovals ?? []), ...(revisionRequestedApprovals ?? [])].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+  );
+  const isLoadingPendingTab = isLoadingPending || isLoadingRevisionRequested;
 
+  // History: the raw-status filter here is intentional and not the bug —
+  // it only ever excludes rows whose raw status is still "pending"/
+  // "revision_requested", so a genuinely resolved (approved/rejected/etc.)
+  // row is never dropped.
   const resolvedApprovals = (approvals ?? [])
     .filter((a) => a.status !== "pending" && a.status !== "revision_requested")
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
@@ -174,7 +249,7 @@ export function MobileApprovalConsole() {
       {/* Approvals Lists */}
       {activeTab === "pending" ? (
         <div className="space-y-3">
-          {isLoadingApprovals ? (
+          {isLoadingPendingTab ? (
             <p className="text-xs text-muted-foreground text-center py-8 animate-pulse">로딩 중...</p>
           ) : pendingApprovals.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-center text-muted-foreground">
@@ -250,11 +325,11 @@ function MobileApprovalCard({
       <div className="flex items-start justify-between gap-3">
         <div className="space-y-1.5 flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-1.5">
-            <Badge variant="outline" className="text-[10px] tracking-wide uppercase px-1.5 py-0">
+            <Badge variant="outline" className="text-xs tracking-wide uppercase px-1.5 py-0">
               {approval.type}
             </Badge>
             {isHighRisk && !isHistory && (
-              <Badge variant="destructive" className="text-[10px] bg-red-600 px-1.5 py-0 animate-pulse">
+              <Badge variant="destructive" className="text-xs px-1.5 py-0 animate-pulse">
                 HIGH RISK
               </Badge>
             )}
@@ -262,7 +337,7 @@ function MobileApprovalCard({
           <h4 className="text-sm font-bold text-foreground truncate">
             {payload.title || payload.recommendedAction || "승인 검토 요청"}
           </h4>
-          <p className="text-[11px] text-muted-foreground">
+          <p className="text-xs text-muted-foreground">
             {new Date(approval.createdAt).toLocaleTimeString()} 생성
           </p>
         </div>
@@ -274,7 +349,7 @@ function MobileApprovalCard({
             </span>
           ) : (
             <div className="space-y-1">
-              <span className="block text-[10px] text-muted-foreground">만료 시간</span>
+              <span className="block text-xs text-muted-foreground">만료 시간</span>
               <span className="block text-xs font-bold text-amber-500 font-mono flex items-center justify-end gap-1">
                 <Clock className="h-3 w-3" />
                 {timeLeft || "계산 중"}

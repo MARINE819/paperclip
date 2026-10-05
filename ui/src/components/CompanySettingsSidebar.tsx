@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import {
+  Building2,
   ChevronLeft,
   Clock3,
   Cpu,
@@ -159,6 +160,12 @@ export function CompanySettingsSidebar() {
               end
             />
           )}
+          <SidebarNavItem
+            to={`${INSTANCE_SETTINGS_PATH_PREFIX}/ai-office-status`}
+            label="AI Office"
+            icon={Building2}
+            end
+          />
           {showPage("company.export") && (
             <SidebarNavItem to="/company/export" label="Export" icon={Download} />
           )}

@@ -547,6 +547,7 @@ export type {
   ToolRateLimitWindowKind,
   ToolRedactedValueSummary,
   ToolRiskLevel,
+  ToolTrustStatus,
   ToolRunDecision,
   ToolRunDecisionLookup,
   ToolRuntimeKind,
@@ -582,6 +583,7 @@ export type {
   ToolConnectionTestCallStatusPhase,
 } from "./tool-access.js";
 export { CONNECTION_RECOVERABLE_ERROR_CODES } from "./tool-access.js";
+export type { DataLifecycleClass, DataLifecycleRetentionMode } from "./data-lifecycle.js";
 export type {
   IssueWorkProduct,
   IssueWorkProductType,

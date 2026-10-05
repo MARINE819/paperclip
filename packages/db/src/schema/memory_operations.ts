@@ -91,5 +91,13 @@ export const memoryOperations = pgTable(
     companyExtractionKeyUq: uniqueIndex("memory_operations_company_extraction_key_uq")
       .on(table.companyId, table.extractionKey)
       .where(sql`${table.extractionKey} IS NOT NULL`),
+    // JARVIS-01: deliberately excludes companyId — a resolved runtime
+    // incident (instance-scoped, not company-scoped) must produce at most
+    // one failure-memory candidate EVER, globally across every company,
+    // not once per company. See
+    // server/src/services/failure-memory-promotion.ts.
+    incidentFailureMemoryGlobalUq: uniqueIndex("memory_operations_incident_failure_memory_global_uq")
+      .on(table.sourceType, table.sourceId)
+      .where(sql`${table.sourceType} = 'incident_failure_memory' AND ${table.sourceId} IS NOT NULL`),
   }),
 );

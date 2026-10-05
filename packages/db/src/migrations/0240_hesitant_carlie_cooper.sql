@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "memory_operations_incident_failure_memory_global_uq" ON "memory_operations" USING btree ("source_type","source_id") WHERE "memory_operations"."source_type" = 'incident_failure_memory' AND "memory_operations"."source_id" IS NOT NULL;

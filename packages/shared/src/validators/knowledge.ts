@@ -8,6 +8,7 @@ export const memorySourceTypeSchema = z.enum([
   "document",
   "decision",
   "agent_output",
+  "incident_failure_memory",
 ]);
 
 export const memoryOperationStatusSchema = z.enum([

@@ -6,6 +6,7 @@ import {
   agents,
   agentWakeupRequests,
   agentRuntimeState,
+  approvals,
   budgetPolicies,
   companies,
   companyMemberships,
@@ -15,6 +16,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueRelations,
   issueTreeHoldMembers,
@@ -107,6 +109,16 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     // insert can land between the events delete and the heartbeat_runs delete and
     // trip the run_events → runs foreign key.
     await heartbeatService(db).drainActiveRunExecutions();
+    // Pre-Execution Risk Guard (heartbeat.ts) can intercept a run and create
+    // a request_board_approval row (approvals, linked via issue_approvals)
+    // before ever reaching the mocked adapter. Both tables postdate this
+    // file's original cleanup list and must be removed before issues/agents/
+    // companies below, or those deletes fail closed with a foreign-key
+    // violation (approvals.requested_by_agent_id / issue_approvals.issue_id)
+    // and poison this file's single shared (beforeAll) database for every
+    // later test.
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(costEvents);
@@ -400,7 +412,11 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      title: "PAP-14994 fingerprint",
+      // Explicitly LOW-risk wording (contains "review") so this issue never
+      // trips Pre-Execution Risk Guard's HIGH/UNKNOWN classification and
+      // diverts this review-path-lost recovery test away from the code path
+      // it actually exercises. No assertion in this file reads this title.
+      title: "Review recent read-only activity for this issue",
       status: "in_review",
       priority: "medium",
       assigneeAgentId: agentId,

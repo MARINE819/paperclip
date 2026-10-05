@@ -1,4 +1,4 @@
-export type { AIOfficeStatus, SupervisorStatus } from "./types/ai-office.js";
+export type { AIOfficeStatus, OrgUnitStatus, SupervisorStatus } from "./types/ai-office.js";
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./adapter-auth-check-code.js";
 export {
@@ -450,6 +450,9 @@ export {
   TOOL_PROFILE_STATUSES,
   TOOL_RATE_LIMIT_WINDOW_KINDS,
   TOOL_RISK_LEVELS,
+  TOOL_TRUST_STATUSES,
+  DATA_LIFECYCLE_CLASSES,
+  DATA_LIFECYCLE_RETENTION_MODES,
   TOOL_RUNTIME_KINDS,
   TOOL_RUNTIME_SLOT_STATUSES,
   TOOL_ACCESS_ACTIVITY_ACTIONS,
@@ -1375,6 +1378,9 @@ export type {
   ToolRateLimitWindowKind,
   ToolRedactedValueSummary,
   ToolRiskLevel,
+  ToolTrustStatus,
+  DataLifecycleClass,
+  DataLifecycleRetentionMode,
   ToolRunDecision,
   ToolRunDecisionLookup,
   ToolRuntimeKind,
@@ -2592,6 +2598,7 @@ export type {
   MemoryReviewState,
   KnowledgeRecordStatus,
   ObsidianSyncState,
+  KnowledgeSyncState,
   MemoryOperation,
   KnowledgeRecord,
 } from "./types/knowledge.js";

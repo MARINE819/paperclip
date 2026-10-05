@@ -1494,6 +1494,48 @@ Every successful or failed value fetch writes both `secret_access_events` and `a
 
 ---
 
+## Knowledge Records
+
+Agents can query company-wide promoted knowledge records to retrieve architectural standards, shared context, and operational guidelines:
+
+### Query Knowledge Records
+
+```http
+GET /api/companies/:companyId/knowledge-records?q={searchQuery}&limit={limit}
+Authorization: Bearer $PAPERCLIP_API_KEY
+```
+
+- `q` (optional): search query matched case-insensitively against title, summary, and body.
+- `limit` (optional): maximum number of records to return (defaults to all matching, max 500).
+
+Example CLI / curl usage during heartbeat:
+
+```bash
+curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/knowledge-records?q=architecture&limit=10"
+```
+
+Response:
+
+```json
+[
+  {
+    "id": "11111111-2222-3333-4444-555555555555",
+    "companyId": "company-1",
+    "knowledgeType": "guideline",
+    "title": "API Design Standards",
+    "summary": "Standard REST conventions for Paperclip services",
+    "body": "Detailed guidelines...",
+    "metadata": {},
+    "status": "active",
+    "createdAt": "2026-09-01T00:00:00.000Z",
+    "updatedAt": "2026-09-01T00:00:00.000Z"
+  }
+]
+```
+
+---
+
 ## Common Mistakes
 
 | Mistake                                     | Why it's wrong                                        | What to do instead                                      |

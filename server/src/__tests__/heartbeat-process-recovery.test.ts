@@ -10,6 +10,7 @@ import {
   agents,
   agentRuntimeState,
   agentWakeupRequests,
+  approvals,
   authUsers,
   budgetPolicies,
   companySecretBindings,
@@ -28,6 +29,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueDocuments,
   issuePlanDecompositions,
@@ -379,6 +381,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await waitForHeartbeatIdle(db, 5_000);
     await new Promise((resolve) => setTimeout(resolve, 100));
+    // NOTE: drainActiveRunExecutions() was evaluated here (the same pattern
+    // used safely in heartbeat-issue-liveness-escalation.test.ts) but is NOT
+    // applied in this file: several tests here (e.g. the
+    // reconcileStrandedAssignedIssues suite) assert against a retry run
+    // while it is still "queued"/"running" by design and never await its
+    // completion. Because activeRunExecutionPromises is module-scoped for
+    // this file's entire run, that one unawaited in-flight execution makes
+    // every later test's drain call here hang until its own ~30s afterEach
+    // timeout, cascading failures file-wide. See the TEST-HARNESS REPAIR
+    // BATCH report (2026-10-03) for the measured evidence. Left unresolved
+    // pending a CEO decision on how to reconcile that test design with
+    // draining; the approvals/issueApprovals cleanup below is unaffected by
+    // this and is applied regardless.
+    // Pre-Execution Risk Guard (heartbeat.ts) can intercept a run and create
+    // a request_board_approval row (approvals, linked via issue_approvals)
+    // before ever reaching the mocked adapter. Both tables postdate this
+    // file's original cleanup list and must be removed before agents/issues/
+    // companies below, or those deletes fail closed with a foreign-key
+    // violation (approvals.requested_by_agent_id / issue_approvals.issue_id)
+    // and poison this file's single shared (beforeAll) database for every
+    // later test.
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
     await db.delete(activityLog);
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
@@ -559,7 +584,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await db.insert(issues).values({
         id: issueId,
         companyId,
-        title: "Recover local adapter after lost process",
+        // Explicitly LOW-risk wording (contains "investigate") so this
+        // shared fixture's issue never trips Pre-Execution Risk Guard's
+        // HIGH/UNKNOWN classification and diverts these process-recovery
+        // tests away from the adapter/retry path they actually exercise.
+        // No assertion in this file reads this title string.
+        title: "Investigate the lost local adapter process",
         status: "in_progress",
         priority: "medium",
         assigneeAgentId: agentId,
@@ -636,14 +666,41 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
     });
 
-    const { runId, wakeupRequestId } = await seedRunFixture({
+    const { agentId, runId, wakeupRequestId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
       agentStatus: "idle",
       runStatus: "queued",
       processPid: null,
       processGroupId: null,
       includeIssue: false,
+      // includeIssue:false means taskText is otherwise empty, which
+      // classifies as Risk-Guard risk "UNKNOWN" and (since this is an
+      // "assignment"-sourced run, not a timer wake) is not covered by the
+      // generic-empty-timer-wake exemption — intercepting this run before
+      // it ever reaches the adapter this test is actually exercising.
+      // Explicitly LOW-risk, content-irrelevant prompt text only.
+      contextSnapshot: { prompt: "Summarize recent activity." },
     });
+    // openclaw_gateway has no model-registry.ts row (it's a GATEWAY_META_PROVIDER
+    // that discovers its model post-hoc from the remote response, not a
+    // pre-resolvable one — see packages/adapters/openclaw-gateway/src/server/
+    // execute.ts:1388-1403). Without an explicit model, resolveRoutedModel's
+    // tier/default-fallback lookups both fail and it returns reason:
+    // "no_route_available", which heartbeat.ts's dispatch turns into an
+    // immediate model_not_found failure — the adapter is never called, which
+    // defeats this test's actual purpose (verifying active-execution reaping
+    // behavior while the adapter call is genuinely in flight). An explicit
+    // adapterConfig.model makes resolveRoutedModel take its first branch
+    // (agent_explicit_override) and skip the registry lookup entirely — the
+    // same field heartbeat.ts's own dispatch reads via
+    // resolveExecutionRunAdapterConfig's agentConfig (agent.adapterConfig),
+    // confirmed by tracing executeRun's config/agentConfig/executionRunConfig
+    // chain. This does not touch model-router.ts's fail-closed behavior,
+    // model-registry.ts coverage, or any other adapter's routing.
+    await db
+      .update(agents)
+      .set({ adapterConfig: { model: "test-model" } })
+      .where(eq(agents.id, agentId));
     const executorHeartbeat = heartbeatService(db);
     const reaperHeartbeat = heartbeatService(db);
 
@@ -776,7 +833,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ? [{
           id: rootIssueId,
           companyId,
-          title: "Paused recovery root",
+          // Explicitly LOW-risk wording (contains "review") — see
+          // seedRunFixture's title comment above for why.
+          title: "Review paused recovery root",
           status: "todo",
           priority: "medium",
           responsibleUserId: "responsible-user",
@@ -788,7 +847,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         id: issueId,
         companyId,
         parentId: input.activePauseHold ? rootIssueId : null,
-        title: "Recover stranded assigned work",
+        // Explicitly LOW-risk wording (contains "review") — see
+        // seedRunFixture's title comment above for why.
+        title: "Review stranded assigned work",
         status: input.status,
         priority: "medium",
         assigneeAgentId: input.assignToUser ? null : agentId,
@@ -888,7 +949,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      title: "Review participant stayed pending",
+      // Explicitly LOW-risk wording (contains "review") so this shared
+      // fixture's issue never trips Pre-Execution Risk Guard's HIGH/UNKNOWN
+      // classification. No assertion in this file reads this title string.
+      title: "Review recent read-only activity for this issue",
       status: "in_review",
       priority: "medium",
       assigneeAgentId: agentId,
@@ -1154,8 +1218,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      title: "Retry transient Codex failure without blocking",
-      description: "Verify the successful-run handoff and choose an honest disposition.",
+      // Explicitly LOW-risk wording ("Review"/"Review" both contain "view")
+      // so this shared fixture's issue never trips Pre-Execution Risk
+      // Guard's HIGH/UNKNOWN classification. This exact text is asserted
+      // verbatim (as evidence the title/description reach a generated
+      // instruction) by "queues one finish-handoff wake..." below — keep
+      // both in sync if changed again.
+      title: "Review transient Codex failure without blocking",
+      description: "Review the successful-run handoff and choose an honest disposition.",
       status: "in_progress",
       priority: "medium",
       assigneeAgentId: agentId,
@@ -1185,7 +1255,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, runId);
-    await heartbeat.waitForRunExecutionDrain(runId);
+    // This issue (status "in_progress", no assigneeUserId, assigneeAgentId ===
+    // this run's agent) now genuinely satisfies releaseIssueExecutionAndPromote's
+    // issueNeedsImmediateRecovery condition once this run fails for a real
+    // (non-Risk-Guard) reason, so the run's post-terminal finalization chain
+    // (liveness classification, the immediate-recovery DB transaction, review/
+    // handoff checks, scratch cleanup) genuinely takes longer than the 5s
+    // default before activeRunExecutions is cleared — not a race, just more
+    // real work than before. The default timeout is bounded here explicitly;
+    // production heartbeat lifecycle ordering (terminal DB status, then
+    // finalization, then in-memory drain) is unchanged.
+    await heartbeat.waitForRunExecutionDrain(runId, { timeoutMs: 10_000 });
 
     const run = await heartbeat.getRun(runId);
     const runtime = await db
@@ -1940,6 +2020,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: {
         executionEngine: "cli",
         processTopology: "detached",
+        // includeIssue:false means taskText is otherwise empty -> Risk-Guard
+        // risk "UNKNOWN" on an "assignment"-sourced run, intercepting this
+        // run before it ever reaches the adapter this test exercises.
+        prompt: "Summarize recent activity.",
       },
       includeIssue: false,
     });
@@ -3681,9 +3765,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ]) {
       expect(handoffPayload).not.toHaveProperty(key);
     }
-    expect(handoffPayload.instruction).toContain("Retry transient Codex failure without blocking");
+    expect(handoffPayload.instruction).toContain("Review transient Codex failure without blocking");
     expect(handoffPayload.instruction).toContain(
-      "Verify the successful-run handoff and choose an honest disposition.",
+      "Review the successful-run handoff and choose an honest disposition.",
     );
     expect(handoffPayload.instruction).toContain(
       "```text\nImplemented the backend detector, but did not choose a final issue state.\n```",

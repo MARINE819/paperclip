@@ -1073,6 +1073,38 @@ export type ToolCatalogEntryStatus = (typeof TOOL_CATALOG_ENTRY_STATUSES)[number
 export const TOOL_RISK_LEVELS = ["low", "medium", "high", "critical", "read", "write", "destructive"] as const;
 export type ToolRiskLevel = (typeof TOOL_RISK_LEVELS)[number];
 
+// F-05 Tool/Plugin Trust Registry — a review-workflow status, distinct from
+// ToolCatalogEntryStatus (operational active/disabled/quarantined/removed)
+// and from PluginStatus (install lifecycle). "unreviewed" is the only
+// possible default for any newly-discovered tool/plugin; advancing past it
+// requires an explicit human review action (see tool-trust-registry.ts) —
+// never automatic, never agent-initiated, never inferred from an LLM's own
+// judgment of itself.
+export const TOOL_TRUST_STATUSES = ["unreviewed", "trusted", "restricted", "blocked", "revoked"] as const;
+export type ToolTrustStatus = (typeof TOOL_TRUST_STATUSES)[number];
+
+// F-01 Data Lifecycle / Data Governance. "memory_summary" has no mapped
+// table yet (see data-lifecycle-classification.ts) — it stays in this list
+// as a recognized future class, not force-mapped onto an existing table.
+export const DATA_LIFECYCLE_CLASSES = [
+  "audit",
+  "runtime",
+  "task",
+  "approval",
+  "incident",
+  "eval",
+  "conversation",
+  "memory_raw",
+  "memory_summary",
+  "verified_knowledge",
+  "secret_audit",
+  "backup_metadata",
+] as const;
+export type DataLifecycleClass = (typeof DATA_LIFECYCLE_CLASSES)[number];
+
+export const DATA_LIFECYCLE_RETENTION_MODES = ["retain", "archive", "delete", "archive_then_delete"] as const;
+export type DataLifecycleRetentionMode = (typeof DATA_LIFECYCLE_RETENTION_MODES)[number];
+
 export const TOOL_PROFILE_STATUSES = ["draft", "active", "disabled", "archived"] as const;
 export type ToolProfileStatus = (typeof TOOL_PROFILE_STATUSES)[number];
 

@@ -90,6 +90,7 @@ export interface IssueLabel {
 
 export interface IssueAssigneeAdapterOverrides {
   modelProfile?: ModelProfileKey;
+  modelTier?: "T1" | "T2" | "T3" | "T4";
   adapterConfig?: Record<string, unknown>;
   useProjectWorkspace?: boolean;
 }

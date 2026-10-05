@@ -15,6 +15,7 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  orgUnits,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -24,6 +25,7 @@ import {
   normalizeAgentUrlKey,
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
+  type OrgUnitStatus,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import {
@@ -1219,6 +1221,68 @@ export function agentService(db: Db) {
       };
 
       return build(null);
+    },
+
+    // Reads only agents.orgUnitId and existing org_units rows — never invents
+    // department structure. runningCount/currentTaskCount are derived from
+    // the same live heartbeat_runs contract as /companies/:companyId/live-runs
+    // (status IN queued/running), not from agents.status, to avoid drifting
+    // from that single source of truth.
+    orgUnitStatusForCompany: async (companyId: string): Promise<OrgUnitStatus[]> => {
+      const units = await db
+        .select({ id: orgUnits.id, name: orgUnits.name })
+        .from(orgUnits)
+        .where(eq(orgUnits.companyId, companyId));
+
+      const assignedAgents = await db
+        .select({ id: agents.id, orgUnitId: agents.orgUnitId, status: agents.status })
+        .from(agents)
+        .where(and(eq(agents.companyId, companyId), sql`${agents.orgUnitId} is not null`));
+
+      const liveRuns = await db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          taskKey: sql<string>`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.id}::text)`,
+        })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running"])));
+
+      const agentsByOrgUnit = new Map<string, typeof assignedAgents>();
+      for (const agent of assignedAgents) {
+        const key = agent.orgUnitId as string;
+        const group = agentsByOrgUnit.get(key) ?? [];
+        group.push(agent);
+        agentsByOrgUnit.set(key, group);
+      }
+
+      const liveRunsByAgentId = new Map<string, Set<string>>();
+      for (const run of liveRuns) {
+        const set = liveRunsByAgentId.get(run.agentId) ?? new Set<string>();
+        set.add(run.taskKey);
+        liveRunsByAgentId.set(run.agentId, set);
+      }
+
+      return units.map((unit) => {
+        const members = agentsByOrgUnit.get(unit.id) ?? [];
+        const taskKeys = new Set<string>();
+        let runningCount = 0;
+        for (const member of members) {
+          const memberTasks = liveRunsByAgentId.get(member.id);
+          if (memberTasks && memberTasks.size > 0) {
+            runningCount += 1;
+            for (const taskKey of memberTasks) taskKeys.add(taskKey);
+          }
+        }
+        return {
+          orgUnitId: unit.id,
+          name: unit.name,
+          agentCount: members.length,
+          activeCount: members.filter((m) => m.status === "active").length,
+          runningCount,
+          errorCount: members.filter((m) => m.status === "error").length,
+          currentTaskCount: taskKeys.size,
+        };
+      });
     },
 
     getChainOfCommand: async (agentId: string) => {

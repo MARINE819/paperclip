@@ -55,6 +55,19 @@ function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
 
+// Named MCP gateway requests authenticate with a self-contained pcgw_ bearer
+// token verified by namedGatewaySessionFromBearer() in tool-gateway.ts, not by
+// the board/agentApiKey/JWT schemes below. Without this early exit, those
+// schemes reject the pcgw_ token before the gateway-specific verifier ever runs.
+const NAMED_MCP_GATEWAY_PATH_PATTERNS = [
+  /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp$/,
+  /^\/mcp\/gateways\/[^/]+$/,
+];
+
+function isNamedMcpGatewayPath(path: string): boolean {
+  return NAMED_MCP_GATEWAY_PATH_PATTERNS.some((pattern) => pattern.test(path));
+}
+
 function normalizeOptionalString(value: string | null | undefined) {
   return value?.trim() || null;
 }
@@ -278,6 +291,11 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     const token = authHeader!.slice("bearer".length).trim();
     if (!token) {
       next(unauthorized("Empty bearer token; provide valid agent credentials and retry"));
+      return;
+    }
+
+    if (token.startsWith("pcgw_") && isNamedMcpGatewayPath(req.path)) {
+      next();
       return;
     }
 

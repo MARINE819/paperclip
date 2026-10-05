@@ -28,6 +28,9 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  onEvent?: (event: BackupLifecycleEvent) => void;
+  /** Overrides the gzip-finalize timeout. Primarily for tests; defaults to 5 minutes. */
+  gzipTimeoutMs?: number;
 };
 
 export type RunDatabaseBackupResult = {
@@ -70,6 +73,20 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+// On Windows, closing a just-written file and immediately reopening the same
+// path to compress it can occasionally stall indefinitely (no error, no
+// data). Without a bound, that hang left the caller's in-flight guard stuck
+// forever with no way for the next scheduled backup to ever run again.
+const DEFAULT_GZIP_FINALIZE_TIMEOUT_MS = 5 * 60 * 1000;
+
+export type BackupLifecycleEvent =
+  | { type: "engine_selected"; engine: "pg_dump" | "javascript" }
+  | { type: "gzip_started" }
+  | { type: "gzip_timeout"; timeoutMs: number }
+  | { type: "gzip_failed"; message: string }
+  | { type: "partial_gzip_removed"; path: string }
+  | { type: "partial_gzip_remove_failed"; path: string; message: string }
+  | { type: "raw_sql_preserved"; path: string };
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -296,6 +313,42 @@ function appendCapturedStderr(previous: string, chunk: Buffer | string): string 
   const next = previous + (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
   if (Buffer.byteLength(next, "utf8") <= BACKUP_CLI_STDERR_BYTES) return next;
   return Buffer.from(next, "utf8").subarray(-BACKUP_CLI_STDERR_BYTES).toString("utf8");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export class GzipFinalizeTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`gzip_finalize timed out after ${timeoutMs}ms`);
+    this.name = "GzipFinalizeTimeoutError";
+  }
+}
+
+/**
+ * Races `promise` against a timeout. `onTimeout` runs synchronously the
+ * moment the deadline passes (before the timeout rejection settles) so the
+ * caller can destroy any streams it needs to stop still writing in the
+ * background — this function does not do that on the caller's behalf.
+ */
+async function runWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  onTimeout: () => void,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      onTimeout();
+      reject(new GzipFinalizeTimeoutError(timeoutMs));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function waitForChildExit(child: ReturnType<typeof spawn>, label: string): Promise<void> {
@@ -543,9 +596,14 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
   const writer = createBufferedTextFileWriter(sqlFile);
+  // Set once the raw .sql has been confirmed fully written and a later step
+  // fails: the generic failure cleanup below must not delete a good recovery
+  // artifact just because compressing it afterward didn't work.
+  let preserveRawSqlOnFailure = false;
 
   try {
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
+      opts.onEvent?.({ type: "engine_selected", engine: "pg_dump" });
       await sql`SELECT 1`;
       try {
         await closeSql();
@@ -574,6 +632,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       }
     }
 
+    opts.onEvent?.({ type: "engine_selected", engine: "javascript" });
     await sql`SELECT 1`;
 
     const emit = (line: string) => writer.emit(line);
@@ -1018,10 +1077,55 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await writer.close();
 
-    // Compress the SQL file with gzip
+    // Compress the SQL file with gzip. Bounded by a timeout: on Windows,
+    // reopening a file for reading immediately after another handle closed
+    // it can occasionally stall forever with no error and no data. A hang
+    // here must not stay silent — it must become an explicit, recoverable
+    // failure so the caller's in-flight guard is released for the next
+    // scheduled attempt.
+    opts.onEvent?.({ type: "gzip_started" });
     const sqlReadStream = createReadStream(sqlFile);
     const gzWriteStream = createWriteStream(backupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    try {
+      await runWithTimeout(
+        pipeline(sqlReadStream, createGzip(), gzWriteStream),
+        opts.gzipTimeoutMs ?? DEFAULT_GZIP_FINALIZE_TIMEOUT_MS,
+        () => {
+          sqlReadStream.destroy();
+          gzWriteStream.destroy();
+        },
+      );
+    } catch (error) {
+      const timedOut = error instanceof GzipFinalizeTimeoutError;
+      opts.onEvent?.(
+        timedOut
+          ? { type: "gzip_timeout", timeoutMs: opts.gzipTimeoutMs ?? DEFAULT_GZIP_FINALIZE_TIMEOUT_MS }
+          : { type: "gzip_failed", message: errorMessage(error) },
+      );
+
+      // The compressed output is incomplete or corrupt either way — it must
+      // never be left behind where the health check could mistake it for a
+      // successful backup. The raw .sql above already finished writing
+      // successfully, so it is kept as the recovery artifact instead of
+      // being deleted by the generic failure cleanup below.
+      if (existsSync(backupFile)) {
+        try {
+          unlinkSync(backupFile);
+          opts.onEvent?.({ type: "partial_gzip_removed", path: backupFile });
+        } catch (removeError) {
+          opts.onEvent?.({
+            type: "partial_gzip_remove_failed",
+            path: backupFile,
+            message: errorMessage(removeError),
+          });
+        }
+      }
+      opts.onEvent?.({ type: "raw_sql_preserved", path: sqlFile });
+      preserveRawSqlOnFailure = true;
+      throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), {
+        phase: "gzip_finalize",
+      });
+    }
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
@@ -1037,7 +1141,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     if (existsSync(backupFile)) {
       try { unlinkSync(backupFile); } catch { /* ignore */ }
     }
-    if (existsSync(sqlFile)) {
+    if (!preserveRawSqlOnFailure && existsSync(sqlFile)) {
       try { unlinkSync(sqlFile); } catch { /* ignore */ }
     }
     throw error;

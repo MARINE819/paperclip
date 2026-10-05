@@ -175,6 +175,47 @@ describe("approval routes idempotent retries", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
+  it("wakes the requesting agent when a risk-guard-sourced approval is approved via the route", async () => {
+    const approvalId = "approval-risk-guard-1";
+    const requestedByAgentId = "agent-risk-guard-1";
+    const issueId = "issue-risk-guard-1";
+    const pending = {
+      id: approvalId,
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: { source: "risk_guard", issueId },
+      requestedByAgentId,
+    };
+    const approved = { ...pending, status: "approved" };
+
+    mockApprovalService.getById.mockResolvedValue(pending);
+    mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: issueId }]);
+    mockApprovalService.approve.mockResolvedValueOnce({ approval: approved, applied: true });
+
+    const res = await request(await createApp())
+      .post(`/api/approvals/${approvalId}/approve`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      requestedByAgentId,
+      expect.objectContaining({
+        reason: "approval_approved",
+        payload: expect.objectContaining({ approvalId, issueId, issueIds: [issueId] }),
+      }),
+    );
+
+    // Duplicate approve on an already-resolved approval must not emit a second wake.
+    mockApprovalService.approve.mockResolvedValueOnce({ approval: approved, applied: false });
+    const res2 = await request(await createApp())
+      .post(`/api/approvals/${approvalId}/approve`)
+      .send({});
+    expect(res2.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+  });
+
   it("does not emit duplicate rejection logs when reject is already resolved", async () => {
     mockApprovalService.getById.mockResolvedValue({
       id: "approval-1",

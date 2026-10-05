@@ -57,6 +57,8 @@ import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { effectiveApprovalStatus } from "./approval-lifecycle.js";
+import { authorizeAndConsumeEnvelope } from "./task-authorization-envelope.js";
 import {
   createToolRuntimeSupervisor,
   ToolRuntimeSupervisorError,
@@ -2644,9 +2646,21 @@ export function createToolGatewayService(
         { connectionId: input.connection.id, templateId: input.template.templateId },
       );
     }
+    // Windows resolves pnpm workspace bins as .cmd shims, which
+    // child_process.spawn only executes via a shell (CreateProcess does not
+    // apply PATHEXT resolution on its own). A direct .exe path (e.g.
+    // process.execPath) needs no shell and must NOT go through one, since
+    // shell:true on Windows concatenates command+args into a single
+    // unquoted string for cmd.exe, breaking any .exe path containing spaces
+    // (e.g. "C:\Program Files\nodejs\node.exe"). template.command/args are
+    // fixed, admin-approved template values (APPROVED_STDIO_TEMPLATES /
+    // createStdioCommandTemplate), never raw user input, so shelling out
+    // for the .cmd/.bat/bare-name case carries no injection surface.
+    const needsWindowsShell = process.platform === "win32" && !/\.exe$/i.test(input.template.command);
     const child = spawn(input.template.command, input.template.args, {
       env: localStdioEnvironment(input.connection, input.template),
       stdio: ["pipe", "pipe", "pipe"],
+      shell: needsWindowsShell,
     });
     let stdout = "";
     let stderr = "";
@@ -5271,14 +5285,14 @@ export function createToolGatewayService(
       }
       if (actionRequest.approvalId) {
         const [formalApproval] = await db
-          .select({ status: approvals.status })
+          .select({ status: approvals.status, expiresAt: approvals.expiresAt, consumedAt: approvals.consumedAt })
           .from(approvals)
           .where(and(
             eq(approvals.id, actionRequest.approvalId),
             eq(approvals.companyId, input.companyId),
           ))
           .limit(1);
-        if (!formalApproval || formalApproval.status !== "approved") {
+        if (!formalApproval || effectiveApprovalStatus(formalApproval) !== "approved") {
           throw new ToolGatewayHttpError(
             409,
             "Tool action request requires formal board approval before execution",
@@ -5645,14 +5659,14 @@ export function createToolGatewayService(
         }
         if (actionRequest.approvalId) {
           const [formalApproval] = await db
-            .select({ status: approvals.status })
+            .select({ status: approvals.status, expiresAt: approvals.expiresAt, consumedAt: approvals.consumedAt })
             .from(approvals)
             .where(and(
               eq(approvals.id, actionRequest.approvalId),
               eq(approvals.companyId, session.companyId),
             ))
             .limit(1);
-          if (!formalApproval || formalApproval.status !== "approved") {
+          if (!formalApproval || effectiveApprovalStatus(formalApproval) !== "approved") {
             throw new ToolGatewayHttpError(
               409,
               "Tool action request requires formal board approval before execution",
@@ -5762,7 +5776,48 @@ export function createToolGatewayService(
             result: recorded.invocation.resultSummary ?? null,
           };
         }
-        if (accessDecision.decision === "require_approval") {
+        // NEXORA Master 2 — Task Authorization Envelope (Phase 2 PoC, Google
+        // Sheets append_rows/update_values only). Purely additive: only
+        // evaluated when the existing policy decision is already
+        // "require_approval", and DENY here changes nothing — it falls
+        // through to the exact unmodified approval flow below. This can
+        // never affect a "destructive" tool: authorizeAndConsumeEnvelope's
+        // own trusted-tool resolution requires riskLevel === "write".
+        let envelopeAuthorized = false;
+        if (accessDecision.decision === "require_approval" && tool.catalogEntryId) {
+          const envelopeOutcome = await authorizeAndConsumeEnvelope(db, {
+            companyId: session.companyId,
+            issueId: session.issueId,
+            agentId: session.agentId,
+            runId: session.runId,
+            toolCatalogEntryId: tool.catalogEntryId,
+            // authorizeAndConsumeEnvelope's trusted-tool resolution matches
+            // against the plain catalog name ("append_rows"), not the
+            // gateway-namespaced display name tool.name carries (e.g.
+            // "mcp.app-gallery-...:append-rows") — upstreamToolName is the
+            // same server-derived catalog field, never agent-supplied.
+            toolName: tool.upstreamToolName ?? tool.name,
+            parameters: effectiveParameters,
+          });
+          envelopeAuthorized = envelopeOutcome.outcome === "allowed";
+          await writeAudit({
+            session,
+            companyId: session.companyId,
+            agentId: session.agentId,
+            runId: session.runId,
+            issueId: session.issueId,
+            action: envelopeAuthorized
+              ? "task_authorization_envelope.allowed"
+              : "task_authorization_envelope.denied",
+            details: {
+              invocationId,
+              tool: tool.name,
+              envelopeId: envelopeOutcome.outcome === "allowed" ? envelopeOutcome.envelopeId : null,
+              denialReason: envelopeOutcome.outcome === "denied" ? envelopeOutcome.reason : null,
+            },
+          });
+        }
+        if (accessDecision.decision === "require_approval" && !envelopeAuthorized) {
           await requestApprovalForRecordedToolCall({
             invocation: recorded.invocation,
             actionRequest: recorded.actionRequest,
@@ -5773,7 +5828,7 @@ export function createToolGatewayService(
             policyDecision: accessDecision,
           });
         }
-        if (!accessDecision.allowed) {
+        if (!accessDecision.allowed && !envelopeAuthorized) {
           await writeAudit({
             session,
             companyId: session.companyId,

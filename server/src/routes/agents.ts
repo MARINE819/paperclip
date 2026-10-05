@@ -3051,6 +3051,13 @@ export function agentRoutes(
     res.json(leanTree);
   });
 
+  router.get("/companies/:companyId/org-units/status", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const status = await svc.orgUnitStatusForCompany(companyId);
+    res.json(status);
+  });
+
   router.get("/companies/:companyId/org.svg", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);

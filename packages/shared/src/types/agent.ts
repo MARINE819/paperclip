@@ -31,6 +31,15 @@ export interface AgentModelProfileConfig {
 
 export interface AgentRuntimeConfig extends Record<string, unknown> {
   modelProfiles?: Partial<Record<ModelProfileKey, AgentModelProfileConfig>>;
+  // Intelligent Execution Router pin semantics (all optional, default unset
+  // = not pinned = open to dynamic executor/provider/model routing). For
+  // today's adapters, which map 1:1:1 to a single (executor, provider)
+  // pair, setting any one of these is equivalent to pinning all three —
+  // kept as separate fields for forward compatibility with a future
+  // gateway-style executor where they could genuinely diverge.
+  executorPinned?: boolean;
+  adapterPinned?: boolean;
+  providerPinned?: boolean;
 }
 
 export type AgentInstructionsBundleMode = "managed" | "external";
@@ -89,6 +98,7 @@ export interface Agent {
   icon: string | null;
   status: AgentStatus;
   reportsTo: string | null;
+  orgUnitId?: string | null;
   capabilities: string | null;
   adapterType: AgentAdapterType;
   adapterConfig: Record<string, unknown>;

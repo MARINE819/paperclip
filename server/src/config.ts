@@ -69,6 +69,8 @@ export interface Config {
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  incidentScanEnabled: boolean;
+  incidentScanIntervalSeconds: number;
   workspaceReaperCooldownDays: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
@@ -266,6 +268,11 @@ export function loadConfig(): Config {
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
+  const incidentScanEnabled = process.env.PAPERCLIP_INCIDENT_SCAN_ENABLED !== "false";
+  const incidentScanIntervalSeconds = Math.max(
+    15,
+    Number(process.env.PAPERCLIP_INCIDENT_SCAN_INTERVAL_SECONDS) || 60,
+  );
   // The terminal-workspace reaper waits this many days after an issue tree
   // becomes terminal before it archives the workspace. A person can reopen the
   // work inside this window. A value of 0 disables the cooldown and restores
@@ -323,6 +330,8 @@ export function loadConfig(): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    incidentScanEnabled,
+    incidentScanIntervalSeconds,
     workspaceReaperCooldownDays,
     serveUi:
       process.env.SERVE_UI !== undefined

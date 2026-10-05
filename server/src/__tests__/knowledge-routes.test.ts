@@ -335,4 +335,85 @@ describeEmbeddedPostgres("knowledge routes (memory operation -> knowledge record
     const rows = await ctx.db.select().from(knowledgeRecords);
     expect(rows).toHaveLength(0);
   });
+
+  it("allows an agent actor to search knowledge records with ?q= and ?limit=", async () => {
+    const { company, agentActor } = await seedScenario();
+
+    await ctx.db.insert(knowledgeRecords).values([
+      {
+        id: randomUUID(),
+        companyId: company.companyId,
+        title: "Agent Deployment Guide",
+        summary: "Best practices for containerized agents",
+        body: "Ensure health checks pass before serving traffic.",
+        status: "active",
+      },
+      {
+        id: randomUUID(),
+        companyId: company.companyId,
+        title: "Incident Response Playbook",
+        summary: "Steps to take during downtime",
+        body: "Notify engineering leads and check deployment status.",
+        status: "active",
+      },
+      {
+        id: randomUUID(),
+        companyId: company.companyId,
+        title: "Database Backup Procedure",
+        summary: "Nightly backup scripts",
+        body: "Verify backup archive integrity.",
+        status: "active",
+      },
+    ]);
+
+    // 1. Agent queries matching title
+    const resTitle = await request(buildApp(ctx.db, agentActor))
+      .get(`/api/companies/${company.companyId}/knowledge-records?q=Agent Deployment`);
+    expect(resTitle.status).toBe(200);
+    expect(resTitle.body).toHaveLength(1);
+    expect(resTitle.body[0].title).toBe("Agent Deployment Guide");
+
+    // 2. Agent queries matching body substring across records
+    const resBody = await request(buildApp(ctx.db, agentActor))
+      .get(`/api/companies/${company.companyId}/knowledge-records?q=deployment`);
+    expect(resBody.status).toBe(200);
+    expect(resBody.body).toHaveLength(2);
+
+    // 3. Agent query with limit
+    const resLimit = await request(buildApp(ctx.db, agentActor))
+      .get(`/api/companies/${company.companyId}/knowledge-records?q=deployment&limit=1`);
+    expect(resLimit.status).toBe(200);
+    expect(resLimit.body).toHaveLength(1);
+
+    // 4. Agent query with no match
+    const resNone = await request(buildApp(ctx.db, agentActor))
+      .get(`/api/companies/${company.companyId}/knowledge-records?q=nonexistent`);
+    expect(resNone.status).toBe(200);
+    expect(resNone.body).toHaveLength(0);
+
+    // 5. Board actor also can query
+    const resBoard = await request(buildApp(ctx.db, company.actor))
+      .get(`/api/companies/${company.companyId}/knowledge-records?q=Backup`);
+    expect(resBoard.status).toBe(200);
+    expect(resBoard.body).toHaveLength(1);
+    expect(resBoard.body[0].title).toBe("Database Backup Procedure");
+  });
+
+  it("strictly blocks an agent actor from searching another company's knowledge records with 403", async () => {
+    const { company, agentActor } = await seedScenario();
+    const otherCompany = await seedCompanyWithBoardAccess(ctx.db, "Other Co");
+
+    await ctx.db.insert(knowledgeRecords).values({
+      id: randomUUID(),
+      companyId: otherCompany.companyId,
+      title: "Other Company Strategy",
+      body: "Highly confidential strategy document.",
+      status: "active",
+    });
+
+    const res = await request(buildApp(ctx.db, agentActor))
+      .get(`/api/companies/${otherCompany.companyId}/knowledge-records?q=Strategy`);
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("Agent key cannot access another company");
+  });
 });

@@ -95,6 +95,10 @@ import { DUPLEX_COUNTER_AGGREGATE_BYTE_ACCOUNTING_UNDERFLOW_TOTAL } from "@paper
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
+import { getServerInfoSnapshot } from "./server-info.js";
+import { consumeRestartControlRequest } from "./services/restart-control.js";
+import { resolvePaperclipInstanceId } from "./home-paths.js";
+import { defaultIncidentScanPaths, runIncidentScan } from "./services/incident-scanner.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
@@ -735,6 +739,17 @@ export async function startServer(): Promise<StartedServer> {
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        onEvent: (event) => {
+          switch (event.type) {
+            case "gzip_timeout":
+            case "gzip_failed":
+            case "partial_gzip_remove_failed":
+              logger.warn({ trigger, ...event }, `${label} database backup: ${event.type}`);
+              break;
+            default:
+              logger.info({ trigger, ...event }, `${label} database backup: ${event.type}`);
+          }
+        },
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -1634,7 +1649,31 @@ export async function startServer(): Promise<StartedServer> {
       });
     }, backupIntervalMs);
   }
-  
+
+  if (config.incidentScanEnabled) {
+    const incidentScanIntervalMs = config.incidentScanIntervalSeconds * 1000;
+    const incidentInstanceId = resolvePaperclipInstanceId();
+    const incidentScanPaths = defaultIncidentScanPaths();
+    logger.info(
+      { intervalSeconds: config.incidentScanIntervalSeconds, instanceId: incidentInstanceId },
+      "F-06 runtime incident scanning enabled",
+    );
+    setInterval(() => {
+      void runIncidentScan({ db, instanceId: incidentInstanceId, paths: incidentScanPaths })
+        .then((result) => {
+          if (result.opened.length > 0) {
+            logger.warn({ opened: result.opened.map((i) => ({ id: i.id, code: i.code, fingerprint: i.fingerprint })) }, "runtime incident opened");
+          }
+          if (result.resolved.length > 0) {
+            logger.info({ resolved: result.resolved.map((i) => ({ id: i.id, code: i.code, failureMemoryCandidate: i.failureMemoryCandidate })) }, "runtime incident resolved");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "runtime incident scan failed");
+        });
+    }, incidentScanIntervalMs);
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -1718,7 +1757,19 @@ export async function startServer(): Promise<StartedServer> {
   });
   
   {
-    const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+    // The restart-control watcher below calls this same shutdown path from a
+    // second, independent trigger (a self-consumed request file, not an OS
+    // signal). Without this guard, a real SIGTERM/SIGINT arriving at the same
+    // moment as an accepted restart-control request would run the entire
+    // drain/DB-stop/exit sequence twice concurrently. Callers race harmlessly
+    // for the same in-flight promise instead.
+    let shutdownStarted: Promise<void> | null = null;
+    const shutdown = (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
+      if (shutdownStarted) return shutdownStarted;
+      shutdownStarted = runShutdown(signal);
+      return shutdownStarted;
+    };
+    const runShutdown = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
       if (heartbeatSchedulerInterval) {
@@ -1798,6 +1849,48 @@ export async function startServer(): Promise<StartedServer> {
     process.once("SIGTERM", () => {
       void shutdown("SIGTERM");
     });
+
+    // Windows has no reliable way to deliver a POSIX-style SIGTERM to an
+    // arbitrary external process, so a managed restart on Windows cannot
+    // depend on an operator or supervisor signaling this process from the
+    // outside. Instead this process polls for its own restart-control
+    // request and, when one targets this exact process, drives itself
+    // through the identical shutdown(...) path used for a real SIGTERM —
+    // no separate shutdown logic exists for this trigger.
+    const restartControlPollMs = 2_500;
+    const bootProcessStartedAt = getServerInfoSnapshot().processStartedAt;
+    let restartControlPolling = false;
+    const restartControlTimer = setInterval(() => {
+      if (restartControlPolling) return;
+      restartControlPolling = true;
+      void consumeRestartControlRequest({
+        currentPid: process.pid,
+        currentProcessStartedAt: bootProcessStartedAt,
+      })
+        .then((decision) => {
+          if (decision.action === "shutdown") {
+            logger.warn(
+              { request: decision.request },
+              "restart-control request accepted; starting self-initiated graceful shutdown",
+            );
+            clearInterval(restartControlTimer);
+            void shutdown("SIGTERM");
+            return;
+          }
+          if (decision.action === "ignored") {
+            logger.warn(
+              { reason: decision.reason, requestId: decision.request?.requestId ?? null },
+              "restart-control request ignored",
+            );
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "restart-control watcher poll failed");
+        })
+        .finally(() => {
+          restartControlPolling = false;
+        });
+    }, restartControlPollMs);
   }
 
   return {

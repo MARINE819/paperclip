@@ -1,0 +1,26 @@
+{
+    "name":  "@paperclipai/adapter-antigravity-local",
+    "version":  "0.0.0",
+    "private":  true,
+    "type":  "module",
+    "exports":  {
+                    ".":  {
+                              "default":  "./src/index.ts"
+                          },
+                    "./server":  {
+                                     "default":  "./src/server/index.ts"
+                                 }
+                },
+    "dependencies":  {
+                         "@paperclipai/adapter-utils":  "workspace:*"
+                     },
+    "devDependencies":  {
+                            "@types/node":  "^22.20.1",
+                            "typescript":  "^5.7.3"
+                        },
+    "scripts":  {
+                    "clean":  "rm -rf dist",
+                    "build":  "tsc",
+                    "typecheck":  "tsc --noEmit"
+                }
+}

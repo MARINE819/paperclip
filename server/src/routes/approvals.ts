@@ -1,6 +1,8 @@
 import { Router, type Request } from "express";
+import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { parseObject } from "../adapters/utils.js";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
@@ -33,6 +35,29 @@ import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../services/recovery/review-path-recovery.js";
+import { webauthnService } from "../services/webauthn-service.js";
+
+class ApprovalTokenError extends Error {
+  constructor(public readonly httpStatus: number, public readonly reason: string, message: string) {
+    super(message);
+    this.name = "ApprovalTokenError";
+  }
+}
+
+class RollbackWithoutTokenBurnError extends Error {
+  constructor(public readonly httpStatus: number, public readonly body: unknown) {
+    super("Rollback without burning token");
+    this.name = "RollbackWithoutTokenBurnError";
+  }
+}
+
+function isMobileApprovalOnly(req: Request): boolean {
+  return req.actor.type === "board" && req.actor.boardKeyScope === "approval_only";
+}
+
+const resolveApprovalRouteSchema = resolveApprovalSchema.extend({
+  approvalToken: z.string().trim().optional(),
+});
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
   return {
@@ -199,6 +224,28 @@ export function approvalRoutes(
       ? approvalReviewPathContext(approval.id)
       : null;
 
+    // Replay the task-defining fields (prompt/title/message) from the
+    // original Risk-Guard-intercepted run so the resumed wake recomputes the
+    // identical taskText/canonicalFingerprint the approval was granted for.
+    // Without this, consumeApproval's fingerprint re-validation legitimately
+    // fails (the resumed run's task content differs from what was reviewed)
+    // and Risk Guard re-intercepts with a brand-new approval instead of
+    // recognizing this one. See computeApprovalFingerprint's docstring.
+    const originalRunId = typeof approval.payload.runId === "string" ? approval.payload.runId : null;
+    let originalTaskContext: Record<string, string> = {};
+    if (originalRunId) {
+      const [originalRun] = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, originalRunId));
+      const originalContext = parseObject(originalRun?.contextSnapshot);
+      originalTaskContext = {
+        ...(typeof originalContext.prompt === "string" ? { prompt: originalContext.prompt } : {}),
+        ...(typeof originalContext.title === "string" ? { title: originalContext.title } : {}),
+        ...(typeof originalContext.message === "string" ? { message: originalContext.message } : {}),
+      };
+    }
+
     let primaryReviewPathWakeCovered = false;
     if (approval.requestedByAgentId) {
       try {
@@ -211,6 +258,7 @@ export function approvalRoutes(
             approvalStatus: approval.status,
             issueId: primaryIssueId,
             issueIds: linkedIssueIds,
+            ...originalTaskContext,
             ...(primaryReviewPathContext ?? {}),
           },
           requestedByActorType: "user",
@@ -223,6 +271,7 @@ export function approvalRoutes(
             issueIds: linkedIssueIds,
             taskId: primaryIssueId,
             wakeReason: "approval_approved",
+            ...originalTaskContext,
             ...(primaryReviewPathContext ?? {}),
           },
         });
@@ -426,7 +475,7 @@ export function approvalRoutes(
     res.json(issues);
   });
 
-  router.post("/approvals/:id/approve", validate(resolveApprovalSchema), async (req, res) => {
+  router.post("/approvals/:id/approve", validate(resolveApprovalRouteSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
     const existingApproval = await requireApprovalAccess(req, id);
@@ -436,8 +485,98 @@ export function approvalRoutes(
     }
     const decidedByUserId = req.actor.userId ?? "board";
     const idempotencyKey = req.body.idempotencyKey as string | undefined;
+    const mobileRequired = isMobileApprovalOnly(req);
+    const approvalToken = typeof req.body.approvalToken === "string" ? req.body.approvalToken.trim() : null;
 
     if (!idempotencyKey) {
+      if (mobileRequired) {
+        if (!approvalToken) {
+          res.status(401).json({
+            error: "WebAuthn approval token required for mobile approval",
+            reason: "approval_token_required",
+          });
+          return;
+        }
+
+        let applied = false;
+        let httpStatus = 200;
+        let body: unknown;
+        let approvalForSideEffects: ApprovalRecord | null = null;
+
+        try {
+          await db.transaction(async (tx) => {
+            const tokenResult = await webauthnService(tx as unknown as Db).consumeApprovalToken({
+              token: approvalToken,
+              approvalId: id,
+              companyId: existingApproval.companyId,
+              userId: decidedByUserId,
+            });
+
+            if (!tokenResult.valid) {
+              throw new ApprovalTokenError(tokenResult.status, tokenResult.reason, tokenResult.error);
+            }
+
+            const result = await approvalService(tx as unknown as Db).approve(
+              id,
+              decidedByUserId,
+              req.body.decisionNote,
+            );
+
+            if (result.outcome === "expired") {
+              throw new RollbackWithoutTokenBurnError(410, {
+                error: "This approval has expired and can no longer be resolved",
+                reason: "approval_expired",
+                expiredAt: result.approval.expiresAt?.toISOString() ?? null,
+              });
+            }
+            if (result.outcome === "conflict") {
+              throw new RollbackWithoutTokenBurnError(409, {
+                error: "This approval was already resolved to a different status",
+                reason: "already_resolved_conflict",
+                currentStatus: result.approval.status,
+              });
+            }
+
+            applied = result.applied;
+            if (result.applied) {
+              await logActivity(tx as unknown as Db, {
+                companyId: result.approval.companyId,
+                actorType: "user",
+                actorId: decidedByUserId,
+                action: "approval.approved",
+                entityType: "approval",
+                entityId: result.approval.id,
+                details: {
+                  type: result.approval.type,
+                  requestedByAgentId: result.approval.requestedByAgentId,
+                  ...boardKeySourceDetails(req),
+                },
+              });
+            }
+            httpStatus = 200;
+            body = projectApprovalResponse(result.approval);
+            approvalForSideEffects = result.approval;
+          });
+        } catch (err) {
+          if (err instanceof ApprovalTokenError) {
+            res.status(err.httpStatus).json({ error: err.message, reason: err.reason });
+            return;
+          }
+          if (err instanceof RollbackWithoutTokenBurnError) {
+            res.status(err.httpStatus).json(err.body);
+            return;
+          }
+          throw err;
+        }
+
+        if (applied && approvalForSideEffects) {
+          await runApproveSideEffects(req, approvalForSideEffects);
+        }
+
+        res.status(httpStatus).json(body);
+        return;
+      }
+
       const { approval, applied, outcome } = await svc.approve(id, decidedByUserId, req.body.decisionNote);
 
       if (outcome === "expired") {
@@ -497,6 +636,14 @@ export function approvalRoutes(
       return;
     }
 
+    if (mobileRequired && !approvalToken) {
+      res.status(401).json({
+        error: "WebAuthn approval token required for mobile approval",
+        reason: "approval_token_required",
+      });
+      return;
+    }
+
     let applied = false;
     let httpStatus = 200;
     let body: unknown;
@@ -521,10 +668,30 @@ export function approvalRoutes(
         return;
       }
 
+      if (mobileRequired) {
+        const tokenResult = await webauthnService(tx as unknown as Db).consumeApprovalToken({
+          token: approvalToken!,
+          approvalId: id,
+          companyId: existingApproval.companyId,
+          userId: decidedByUserId,
+        });
+
+        if (!tokenResult.valid) {
+          throw new ApprovalTokenError(tokenResult.status, tokenResult.reason, tokenResult.error);
+        }
+      }
+
       const result = await approvalService(tx as unknown as Db).approve(id, decidedByUserId, req.body.decisionNote);
       applied = result.applied;
 
       if (result.outcome === "expired") {
+        if (mobileRequired) {
+          throw new RollbackWithoutTokenBurnError(410, {
+            error: "This approval has expired and can no longer be resolved",
+            reason: "approval_expired",
+            expiredAt: result.approval.expiresAt?.toISOString() ?? null,
+          });
+        }
         httpStatus = 410;
         body = {
           error: "This approval has expired and can no longer be resolved",
@@ -532,6 +699,13 @@ export function approvalRoutes(
           expiredAt: result.approval.expiresAt?.toISOString() ?? null,
         };
       } else if (result.outcome === "conflict") {
+        if (mobileRequired) {
+          throw new RollbackWithoutTokenBurnError(409, {
+            error: "This approval was already resolved to a different status",
+            reason: "already_resolved_conflict",
+            currentStatus: result.approval.status,
+          });
+        }
         httpStatus = 409;
         body = {
           error: "This approval was already resolved to a different status",
@@ -560,6 +734,18 @@ export function approvalRoutes(
       }
 
       await completeApprovalIdempotency(tx as unknown as Db, { claimId: claim.claimId, httpStatus, body });
+    }).catch((err) => {
+      if (err instanceof ApprovalTokenError) {
+        httpStatus = err.httpStatus;
+        body = { error: err.message, reason: err.reason };
+        return;
+      }
+      if (err instanceof RollbackWithoutTokenBurnError) {
+        httpStatus = err.httpStatus;
+        body = err.body;
+        return;
+      }
+      throw err;
     });
 
     if (applied && approvalForSideEffects) {

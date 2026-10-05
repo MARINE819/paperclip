@@ -21,6 +21,20 @@ export const APPROVAL_ONLY_SCOPE_ALLOWLIST: ReadonlyArray<{ method: string; patt
   { method: "POST", pattern: /^\/api\/approvals\/[^/]+\/reject$/ },
   { method: "POST", pattern: /^\/api\/approvals\/[^/]+\/request-revision$/ },
   { method: "POST", pattern: /^\/api\/approvals\/[^/]+\/comments$/ },
+  // WebAuthn routes for paired mobile devices
+  { method: "POST", pattern: /^\/api\/companies\/[^/]+\/webauthn\/register\/options$/ },
+  { method: "POST", pattern: /^\/api\/companies\/[^/]+\/webauthn\/register\/verify$/ },
+  { method: "POST", pattern: /^\/api\/companies\/[^/]+\/webauthn\/authenticate\/options$/ },
+  { method: "POST", pattern: /^\/api\/companies\/[^/]+\/webauthn\/authenticate\/verify$/ },
+  { method: "GET", pattern: /^\/api\/companies\/[^/]+\/webauthn\/credentials$/ },
+  { method: "DELETE", pattern: /^\/api\/companies\/[^/]+\/webauthn\/credentials\/[^/]+$/ },
+  // Web Push routes for paired mobile devices
+  { method: "GET", pattern: /^\/api\/push\/public-key$/ },
+  { method: "POST", pattern: /^\/api\/companies\/[^/]+\/push\/subscribe$/ },
+  { method: "POST", pattern: /^\/api\/companies\/[^/]+\/push\/unsubscribe$/ },
+  // Emergency stop & resume routes for paired mobile devices
+  { method: "POST", pattern: /^\/api\/companies\/[^/]+\/emergency-pause$/ },
+  { method: "POST", pattern: /^\/api\/companies\/[^/]+\/emergency-resume$/ },
 ];
 
 export function isApprovalOnlyBoardKeyRequestAllowed(method: string, path: string): boolean {

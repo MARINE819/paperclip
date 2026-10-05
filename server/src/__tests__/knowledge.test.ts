@@ -18,6 +18,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { knowledgeRoutes } from "../routes/knowledge.js";
+import { knowledgeService } from "../services/knowledge.js";
 import { errorHandler } from "../middleware/index.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -199,5 +200,280 @@ describeEmbeddedPostgres("Knowledge Layer integration tests", () => {
     // Check database to ensure only 1 knowledge record exists
     const records = await db.select().from(knowledgeRecords).where(eq(knowledgeRecords.sourceMemoryOperationId, op.id));
     expect(records.length).toBe(1);
+  });
+
+  it("[F-07] a newly promoted knowledge record is created with externalSyncState='pending', never NULL", async () => {
+    await seedCompany(company1Id);
+    const [op] = await db.insert(memoryOperations).values({
+      companyId: company1Id,
+      sourceType: "issue",
+      sourceId: "ISS-2",
+      content: "Facts to auto-save",
+      status: "candidate",
+      reviewState: "approved",
+    }).returning();
+
+    actor = { type: "board", userId: randomUUID(), companyIds: [company1Id], source: "session" };
+
+    const res = await request(app)
+      .post(`/api/memory-operations/${op.id}/promote`)
+      .send({ title: "Auto Save Wiki Page", body: "Facts markdown content" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.knowledgeRecord.externalSyncState).toBe("pending");
+
+    const [row] = await db.select().from(knowledgeRecords).where(eq(knowledgeRecords.id, res.body.knowledgeRecord.id));
+    expect(row.externalSyncState).toBe("pending");
+  });
+
+  describe("listKnowledgeRecords search and retrieval", () => {
+    it("searches records by title, summary, or body with case-insensitive matching and enforces company isolation", async () => {
+      await seedCompany(company1Id);
+      await seedCompany(company2Id);
+      const svc = knowledgeService(db);
+
+      await db.insert(knowledgeRecords).values([
+        {
+          id: randomUUID(),
+          companyId: company1Id,
+          title: "System Architecture Standards",
+          summary: "Guidelines for distributed services",
+          body: "Always use idempotency keys on mutating routes.",
+          status: "active",
+        },
+        {
+          id: randomUUID(),
+          companyId: company1Id,
+          title: "Database Indexing Patterns",
+          summary: "Trigram indexing conventions",
+          body: "PostgreSQL gin_trgm_ops speeds up substring search.",
+          status: "active",
+        },
+        {
+          id: randomUUID(),
+          companyId: company1Id,
+          title: "Release Playbook",
+          summary: "Checklist for deploying safely",
+          body: "Review telemetry before and after traffic migration.",
+          status: "active",
+        },
+        // Company 2 record with same keyword
+        {
+          id: randomUUID(),
+          companyId: company2Id,
+          title: "Secret Architecture Guide",
+          summary: "Internal to company 2",
+          body: "Confidential architecture specs.",
+          status: "active",
+        },
+      ]);
+
+      // 1. Without q: returns all 3 records for company1
+      const allCompany1 = await svc.listKnowledgeRecords(company1Id);
+      expect(allCompany1).toHaveLength(3);
+
+      // 2. Search by title keyword (case-insensitive)
+      const titleMatches = await svc.listKnowledgeRecords(company1Id, { q: "architecture" });
+      expect(titleMatches).toHaveLength(1);
+      expect(titleMatches[0]!.title).toBe("System Architecture Standards");
+
+      // 3. Search by summary keyword
+      const summaryMatches = await svc.listKnowledgeRecords(company1Id, { q: "Trigram indexing" });
+      expect(summaryMatches).toHaveLength(1);
+      expect(summaryMatches[0]!.title).toBe("Database Indexing Patterns");
+
+      // 4. Search by body keyword
+      const bodyMatches = await svc.listKnowledgeRecords(company1Id, { q: "telemetry" });
+      expect(bodyMatches).toHaveLength(1);
+      expect(bodyMatches[0]!.title).toBe("Release Playbook");
+
+      // 5. No match returns empty array
+      const noMatches = await svc.listKnowledgeRecords(company1Id, { q: "nonexistent-term-xyz" });
+      expect(noMatches).toHaveLength(0);
+
+      // 6. Company isolation: searching "architecture" in company1 never returns company2 records
+      const c1Results = await svc.listKnowledgeRecords(company1Id, { q: "architecture" });
+      expect(c1Results.every((r) => r.companyId === company1Id)).toBe(true);
+
+      const c2Results = await svc.listKnowledgeRecords(company2Id, { q: "architecture" });
+      expect(c2Results).toHaveLength(1);
+      expect(c2Results[0]!.title).toBe("Secret Architecture Guide");
+      expect(c2Results[0]!.companyId).toBe(company2Id);
+
+      // 7. Limit behavior
+      const limited = await svc.listKnowledgeRecords(company1Id, { limit: 2 });
+      expect(limited).toHaveLength(2);
+
+      // 8. Empty string / whitespace q behaves like no q
+      const emptyQ = await svc.listKnowledgeRecords(company1Id, { q: "   " });
+      expect(emptyQ).toHaveLength(3);
+    });
+  });
+
+  describe("M2-03-B01 Knowledge Revision & Confidence Hardening", () => {
+    it("promotion creates revisionNumber=1, a matching revision row, and carries confidence through unchanged", async () => {
+      await seedCompany(company1Id);
+      const [op] = await db.insert(memoryOperations).values({
+        companyId: company1Id,
+        sourceType: "issue",
+        sourceId: "ISS-B01-1",
+        content: "Confident fact",
+        confidence: 0.82,
+        status: "candidate",
+        reviewState: "approved",
+      }).returning();
+
+      const svc = knowledgeService(db);
+      const { knowledgeRecord } = await svc.promoteMemoryOperation(op.id, {
+        title: "B01 Wiki Page",
+        body: "Confident fact body",
+      });
+
+      expect(knowledgeRecord.revisionNumber).toBe(1);
+      expect(knowledgeRecord.confidence).toBe(0.82);
+      expect(knowledgeRecord.latestRevisionId).toBeTruthy();
+
+      const revisions = await svc.listKnowledgeRecordRevisions(knowledgeRecord.id);
+      expect(revisions).toHaveLength(1);
+      expect(revisions[0]!.revisionNumber).toBe(1);
+      expect(revisions[0]!.confidence).toBe(0.82);
+      expect(revisions[0]!.id).toBe(knowledgeRecord.latestRevisionId);
+    });
+
+    it("promotion with a null-confidence candidate keeps the knowledge record's confidence null, never defaulted to 0", async () => {
+      await seedCompany(company1Id);
+      const [op] = await db.insert(memoryOperations).values({
+        companyId: company1Id,
+        sourceType: "issue",
+        sourceId: "ISS-B01-2",
+        content: "No confidence recorded",
+        status: "candidate",
+        reviewState: "approved",
+      }).returning();
+
+      const svc = knowledgeService(db);
+      const { knowledgeRecord } = await svc.promoteMemoryOperation(op.id, {
+        title: "No Confidence Wiki Page",
+        body: "Body text",
+      });
+
+      expect(knowledgeRecord.confidence).toBeNull();
+      const revisions = await svc.listKnowledgeRecordRevisions(knowledgeRecord.id);
+      expect(revisions[0]!.confidence).toBeNull();
+    });
+
+    it("updateKnowledgeRecord increments the revision exactly once, preserves the prior revision, and carries confidence forward unchanged when not explicitly passed", async () => {
+      await seedCompany(company1Id);
+      const [op] = await db.insert(memoryOperations).values({
+        companyId: company1Id,
+        sourceType: "issue",
+        sourceId: "ISS-B01-3",
+        content: "Original body",
+        confidence: 0.5,
+        status: "candidate",
+        reviewState: "approved",
+      }).returning();
+
+      const svc = knowledgeService(db);
+      const { knowledgeRecord: v1 } = await svc.promoteMemoryOperation(op.id, {
+        title: "Versioned Wiki Page",
+        body: "Original body",
+      });
+      expect(v1.revisionNumber).toBe(1);
+
+      const { knowledgeRecord: v2, revision: rev2 } = await svc.updateKnowledgeRecord(v1.id, {
+        baseRevisionId: v1.latestRevisionId!,
+        body: "Updated body text",
+        changeSummary: "Clarified wording.",
+      });
+
+      expect(v2.revisionNumber).toBe(2);
+      expect(v2.body).toBe("Updated body text");
+      // Confidence was NOT passed in this update -> must carry forward unchanged,
+      // never silently increased merely because the record was re-saved.
+      expect(v2.confidence).toBe(0.5);
+      expect(rev2.revisionNumber).toBe(2);
+      expect(rev2.confidence).toBe(0.5);
+
+      // Full history remains reconstructable: both revisions still exist.
+      const revisions = await svc.listKnowledgeRecordRevisions(v1.id);
+      expect(revisions).toHaveLength(2);
+      expect(revisions.map((r) => r.revisionNumber).sort()).toEqual([1, 2]);
+      const firstRevision = revisions.find((r) => r.revisionNumber === 1)!;
+      expect(firstRevision.body).toBe("Original body");
+    });
+
+    it("updateKnowledgeRecord rejects a stale baseRevisionId and creates no orphan revision row", async () => {
+      await seedCompany(company1Id);
+      const [op] = await db.insert(memoryOperations).values({
+        companyId: company1Id,
+        sourceType: "issue",
+        sourceId: "ISS-B01-4",
+        content: "Race body",
+        confidence: 0.3,
+        status: "candidate",
+        reviewState: "approved",
+      }).returning();
+
+      const svc = knowledgeService(db);
+      const { knowledgeRecord: v1 } = await svc.promoteMemoryOperation(op.id, {
+        title: "Race Wiki Page",
+        body: "Race body",
+      });
+
+      // First update succeeds and advances to revision 2.
+      await svc.updateKnowledgeRecord(v1.id, {
+        baseRevisionId: v1.latestRevisionId!,
+        body: "First update wins",
+      });
+
+      // Second update still targets the now-stale revision 1 id -> must be rejected.
+      await expect(
+        svc.updateKnowledgeRecord(v1.id, {
+          baseRevisionId: v1.latestRevisionId!,
+          body: "Second update loses",
+        }),
+      ).rejects.toMatchObject({ status: 409 });
+
+      // Exactly 2 revisions exist (1 and 2) -- the rejected call created no orphan revision 3.
+      const revisions = await svc.listKnowledgeRecordRevisions(v1.id);
+      expect(revisions).toHaveLength(2);
+      expect(revisions.map((r) => r.revisionNumber).sort()).toEqual([1, 2]);
+    });
+
+    it("repeated promotion of multiple independent candidates into separate knowledge records never auto-increases any single record's confidence", async () => {
+      await seedCompany(company1Id);
+      const [opA] = await db.insert(memoryOperations).values({
+        companyId: company1Id,
+        sourceType: "issue",
+        sourceId: "ISS-B01-5A",
+        content: "Independent evidence A",
+        confidence: 0.4,
+        status: "candidate",
+        reviewState: "approved",
+      }).returning();
+
+      const svc = knowledgeService(db);
+      const { knowledgeRecord: recordA } = await svc.promoteMemoryOperation(opA.id, {
+        title: "Evidence A Wiki Page",
+        body: "Independent evidence A",
+      });
+      expect(recordA.confidence).toBe(0.4);
+
+      // Re-saving the SAME record twice with no new confidence value must never
+      // raise it on its own -- repetition is not new independent evidence.
+      const { knowledgeRecord: afterFirstResave } = await svc.updateKnowledgeRecord(recordA.id, {
+        baseRevisionId: recordA.latestRevisionId!,
+        changeSummary: "Cosmetic re-save, no new evidence.",
+      });
+      expect(afterFirstResave.confidence).toBe(0.4);
+
+      const { knowledgeRecord: afterSecondResave } = await svc.updateKnowledgeRecord(recordA.id, {
+        baseRevisionId: afterFirstResave.latestRevisionId!,
+        changeSummary: "Another cosmetic re-save, still no new evidence.",
+      });
+      expect(afterSecondResave.confidence).toBe(0.4);
+      expect(afterSecondResave.revisionNumber).toBe(3);
+    });
   });
 });

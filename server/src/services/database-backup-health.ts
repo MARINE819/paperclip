@@ -1,5 +1,15 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, openSync, closeSync, readSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+
+// A truncated or empty gzip stream (the exact shape left behind by a backup
+// whose compression step was interrupted mid-write) still has a technically
+// valid gzip header — an empty gzip archive is a legal gzip file. Size alone
+// is what distinguishes it from a real database dump: every backup this
+// deployment has ever produced, even of a near-empty database, has been
+// multiple megabytes. A file below this floor is treated as not a real
+// backup regardless of its extension.
+const MIN_VALID_BACKUP_SIZE_BYTES = 4096;
+const GZIP_MAGIC_BYTES = [0x1f, 0x8b];
 
 export type DatabaseBackupHealthWarningCode =
   | "database_backup_check_failed"
@@ -23,6 +33,21 @@ export type DatabaseBackupHealthStatus = {
     mtime: string;
     ageHours: number;
     sizeBytes: number;
+  } | null;
+  /**
+   * A newer-than-latestBackup artifact left behind by a backup that did not
+   * finish successfully — most commonly the raw, uncompressed .sql from a
+   * run whose gzip-compression step failed or timed out after the dump
+   * itself completed. Present only when such an artifact exists and is
+   * newer than the true latestBackup; never a substitute for a real backup.
+   */
+  latestRecoveryArtifact: {
+    name: string;
+    path: string;
+    mtime: string;
+    ageHours: number;
+    sizeBytes: number;
+    reason: string;
   } | null;
   lastFailure: {
     path: string;
@@ -78,10 +103,48 @@ function readLastFailure(alertFiles: string[]) {
   };
 }
 
-function findLatestBackup(backupDir: string, nowMs: number) {
-  if (!existsSync(backupDir)) return null;
+function hasGzipMagicBytes(filePath: string): boolean {
+  let fd: number;
+  try {
+    fd = openSync(filePath, "r");
+  } catch {
+    return false;
+  }
+  try {
+    const header = Buffer.alloc(2);
+    const bytesRead = readSync(fd, header, 0, 2, 0);
+    return bytesRead === 2 && header[0] === GZIP_MAGIC_BYTES[0] && header[1] === GZIP_MAGIC_BYTES[1];
+  } catch {
+    return false;
+  } finally {
+    closeSync(fd);
+  }
+}
 
-  const candidates = readdirSync(backupDir)
+// A file only counts as a genuine backup when it is large enough to plausibly
+// hold real dump content AND actually starts with the gzip magic bytes.
+// Neither check alone is enough: an interrupted compression can leave behind
+// a technically-valid-but-empty gzip stream (passes the magic check, fails
+// the size floor), so both must hold.
+function isValidBackupFile(stat: { size: number }, fullPath: string): boolean {
+  return stat.size >= MIN_VALID_BACKUP_SIZE_BYTES && hasGzipMagicBytes(fullPath);
+}
+
+function toBackupEntry(fullPath: string, mtimeMs: number, sizeBytes: number, nowMs: number) {
+  return {
+    name: basename(fullPath),
+    path: fullPath,
+    mtime: new Date(mtimeMs).toISOString(),
+    ageHours: roundHours((nowMs - mtimeMs) / 3_600_000),
+    sizeBytes,
+  };
+}
+
+function findLatestBackup(backupDir: string, nowMs: number) {
+  if (!existsSync(backupDir)) return { latestBackup: null, latestRecoveryArtifact: null };
+
+  const allEntries = readdirSync(backupDir);
+  const candidates = allEntries
     .filter((name) => name.endsWith(".sql.gz"))
     .map((name) => {
       const fullPath = join(backupDir, name);
@@ -90,16 +153,30 @@ function findLatestBackup(backupDir: string, nowMs: number) {
     })
     .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
 
-  const latest = candidates[0];
-  if (!latest) return null;
+  const newestCandidate = candidates[0] ?? null;
+  const latestValid = candidates.find((entry) => isValidBackupFile(entry.stat, entry.fullPath)) ?? null;
 
-  return {
-    name: basename(latest.fullPath),
-    path: latest.fullPath,
-    mtime: new Date(latest.stat.mtimeMs).toISOString(),
-    ageHours: roundHours((nowMs - latest.stat.mtimeMs) / 3_600_000),
-    sizeBytes: latest.stat.size,
-  };
+  const latestBackup = latestValid
+    ? toBackupEntry(latestValid.fullPath, latestValid.stat.mtimeMs, latestValid.stat.size, nowMs)
+    : null;
+
+  // A recovery artifact is only worth surfacing when the newest .gz on disk
+  // is itself the broken one (otherwise there is nothing to point at beyond
+  // the good backup already reported above).
+  let latestRecoveryArtifact: DatabaseBackupHealthStatus["latestRecoveryArtifact"] = null;
+  if (newestCandidate && newestCandidate !== latestValid && !isValidBackupFile(newestCandidate.stat, newestCandidate.fullPath)) {
+    const siblingSqlName = newestCandidate.name.replace(/\.gz$/, "");
+    const siblingSqlPath = join(backupDir, siblingSqlName);
+    if (siblingSqlName !== newestCandidate.name && existsSync(siblingSqlPath)) {
+      const siblingStat = statSync(siblingSqlPath);
+      latestRecoveryArtifact = {
+        ...toBackupEntry(siblingSqlPath, siblingStat.mtimeMs, siblingStat.size, nowMs),
+        reason: `Compressed backup ${newestCandidate.name} is invalid or truncated; this uncompressed dump from the same run is the actual recovery point.`,
+      };
+    }
+  }
+
+  return { latestBackup, latestRecoveryArtifact };
 }
 
 export function inspectDatabaseBackupHealth(
@@ -110,10 +187,11 @@ export function inspectDatabaseBackupHealth(
   const maxAgeHours = Math.max(1, opts.maxAgeHours);
 
   let latestBackup: DatabaseBackupHealthStatus["latestBackup"] = null;
+  let latestRecoveryArtifact: DatabaseBackupHealthStatus["latestRecoveryArtifact"] = null;
   let lastFailure: DatabaseBackupHealthStatus["lastFailure"] = null;
 
   try {
-    latestBackup = findLatestBackup(opts.backupDir, now.getTime());
+    ({ latestBackup, latestRecoveryArtifact } = findLatestBackup(opts.backupDir, now.getTime()));
     lastFailure = readLastFailure(alertFileCandidates(opts));
 
     if (!latestBackup) {
@@ -147,6 +225,7 @@ export function inspectDatabaseBackupHealth(
     backupDir: opts.backupDir,
     maxAgeHours,
     latestBackup,
+    latestRecoveryArtifact,
     lastFailure,
     warnings,
   };

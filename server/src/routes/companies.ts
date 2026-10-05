@@ -4,7 +4,7 @@ import multer from "multer";
 import { and, count as countFn, eq } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { agents as agentsTable } from "@paperclipai/db";
+import { agents as agentsTable, companies as companiesTable } from "@paperclipai/db";
 import type { CompanyPortabilityImportResult } from "@paperclipai/shared";
 import {
   MAX_ZIP_ENTRY_DECOMPRESSED_BYTES,
@@ -34,7 +34,7 @@ import {
   type CompanyImportTransferPartUploadResult,
   type CompanyImportTransferStatus,
 } from "@paperclipai/shared/company-import-transfer";
-import { badRequest, conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { HttpError, badRequest, conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { PORTABLE_ZIP_UPLOAD_LIMIT_BYTES } from "../http/body-limits.js";
 import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
@@ -62,6 +62,7 @@ import {
   logActivity,
   workTimelineService,
 } from "../services/index.js";
+import { webauthnService } from "../services/webauthn-service.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import type { StorageService } from "../storage/types.js";
@@ -283,6 +284,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
   const budgets = budgetService(db);
   const artifacts = companyArtifactsService(db, storage);
   const feedback = feedbackService(db);
+  const webauthnSvc = webauthnService(db);
   const importJobs = new Map<string, ImportJobRecord>();
   // Terminal jobs are retained in memory for an hour after they settle. A long
   // import can outlast a user stepping away, and dropping the completion after
@@ -1223,6 +1225,14 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       return;
     }
 
+    if (existingCompany.status === "paused" && body.status === "active") {
+      res.status(403).json({
+        error: "Paused companies must be resumed through the emergency resume flow",
+        reason: "emergency_resume_required",
+      });
+      return;
+    }
+
     if (req.actor.type !== "agent") {
       if (body.feedbackDataSharingEnabled === true && !existingCompany.feedbackDataSharingEnabled) {
         body = {
@@ -1316,6 +1326,138 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       return;
     }
     res.json(company);
+  });
+
+  router.post("/:companyId/emergency-pause", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const actor = getActorInfo(req);
+    const existingCompany = await svc.getById(companyId);
+    if (!existingCompany) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    const updated = await svc.update(companyId, { status: "paused" }, actor);
+    if (!updated) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "company.emergency_paused",
+      entityType: "company",
+      entityId: companyId,
+      details: { previousStatus: existingCompany.status, status: "paused" },
+    });
+
+    res.json(updated);
+  });
+
+  router.post("/:companyId/emergency-resume", async (req, res, next) => {
+    try {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      assertBoard(req);
+      const actor = getActorInfo(req);
+
+      const rawResumeToken = req.body?.resumeToken;
+      const resumeToken = typeof rawResumeToken === "string" ? rawResumeToken.trim() : "";
+
+      if (!resumeToken) {
+        res.status(401).json({
+          error: "WebAuthn emergency resume token is required",
+          reason: "resume_token_required",
+        });
+        return;
+      }
+
+      const userId = req.actor.userId;
+      if (!userId) {
+        res.status(403).json({
+          error: "Authenticated user identity is required for emergency resume",
+          reason: "resume_user_required",
+        });
+        return;
+      }
+
+      const existingCompany = await svc.getById(companyId);
+      if (!existingCompany) {
+        res.status(404).json({ error: "Company not found" });
+        return;
+      }
+
+      if (existingCompany.status !== "paused") {
+        res.status(409).json({
+          error: `Company is not paused (current status: ${existingCompany.status})`,
+          reason: "company_not_paused",
+        });
+        return;
+      }
+
+      const updated = await db.transaction(async (tx) => {
+        const tokenResult = await webauthnSvc.consumeEmergencyResumeToken({
+          token: resumeToken,
+          companyId,
+          userId,
+          tx,
+        });
+
+        if (!tokenResult.valid) {
+          throw new HttpError(tokenResult.status, tokenResult.error, { reason: tokenResult.reason });
+        }
+
+        const [updatedCompany] = await tx
+          .update(companiesTable)
+          .set({ status: "active", updatedAt: new Date() })
+          .where(
+            and(
+              eq(companiesTable.id, companyId),
+              eq(companiesTable.status, "paused"),
+            ),
+          )
+          .returning();
+
+        if (!updatedCompany) {
+          throw new HttpError(409, "Company is no longer in paused state", {
+            reason: "company_not_paused",
+          });
+        }
+
+        return updatedCompany;
+      });
+
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "company.emergency_resumed",
+        entityType: "company",
+        entityId: companyId,
+        details: { previousStatus: existingCompany.status, status: "active" },
+      });
+
+      const [hydrated] = await svc.getById(companyId).then((c) => [c]);
+      res.json(hydrated ?? updated);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        const details = err.details as { reason?: string } | undefined;
+        res.status(err.status).json({
+          error: err.message,
+          ...(details?.reason ? { reason: details.reason } : {}),
+        });
+        return;
+      }
+      next(err);
+    }
   });
 
   router.delete("/:companyId", async (req, res) => {

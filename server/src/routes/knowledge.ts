@@ -106,7 +106,15 @@ export function knowledgeRoutes(db: Db, options: KnowledgeServiceOptions = {}) {
   router.get("/companies/:companyId/knowledge-records", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    res.json(await service.listKnowledgeRecords(companyId));
+    const q = typeof req.query.q === "string" ? req.query.q : undefined;
+    let limit: number | undefined;
+    if (typeof req.query.limit === "string" && req.query.limit.trim().length > 0) {
+      const parsed = Number(req.query.limit);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        limit = Math.floor(parsed);
+      }
+    }
+    res.json(await service.listKnowledgeRecords(companyId, { q, limit }));
   });
 
   router.get("/knowledge-records/:id", async (req, res) => {

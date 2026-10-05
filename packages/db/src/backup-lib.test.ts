@@ -2,9 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { gunzipSync } from "node:zlib";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  runDatabaseBackup,
+  runDatabaseRestore,
+  GzipFinalizeTimeoutError,
+  type BackupLifecycleEvent,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -593,5 +599,151 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       }
     },
     20_000,
+  );
+});
+
+describeEmbeddedPostgres("runDatabaseBackup gzip-finalize failure handling", () => {
+  async function seedOneRow(connectionString: string) {
+    const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+    try {
+      await sql.unsafe(`
+        CREATE TABLE "public"."gzip_finalize_test" ("id" serial PRIMARY KEY, "payload" text NOT NULL);
+      `);
+      await sql`INSERT INTO "public"."gzip_finalize_test" ("payload") VALUES (${"x".repeat(4096)})`;
+    } finally {
+      await sql.end();
+    }
+  }
+
+  it(
+    "[B] a gzip timeout rejects with phase=gzip_finalize, preserves the raw .sql, removes the partial .gz, and releases the in-flight guard for the next attempt",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await seedOneRow(connectionString);
+      const backupDir = createTempDir("paperclip-db-backup-gzip-timeout-");
+      const events: BackupLifecycleEvent[] = [];
+
+      // Simulates the exact try/finally shape server/src/index.ts wraps every
+      // scheduled backup in: a hang here would previously leave `inFlight`
+      // stuck true forever. A rejection (timeout or otherwise) always runs
+      // the finally, regardless of what the backup itself did.
+      let inFlight = false;
+      const attempt = () => {
+        if (inFlight) throw new Error("a previous backup is still running");
+        inFlight = true;
+        return runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-test",
+          backupEngine: "javascript",
+          gzipTimeoutMs: 1,
+          onEvent: (event) => events.push(event),
+        }).finally(() => {
+          inFlight = false;
+        });
+      };
+
+      await expect(attempt()).rejects.toMatchObject({ phase: "gzip_finalize" });
+      expect(inFlight).toBe(false);
+
+      const sqlFiles = fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql"));
+      const gzFiles = fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql.gz"));
+      expect(sqlFiles).toHaveLength(1);
+      expect(gzFiles).toHaveLength(0);
+
+      expect(events.map((e) => e.type)).toEqual([
+        "engine_selected",
+        "gzip_started",
+        "gzip_timeout",
+        "partial_gzip_removed",
+        "raw_sql_preserved",
+      ]);
+
+      // The guard was released, so a second attempt is not skipped as
+      // "already running" — it genuinely runs again (and, with the same
+      // 1ms budget, also times out, but that is a different, honest
+      // failure — not a silent skip).
+      await expect(attempt()).rejects.toMatchObject({ phase: "gzip_finalize" });
+      expect(inFlight).toBe(false);
+    },
+    30_000,
+  );
+
+  it(
+    "[C] a non-timeout gzip failure also preserves the raw .sql and reports gzip_failed (not gzip_timeout)",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await seedOneRow(connectionString);
+      const backupDir = createTempDir("paperclip-db-backup-gzip-failure-");
+      const events: BackupLifecycleEvent[] = [];
+
+      // Force the compression write step itself to fail (not merely run
+      // slowly): pre-create a directory at the exact path the backup will
+      // try to open as a write stream, which fails immediately with EISDIR.
+      // The clock is faked (not just Date.now, since timestamp() builds its
+      // stamp from `new Date()`) so the collision path is known ahead of time.
+      const filenamePrefix = "paperclip-test";
+      const fixedNow = Date.UTC(2026, 5, 15, 8, 30, 0);
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(fixedNow);
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const fixedDate = new Date(fixedNow);
+      const expectedStamp = `${fixedDate.getFullYear()}${pad(fixedDate.getMonth() + 1)}${pad(fixedDate.getDate())}-${pad(fixedDate.getHours())}${pad(fixedDate.getMinutes())}${pad(fixedDate.getSeconds())}`;
+      const expectedGzPath = path.join(backupDir, `${filenamePrefix}-${expectedStamp}.sql.gz`);
+      fs.mkdirSync(expectedGzPath, { recursive: true });
+
+      try {
+        await expect(
+          runDatabaseBackup({
+            connectionString,
+            backupDir,
+            retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+            filenamePrefix,
+            backupEngine: "javascript",
+            onEvent: (event) => events.push(event),
+          }),
+        ).rejects.toMatchObject({ phase: "gzip_finalize" });
+      } finally {
+        vi.useRealTimers();
+      }
+
+      const timeoutEvents = events.filter((e) => e.type === "gzip_timeout");
+      const failedEvents = events.filter((e) => e.type === "gzip_failed");
+      expect(timeoutEvents).toHaveLength(0);
+      expect(failedEvents.length).toBeGreaterThan(0);
+      expect(events.some((e) => e.type === "raw_sql_preserved")).toBe(true);
+
+      const sqlFiles = fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql"));
+      expect(sqlFiles).toHaveLength(1);
+    },
+    30_000,
+  );
+
+  it(
+    "[A] a normal gzip pipeline still succeeds and cleans up the raw .sql (regression)",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await seedOneRow(connectionString);
+      const backupDir = createTempDir("paperclip-db-backup-gzip-success-");
+      const events: BackupLifecycleEvent[] = [];
+
+      const result = await runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        filenamePrefix: "paperclip-test",
+        backupEngine: "javascript",
+        onEvent: (event) => events.push(event),
+      });
+
+      expect(fs.existsSync(result.backupFile)).toBe(true);
+      expect(result.backupFile.endsWith(".sql.gz")).toBe(true);
+      const sqlFiles = fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql"));
+      expect(sqlFiles).toHaveLength(0);
+      expect(events.map((e) => e.type)).toEqual(["engine_selected", "gzip_started"]);
+      expect(events.every((e) => e.type !== "gzip_timeout" && e.type !== "gzip_failed")).toBe(true);
+    },
+    30_000,
   );
 });

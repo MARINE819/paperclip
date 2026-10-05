@@ -29,6 +29,10 @@ const testServerInfo = {
   },
 } as const;
 
+function validGzipBackupFixture(): Buffer {
+  return Buffer.concat([Buffer.from([0x1f, 0x8b]), Buffer.alloc(8192, 0)]);
+}
+
 function createHealthyDb(): Db {
   return {
     execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
@@ -198,7 +202,7 @@ describe("GET /health", () => {
   it("surfaces a stale database backup warning in full health details", async () => {
     const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-backups-"));
     const backupFile = path.join(backupDir, "paperclip-20260705-031702.sql.gz");
-    fs.writeFileSync(backupFile, "backup");
+    fs.writeFileSync(backupFile, validGzipBackupFixture());
     fs.utimesSync(
       backupFile,
       new Date("2026-07-05T03:17:02.000Z"),
@@ -235,7 +239,7 @@ describe("GET /health", () => {
     const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-backups-"));
     const backupFile = path.join(backupDir, "paperclip-20260706-031702.sql.gz");
     const alertFile = path.join(backupDir, "db-backup-to-s3.failure");
-    fs.writeFileSync(backupFile, "backup");
+    fs.writeFileSync(backupFile, validGzipBackupFixture());
     fs.writeFileSync(alertFile, "db-backup-to-s3 failed at 2026-07-06T03:17:00.000Z exit=1\n");
     const app = createApp(createHealthyDb(), testServerInfo, {
       enabled: true,
@@ -269,7 +273,7 @@ describe("GET /health", () => {
     fs.mkdirSync(backupDir);
     const backupFile = path.join(backupDir, "paperclip-20260706-031702.sql.gz");
     const alertFile = path.join(backupRoot, "db-backup-to-s3.failure");
-    fs.writeFileSync(backupFile, "backup");
+    fs.writeFileSync(backupFile, validGzipBackupFixture());
     fs.writeFileSync(alertFile, "db-backup-to-s3 failed beside backups\n");
     const app = createApp(createHealthyDb(), testServerInfo, {
       enabled: true,
@@ -299,7 +303,7 @@ describe("GET /health", () => {
   it("surfaces redacted database backup warnings for anonymous authenticated probes", async () => {
     const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-redacted-backups-"));
     const backupFile = path.join(backupDir, "paperclip-20260705-031702.sql.gz");
-    fs.writeFileSync(backupFile, "backup");
+    fs.writeFileSync(backupFile, validGzipBackupFixture());
     fs.utimesSync(
       backupFile,
       new Date("2026-07-05T03:17:02.000Z"),

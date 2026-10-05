@@ -22,6 +22,8 @@ export {
   runDatabaseBackup,
   runDatabaseRestore,
   formatDatabaseBackupResult,
+  GzipFinalizeTimeoutError,
+  type BackupLifecycleEvent,
   type BackupRetentionPolicy,
   type RunDatabaseBackupOptions,
   type RunDatabaseBackupResult,

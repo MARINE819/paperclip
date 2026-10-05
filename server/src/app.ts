@@ -54,6 +54,10 @@ import { goalRoutes } from "./routes/goals.js";
 import { onboardingSeedRoutes } from "./routes/onboarding-seed.js";
 import { boardChatRoutes } from "./routes/board-chat.js";
 import { approvalRoutes } from "./routes/approvals.js";
+import { taskAuthorizationEnvelopeRoutes } from "./routes/task-authorization-envelopes.js";
+import { webauthnRoutes } from "./routes/webauthn.js";
+import { pushRoutes } from "./routes/push.js";
+import { voiceRoutes } from "./routes/voice.js";
 import { secretRoutes } from "./routes/secrets.js";
 import { toolAccessRoutes } from "./routes/tool-access.js";
 import { smokeLabRoutes } from "./routes/smoke-lab.js";
@@ -78,6 +82,11 @@ import {
   instanceDatabaseBackupRoutes,
   type InstanceDatabaseBackupService,
 } from "./routes/instance-database-backups.js";
+import { instanceIncidentRoutes } from "./routes/instance-incidents.js";
+import { evalRoutes } from "./routes/evals.js";
+import { toolTrustRegistryRoutes } from "./routes/tool-trust-registry.js";
+import { secretsRegistryRoutes } from "./routes/secrets-registry.js";
+import { dataLifecycleRoutes } from "./routes/data-lifecycle.js";
 import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
@@ -113,6 +122,9 @@ import { reconcileAutomaticMemoryOperationCandidates } from "./services/memory-c
 import { createFailureCooldownTracker } from "./services/memory-candidate-failure-cooldown.js";
 import { resolveMemoryCandidateReconcilerConfig } from "./services/memory-candidate-reconciler-config.js";
 import { createMemoryCandidateReconcilerScheduler } from "./services/memory-candidate-reconciler-scheduler.js";
+import { reconcileKnowledgeAutoSave } from "./services/knowledge-auto-save-reconciler.js";
+import { resolveKnowledgeAutoSaveConfig } from "./services/knowledge-auto-save-config.js";
+import { createKnowledgeAutoSaveScheduler } from "./services/knowledge-auto-save-scheduler.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
@@ -539,6 +551,10 @@ export async function createApp(
   api.use(onboardingSeedRoutes(db));
   api.use(boardChatRoutes(db, { deploymentMode: opts.deploymentMode }));
   api.use(approvalRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(taskAuthorizationEnvelopeRoutes(db));
+  api.use(webauthnRoutes(db));
+  api.use(pushRoutes(db));
+  api.use(voiceRoutes(db));
   api.use(secretRoutes(db));
   const trustedLocalStdioRuntimeHost =
     process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
@@ -561,6 +577,11 @@ export async function createApp(
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }
+  api.use(instanceIncidentRoutes(db));
+  api.use(evalRoutes(db));
+  api.use(toolTrustRegistryRoutes(db));
+  api.use(secretsRegistryRoutes(db));
+  api.use(dataLifecycleRoutes(db));
   const pluginRegistry = pluginRegistryService(db);
   const eventBus = createPluginEventBus();
   setPluginEventBus(eventBus);
@@ -910,6 +931,32 @@ export async function createApp(
   if (memoryCandidateReconcilerConfig.enabled) {
     memoryCandidateReconcilerScheduler.start();
   }
+  // F-07: durable automatic Knowledge Record -> KnowledgeBackend save. Same
+  // shape as the Phase 3.0B reconciler directly above (reused scheduler
+  // factory, setInterval + `.unref()` + startup-once + swallow-and-log).
+  // Disabled by default (PAPERCLIP_KNOWLEDGE_AUTO_SAVE_ENABLED) — see
+  // docs/contracts/nexora-f07-knowledge-auto-save.md. Eligibility is
+  // re-derived from current DB state every tick (externalSyncState
+  // "pending"/"failed" only, never NULL) — this never touches knowledge.ts's
+  // business logic beyond the one promoteMemoryOperation write that marks a
+  // newly human-approved record eligible.
+  const knowledgeAutoSaveConfig = resolveKnowledgeAutoSaveConfig();
+  const knowledgeAutoSaveFailureCooldown = createFailureCooldownTracker();
+  const knowledgeAutoSaveScheduler = createKnowledgeAutoSaveScheduler({
+    reconcile: async () => {
+      const result = await reconcileKnowledgeAutoSave(db, {
+        batchSize: knowledgeAutoSaveConfig.batchSize,
+        cooldown: knowledgeAutoSaveFailureCooldown,
+      });
+      return { ...result, cooldownMapSize: knowledgeAutoSaveFailureCooldown.size() };
+    },
+    intervalMs: knowledgeAutoSaveConfig.intervalMs,
+    logger,
+    getCooldownMapSize: () => knowledgeAutoSaveFailureCooldown.size(),
+  });
+  if (knowledgeAutoSaveConfig.enabled) {
+    knowledgeAutoSaveScheduler.start();
+  }
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
@@ -982,6 +1029,7 @@ export async function createApp(
         importTransferSweepTimer = null;
       }
       await memoryCandidateReconcilerScheduler.stop();
+      await knowledgeAutoSaveScheduler.stop();
       devWatcher?.close();
       viteHtmlRenderer?.dispose();
       void viteDevServer?.close().catch(() => undefined);

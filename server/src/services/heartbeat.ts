@@ -3402,9 +3402,11 @@ export async function revokeHeartbeatRunGatewayTokens(input: {
     ));
 }
 
+const LOCAL_STDIO_RUNTIME_MCP_ADAPTERS = new Set(["claude_local"]);
+
 export async function buildPaperclipRuntimeMcpServers(input: {
   db: Db;
-  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name">;
+  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name" | "adapterType">;
   runId: string;
 }): Promise<AdapterRuntimeMcpServer[]> {
   const effective = await toolAccessService(input.db).getEffectiveProfilesForAgent(
@@ -3439,7 +3441,10 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     permittedConnectionIds.has(connection.id)
     && connection.status === "active"
     && connection.enabled
-    && connection.transport === "mcp_remote"
+    && (
+      connection.transport === "mcp_remote"
+      || (connection.transport === "local_stdio" && LOCAL_STDIO_RUNTIME_MCP_ADAPTERS.has(input.agent.adapterType))
+    )
   );
   const service = createToolGatewayService(input.db);
   if (uniqueConnections.length === 0) {

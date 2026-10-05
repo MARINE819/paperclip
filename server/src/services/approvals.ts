@@ -1,12 +1,14 @@
-import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvalComments, approvals } from "@paperclipai/db";
+import { approvalComments, approvals, companies } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
+import { logger } from "../middleware/logger.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { webPushService } from "./web-push-service.js";
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -120,6 +122,46 @@ export function approvalService(db: Db) {
     );
   }
 
+  // Best-effort Web Push for a newly-created approval. Never throws — a
+  // push failure (unconfigured VAPID, dead subscription, network error) must
+  // never affect the approval that was already successfully inserted.
+  // Payload is deliberately minimal (approval id/type/title only) — never
+  // includes payload contents that might carry secrets/tokens.
+  async function notifyNewApprovalBestEffort(approval: typeof approvals.$inferSelect) {
+    try {
+      const pushSvc = webPushService(db);
+      if (!pushSvc.isAvailable()) return;
+
+      const [company] = await db
+        .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
+        .from(companies)
+        .where(eq(companies.id, approval.companyId));
+      const userId = company?.defaultResponsibleUserId ?? "local-board";
+
+      const payload = (approval.payload ?? {}) as Record<string, unknown>;
+      const title =
+        typeof payload.title === "string" && payload.title.trim().length > 0
+          ? payload.title
+          : "New approval requires your review";
+
+      await pushSvc.sendNotificationToUser({
+        companyId: approval.companyId,
+        userId,
+        notification: {
+          title,
+          body: `Type: ${approval.type}`,
+          url: `/mobile/approvals/${approval.id}`,
+          tag: `approval-${approval.id}`,
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, approvalId: approval.id },
+        "Best-effort approval push notification failed; approval creation is unaffected",
+      );
+    }
+  }
+
   return {
     list: (companyId: string, status?: string) => {
       const conditions = [eq(approvals.companyId, companyId)];
@@ -130,7 +172,7 @@ export function approvalService(db: Db) {
           if (notExpired) conditions.push(notExpired);
         }
       }
-      return db.select().from(approvals).where(and(...conditions));
+      return db.select().from(approvals).where(and(...conditions)).orderBy(desc(approvals.createdAt));
     },
 
     getById: (id: string) =>
@@ -155,12 +197,19 @@ export function approvalService(db: Db) {
       return rows[0] ?? null;
     },
 
-    create: (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) =>
-      db
+    create: async (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) => {
+      const [row] = await db
         .insert(approvals)
         .values({ ...data, companyId })
-        .returning()
-        .then((rows) => rows[0]),
+        .returning();
+      if (row) {
+        // Awaited (not fire-and-forget) so the outcome is deterministic for
+        // callers/tests, but notifyNewApprovalBestEffort itself never throws
+        // — a push failure cannot fail approval creation.
+        await notifyNewApprovalBestEffort(row);
+      }
+      return row;
+    },
 
     // Cancel an open (pending/revision_requested) approval without a board
     // decision — e.g. when its paired agent is terminated during duplicate

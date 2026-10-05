@@ -163,7 +163,17 @@ async function waitReady(seconds = 90) {
 async function once({ recover = true } = {}) {
   const apiOk = await apiReady();
   const dbOk = await dbReady();
-  record(lifecycle, "probe", { apiReady: apiOk, databaseReady: dbOk });
+  // Probed and recorded as separate dimensions: the app (3100) and the
+  // embedded Postgres cluster (54329) are independent processes, and a live
+  // DB must not mask an app-only outage (see recovery-policy.mjs).
+  const appPortOpenNow = await portOpen(3100);
+  const dbPortOpenNow = await portOpen(54329);
+  record(lifecycle, "probe", {
+    apiReady: apiOk,
+    databaseReady: dbOk,
+    appPortOpen: appPortOpenNow,
+    dbPortOpen: dbPortOpenNow,
+  });
   if (apiOk && dbOk) {
     if (state.attempts) {
       state = { attempts: 0, nextAttemptAt: 0 }; await saveState();
@@ -172,9 +182,16 @@ async function once({ recover = true } = {}) {
     return true;
   }
   if (!recover) return false;
-  const action = recoveryAction({ ready: false, runtimeAlive: runtimeAlive(),
-    portOpen: (await portOpen(3100)) || (await portOpen(54329)),
-    attempts: state.attempts, now: Date.now(), nextAttemptAt: state.nextAttemptAt });
+  const action = recoveryAction({
+    apiReady: apiOk,
+    dbReady: dbOk,
+    runtimeAlive: runtimeAlive(),
+    appPortOpen: appPortOpenNow,
+    dbPortOpen: dbPortOpenNow,
+    attempts: state.attempts,
+    now: Date.now(),
+    nextAttemptAt: state.nextAttemptAt,
+  });
   if (action !== "start") {
     if (action === "exhausted") {
       alert("RECOVERY_CYCLE_PAUSED", { component: "control-plane", retryMinutes: 5 });

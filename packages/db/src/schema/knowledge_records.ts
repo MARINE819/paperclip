@@ -3,6 +3,8 @@ import {
   pgTable,
   uuid,
   text,
+  integer,
+  real,
   timestamp,
   index,
   uniqueIndex,
@@ -11,6 +13,7 @@ import {
 import type {
   KnowledgeRecordStatus,
   ObsidianSyncState,
+  KnowledgeSyncState,
 } from "@paperclipai/shared";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
@@ -54,6 +57,28 @@ export const knowledgeRecords = pgTable(
       .default("pending"),
     obsidianSyncError: text("obsidian_sync_error"),
     obsidianSyncedAt: timestamp("obsidian_synced_at", { withTimezone: true }),
+    // F-08 Pluggable Knowledge Backend — generic counterparts of the four
+    // obsidian* columns above, written alongside them during this
+    // compatibility phase (additive only; the obsidian* columns are not
+    // renamed or dropped). See
+    // docs/contracts/nexora-f08-knowledge-backend-architecture.md.
+    externalBackendId: text("external_backend_id"),
+    externalSyncState: text("external_sync_state").$type<KnowledgeSyncState>(),
+    externalSyncError: text("external_sync_error"),
+    externalSyncedAt: timestamp("external_synced_at", { withTimezone: true }),
+    externalRef: text("external_ref"),
+    // M2-03-B01 Knowledge Revision & Confidence Hardening — additive only.
+    // confidence is carried through unchanged from memory_operations.confidence
+    // at promotion time (see knowledge.ts promoteMemoryOperation) and is never
+    // auto-increased by a later revision that lacks independent new evidence.
+    confidence: real("confidence"),
+    // revisionNumber starts at 1 on every row (existing pre-B01 rows are valid
+    // as "revision 1 of themselves" with no backfill needed). latestRevisionId
+    // is nullable only until the one-time backfill described in the batch
+    // report; every row created from this point forward sets it in the same
+    // transaction as the row itself.
+    latestRevisionId: uuid("latest_revision_id"),
+    revisionNumber: integer("revision_number").notNull().default(1),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

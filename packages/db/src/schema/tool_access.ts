@@ -265,6 +265,15 @@ export const toolCatalogEntries = pgTable(
     reviewedByUserId: text("reviewed_by_user_id"),
     quarantinedAt: timestamp("quarantined_at", { withTimezone: true }),
     quarantineReason: text("quarantine_reason"),
+    // F-05 Trust Registry additions — provenance/integrity metadata this
+    // table had no prior concept of. `signatureVerified` defaults false and
+    // no code path anywhere sets it true automatically; a signature is only
+    // ever "verified" through an explicit future verification step, never
+    // inferred from its mere presence. See
+    // server/src/services/tool-trust-registry.ts.
+    signature: text("signature"),
+    signatureVerified: boolean("signature_verified").notNull().default(false),
+    sourceUrl: text("source_url"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

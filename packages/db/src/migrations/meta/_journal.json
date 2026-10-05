@@ -1618,6 +1618,69 @@
       "when": 1787877673199,
       "tag": "0232_absurd_annihilus",
       "breakpoints": true
+    },
+    {
+      "idx": 233,
+      "version": "7",
+      "when": 1789648805114,
+      "tag": "0233_zippy_johnny_storm",
+      "breakpoints": true
+    },
+    {
+      "idx": 234,
+      "version": "7",
+      "when": 1789969261999,
+      "tag": "0234_broken_ikaris",
+      "breakpoints": true
+    },
+    {
+      "idx": 235,
+      "version": "7",
+      "when": 1790757038344,
+      "tag": "0235_colossal_psynapse",
+      "breakpoints": true
+    },
+    {
+      "idx": 236,
+      "version": "7",
+      "when": 1790761530777,
+      "tag": "0236_normal_dark_beast",
+      "breakpoints": true
+    },
+    {
+      "idx": 237,
+      "version": "7",
+      "when": 1790769368796,
+      "tag": "0237_fluffy_doorman",
+      "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "version": "7",
+      "when": 1790775891882,
+      "tag": "0238_brief_white_queen",
+      "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "7",
+      "when": 1790842376414,
+      "tag": "0239_brainy_pretty_boy",
+      "breakpoints": true
+    },
+    {
+      "idx": 240,
+      "version": "7",
+      "when": 1790865392250,
+      "tag": "0240_hesitant_carlie_cooper",
+      "breakpoints": true
+    },
+    {
+      "idx": 241,
+      "version": "7",
+      "when": 1791174914930,
+      "tag": "0241_chief_puff_adder",
+      "breakpoints": true
     }
   ]
 }

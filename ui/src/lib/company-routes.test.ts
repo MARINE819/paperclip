@@ -114,6 +114,19 @@ describe("company routes", () => {
     expect(extractCompanyPrefixFromPath("/attention")).toBe("ATTENTION");
   });
 
+  // Regression: /ai-office was missing from the board-route allowlist, so
+  // extractCompanyPrefixFromPath misread "ai-office" itself as the company
+  // prefix and applyCompanyPrefix skipped the rewrite, sending users to
+  // "/ai-office" (no real prefix) and surfacing a "no organization matches
+  // prefix 'AI-OFFICE'" error instead of opening the AI Office page.
+  it("treats /ai-office as a board route that needs a company prefix", () => {
+    expect(isBoardPathWithoutPrefix("/ai-office")).toBe(true);
+    expect(extractCompanyPrefixFromPath("/ai-office")).toBeNull();
+    expect(applyCompanyPrefix("/ai-office", "NEXORA")).toBe("/NEXORA/ai-office");
+    expect(applyCompanyPrefix("/NEXORA/ai-office", "NEXORA")).toBe("/NEXORA/ai-office");
+    expect(toCompanyRelativePath("/NEXORA/ai-office")).toBe("/ai-office");
+  });
+
   it("treats /timeline as a board route that needs a company prefix", () => {
     expect(isBoardPathWithoutPrefix("/timeline")).toBe(true);
     expect(extractCompanyPrefixFromPath("/timeline")).toBeNull();

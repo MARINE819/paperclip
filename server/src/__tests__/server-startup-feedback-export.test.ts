@@ -469,19 +469,25 @@ describe("startServer feedback export wiring", () => {
   });
 
   it("keeps routine ticks and setup cleanup active when heartbeat scheduling is suppressed", async () => {
-    loadConfigMock.mockReturnValue(buildTestConfig({
+    const testConfig = buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
-    }));
+    });
+    loadConfigMock.mockReturnValue(testConfig);
     resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
       suppressed: true,
       reason: "worktree_instance",
     });
-    let intervalCallback: (() => void) | null = null;
+    // startServer() registers more than one setInterval (e.g. the
+    // restart-control watcher alongside the heartbeat scheduler), so every
+    // registration is captured and the heartbeat one is identified by the
+    // delay it was actually started with, rather than assuming it is the
+    // only (or the last) setInterval call.
+    const registeredIntervals: Array<{ callback: () => void; delayMs: number | undefined }> = [];
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delayMs?: number) => {
+        registeredIntervals.push({ callback, delayMs });
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -492,7 +498,11 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
 
-      expect(intervalCallback).not.toBeNull();
+      const heartbeatInterval = registeredIntervals.find(
+        (entry) => entry.delayMs === testConfig.heartbeatSchedulerIntervalMs,
+      );
+      expect(heartbeatInterval).toBeDefined();
+      const intervalCallback = heartbeatInterval?.callback ?? null;
       intervalCallback?.();
       await Promise.resolve();
       await Promise.resolve();
@@ -509,15 +519,21 @@ describe("startServer feedback export wiring", () => {
   });
 
   it("keeps external object refresh active when heartbeat scheduling is disabled", async () => {
-    loadConfigMock.mockReturnValue(buildTestConfig({
+    const testConfig = buildTestConfig({
       heartbeatSchedulerEnabled: false,
       heartbeatSchedulerIntervalMs: 30000,
-    }));
-    let intervalCallback: (() => void) | null = null;
+    });
+    loadConfigMock.mockReturnValue(testConfig);
+    // startServer() registers more than one setInterval (e.g. the
+    // restart-control watcher alongside the heartbeat scheduler), so every
+    // registration is captured and the heartbeat one is identified by the
+    // delay it was actually started with, rather than assuming it is the
+    // only (or the last) setInterval call.
+    const registeredIntervals: Array<{ callback: () => void; delayMs: number | undefined }> = [];
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delayMs?: number) => {
+        registeredIntervals.push({ callback, delayMs });
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -529,7 +545,11 @@ describe("startServer feedback export wiring", () => {
       // reaped at startup and on the interval.
       expect(heartbeatServiceFactoryMock).toHaveBeenCalledTimes(1);
       expect(heartbeatServiceMock.sweepPendingCleanupLeases).toHaveBeenCalled();
-      expect(intervalCallback).not.toBeNull();
+      const heartbeatInterval = registeredIntervals.find(
+        (entry) => entry.delayMs === testConfig.heartbeatSchedulerIntervalMs,
+      );
+      expect(heartbeatInterval).toBeDefined();
+      const intervalCallback = heartbeatInterval?.callback ?? null;
       intervalCallback?.();
       await Promise.resolve();
       await Promise.resolve();

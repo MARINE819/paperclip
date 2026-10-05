@@ -21,6 +21,7 @@ import {
   issueReadStates,
   issueRelations,
   issueThreadInteractions,
+  issueWorkProducts,
   issues,
   projectWorkspaces,
   projects,
@@ -31,6 +32,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { workProductService } from "../services/work-products.ts";
 import {
   clampIssueListLimit,
   deriveIssueCommentRunLogAttribution,
@@ -6556,6 +6558,136 @@ describeEmbeddedPostgres("accepted plan decomposition", () => {
     );
     expect(record).not.toHaveProperty("requestedChildren");
     expect(record?.childIssues.every((child) => typeof child.title === "string")).toBe(true);
+  });
+});
+
+describeEmbeddedPostgres("issueService.update() agent DONE evidence gate", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-done-evidence-gate-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueWorkProducts);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyAgentAndIssue() {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Some issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId,
+    });
+    return { companyId, assigneeAgentId, issueId };
+  }
+
+  it("(A) blocks an agent-initiated DONE transition when no work product exists", async () => {
+    const { issueId, assigneeAgentId } = await seedCompanyAgentAndIssue();
+    await expect(
+      svc.update(issueId, { status: "done", actorAgentId: assigneeAgentId }),
+    ).rejects.toMatchObject({ status: 409, details: { code: "agent_done_requires_evidence" } });
+    const after = await svc.getById(issueId);
+    expect(after?.status).not.toBe("done");
+  });
+
+  it("(B) blocks an agent-initiated DONE transition when the only evidence is rejected/incomplete", async () => {
+    const { issueId, assigneeAgentId, companyId } = await seedCompanyAgentAndIssue();
+    await workProductService(db).createForIssue(issueId, companyId, {
+      type: "document",
+      provider: "manual",
+      title: "Bad evidence",
+      status: "failed",
+    });
+    await expect(
+      svc.update(issueId, { status: "done", actorAgentId: assigneeAgentId }),
+    ).rejects.toMatchObject({ status: 409, details: { code: "agent_done_requires_evidence" } });
+  });
+
+  it("(C) allows an agent-initiated DONE transition once accepted evidence exists", async () => {
+    const { issueId, assigneeAgentId, companyId } = await seedCompanyAgentAndIssue();
+    await workProductService(db).createForIssue(issueId, companyId, {
+      type: "document",
+      provider: "manual",
+      title: "Good evidence",
+      status: "ready",
+      url: "https://example.test/evidence",
+    });
+    const updated = await svc.update(issueId, { status: "done", actorAgentId: assigneeAgentId });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("(D) leaves human-actor completion unaffected when there is no evidence", async () => {
+    const { issueId } = await seedCompanyAgentAndIssue();
+    const updated = await svc.update(issueId, { status: "done", actorUserId: randomUUID() });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("(E) blocks a child issue's unvalidated agent self-completion", async () => {
+    const { companyId, assigneeAgentId } = await seedCompanyAgentAndIssue();
+    const parentId = randomUUID();
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      title: "Parent",
+      status: "in_progress",
+      priority: "medium",
+    });
+    const childId = randomUUID();
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      parentId,
+      title: "Child",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId,
+    });
+    await expect(
+      svc.update(childId, { status: "done", actorAgentId: assigneeAgentId }),
+    ).rejects.toMatchObject({ status: 409, details: { code: "agent_done_requires_evidence" } });
+  });
+
+  it("(F) blocks a standalone issue's unvalidated agent self-completion", async () => {
+    const { issueId, assigneeAgentId } = await seedCompanyAgentAndIssue();
+    await expect(
+      svc.update(issueId, { status: "done", actorAgentId: assigneeAgentId }),
+    ).rejects.toMatchObject({ status: 409, details: { code: "agent_done_requires_evidence" } });
   });
 });
 

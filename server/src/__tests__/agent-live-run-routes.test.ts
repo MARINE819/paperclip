@@ -1,9 +1,16 @@
+import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { agents, companies, createDb, heartbeatRuns, orgUnits } from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
+  orgUnitStatusForCompany: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -591,6 +598,51 @@ describe("agent live run routes", () => {
     expect(db.select).toHaveBeenCalledTimes(2);
   });
 
+  it("returns the org unit status list from the service unchanged", async () => {
+    mockAgentService.orgUnitStatusForCompany.mockResolvedValue([
+      {
+        orgUnitId: "org-unit-1",
+        name: "Engineering",
+        agentCount: 3,
+        activeCount: 1,
+        runningCount: 1,
+        errorCount: 0,
+        currentTaskCount: 1,
+      },
+    ]);
+
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/companies/company-1/org-units/status"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.orgUnitStatusForCompany).toHaveBeenCalledWith("company-1");
+    expect(res.body).toEqual([
+      {
+        orgUnitId: "org-unit-1",
+        name: "Engineering",
+        agentCount: 3,
+        activeCount: 1,
+        runningCount: 1,
+        errorCount: 0,
+        currentTaskCount: 1,
+      },
+    ]);
+  });
+
+  it("returns an empty array when the company has no org units", async () => {
+    mockAgentService.orgUnitStatusForCompany.mockResolvedValue([]);
+
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/companies/company-1/org-units/status"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+
   it("passes scoped wake fields through the legacy heartbeat invoke route", async () => {
     const res = await requestApp(
       await createApp(),
@@ -651,5 +703,161 @@ describe("agent live run routes", () => {
         actorId: "local-board",
       },
     });
+  });
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+describeEmbeddedPostgres("agentService.orgUnitStatusForCompany (Stage 9 Phase 9.3)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeEach(async () => {
+    // The mocked-route describe block above leaves `../services/agents.js`
+    // doMock'd with no cleanup of its own. Vite resolves that specifier to
+    // the same module record as this block's `../services/agents.ts` import,
+    // so without explicitly unmocking here, this block would silently import
+    // the stale mock (always returning whatever it last resolved) instead of
+    // the real service — proven by real-DB seeded rows returning [] until
+    // this fix was added.
+    vi.doUnmock("../services/agents.js");
+    vi.resetModules();
+    tempDb = await startEmbeddedPostgresTestDatabase("agent-org-unit-status-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await tempDb?.cleanup();
+    tempDb = null;
+  });
+
+  async function seedCompany(label: string) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: `${label} Co`,
+      issuePrefix: `OU${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    return companyId;
+  }
+
+  async function seedOrgUnit(companyId: string, name: string) {
+    const id = randomUUID();
+    await db.insert(orgUnits).values({ id, companyId, name });
+    return id;
+  }
+
+  async function seedAgent(companyId: string, orgUnitId: string | null, status: string) {
+    const id = randomUUID();
+    await db.insert(agents).values({
+      id,
+      companyId,
+      name: `Agent ${id.slice(0, 8)}`,
+      role: "engineer",
+      status,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      orgUnitId,
+    });
+    return id;
+  }
+
+  async function seedLiveRun(companyId: string, agentId: string, issueId: string | null) {
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: issueId ? { issueId } : {},
+    });
+  }
+
+  it("returns 'No departments configured.'-equivalent empty array when the company has no org units", async () => {
+    const { agentService } = await import("../services/agents.ts");
+    const companyId = await seedCompany("Empty");
+
+    const result = await agentService(db).orgUnitStatusForCompany(companyId);
+
+    expect(result).toEqual([]);
+  });
+
+  it("reports zero counts for a department with no agents", async () => {
+    const { agentService } = await import("../services/agents.ts");
+    const companyId = await seedCompany("NoAgents");
+    const orgUnitId = await seedOrgUnit(companyId, "Empty Dept");
+
+    const result = await agentService(db).orgUnitStatusForCompany(companyId);
+
+    expect(result).toEqual([
+      { orgUnitId, name: "Empty Dept", agentCount: 0, activeCount: 0, runningCount: 0, errorCount: 0, currentTaskCount: 0 },
+    ]);
+  });
+
+  it("counts mixed agent statuses (active/idle/error) correctly with no double counting", async () => {
+    const { agentService } = await import("../services/agents.ts");
+    const companyId = await seedCompany("Mixed");
+    const orgUnitId = await seedOrgUnit(companyId, "Mixed Dept");
+    await seedAgent(companyId, orgUnitId, "active");
+    await seedAgent(companyId, orgUnitId, "idle");
+    await seedAgent(companyId, orgUnitId, "error");
+
+    const [status] = await agentService(db).orgUnitStatusForCompany(companyId);
+
+    expect(status.agentCount).toBe(3);
+    expect(status.activeCount).toBe(1);
+    expect(status.errorCount).toBe(1);
+    expect(status.runningCount).toBe(0);
+  });
+
+  it("counts runningCount from live heartbeat runs (queued/running), not from agent.status", async () => {
+    const { agentService } = await import("../services/agents.ts");
+    const companyId = await seedCompany("Running");
+    const orgUnitId = await seedOrgUnit(companyId, "Running Dept");
+    const idleAgentWithLiveRun = await seedAgent(companyId, orgUnitId, "idle");
+    await seedAgent(companyId, orgUnitId, "idle");
+    await seedLiveRun(companyId, idleAgentWithLiveRun, "issue-1");
+
+    const [status] = await agentService(db).orgUnitStatusForCompany(companyId);
+
+    expect(status.runningCount).toBe(1);
+  });
+
+  it("counts currentTaskCount as distinct issueId across the department, falling back to runId when issueId is absent", async () => {
+    const { agentService } = await import("../services/agents.ts");
+    const companyId = await seedCompany("Tasks");
+    const orgUnitId = await seedOrgUnit(companyId, "Tasks Dept");
+    const agentA = await seedAgent(companyId, orgUnitId, "idle");
+    const agentB = await seedAgent(companyId, orgUnitId, "idle");
+    // Two runs on the same issue must count as one task, not two.
+    await seedLiveRun(companyId, agentA, "issue-shared");
+    await seedLiveRun(companyId, agentB, "issue-shared");
+    // A run with no issueId (ad-hoc prompt) must still count as its own task.
+    await seedLiveRun(companyId, agentB, null);
+
+    const [status] = await agentService(db).orgUnitStatusForCompany(companyId);
+
+    expect(status.currentTaskCount).toBe(2);
+    expect(status.runningCount).toBe(2);
+  });
+
+  it("never leaks another company's org units or agents into the result", async () => {
+    const { agentService } = await import("../services/agents.ts");
+    const companyA = await seedCompany("A");
+    const companyB = await seedCompany("B");
+    const orgUnitA = await seedOrgUnit(companyA, "Dept A");
+    await seedOrgUnit(companyB, "Dept B");
+    await seedAgent(companyA, orgUnitA, "active");
+    await seedAgent(companyB, null, "active");
+
+    const resultA = await agentService(db).orgUnitStatusForCompany(companyA);
+
+    expect(resultA).toHaveLength(1);
+    expect(resultA[0].name).toBe("Dept A");
+    expect(resultA[0].agentCount).toBe(1);
   });
 });

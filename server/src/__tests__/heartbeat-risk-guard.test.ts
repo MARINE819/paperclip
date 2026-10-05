@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { agents, approvals, companies, createDb, heartbeatRuns, issueApprovals, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -8,6 +10,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { classifyPreExecutionRisk, heartbeatService } from "../services/heartbeat.ts";
 import { consumeApproval } from "../services/approval-lifecycle.js";
+import { approvalRoutes } from "../routes/approvals.js";
+import { errorHandler } from "../middleware/error-handler.js";
 
 const adapterExecute = vi.hoisted(() => vi.fn(async () => ({
   exitCode: 0,
@@ -20,13 +24,13 @@ const adapterExecute = vi.hoisted(() => vi.fn(async () => ({
 })));
 
 vi.mock("../adapters/index.js", () => ({
-  getServerAdapter: () => ({
-    type: "codex_local",
+  getServerAdapter: (adapterType?: string) => ({
+    type: adapterType || "codex_local",
     execute: adapterExecute,
     supportsLocalAgentJwt: false,
   }),
-  findActiveServerAdapter: () => ({
-    type: "codex_local",
+  findActiveServerAdapter: (adapterType?: string) => ({
+    type: adapterType || "codex_local",
     execute: adapterExecute,
     supportsLocalAgentJwt: false,
   }),
@@ -333,11 +337,427 @@ describeEmbeddedPostgres("Heartbeat Risk Guard wake payload execution", () => {
       .then((rows) => rows[0] ?? null);
     expect(linkedApproval).not.toBeNull();
   }, 15_000);
+
+  it("keeps the agent idle (not error) after Risk Guard intercepts a HIGH-risk task pending human approval", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Risk Guard Idle-Not-Error Company",
+      issuePrefix: `RI${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RiskGuardIdleNotErrorCodex",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier: `RI-${issueId.slice(0, 8)}`,
+      title: "Update security permissions",
+      description: "Change production security permissions for customer accounts.",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId, prompt: "Change production security permissions for customer accounts." },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    });
+
+    expect(queued).not.toBeNull();
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("failed");
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    const resultJson = finished?.resultJson as Record<string, unknown>;
+    expect(resultJson.errorFamily).toBe("human_intervention_required");
+
+    // finalizeAgentStatus() runs after the run row itself is written terminal,
+    // so poll briefly rather than assume the agent row has already settled
+    // (same pattern used by the generic-empty-timer-wake test above).
+    let agentRow = await db.select().from(agents).where(eq(agents.id, agentId)).then((r) => r[0]);
+    const agentDeadline = Date.now() + 3_000;
+    while (agentRow?.status === "running" && Date.now() < agentDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      agentRow = await db.select().from(agents).where(eq(agents.id, agentId)).then((r) => r[0]);
+    }
+    expect(agentRow?.status).toBe("idle");
+    expect(agentRow?.errorReason).toBeNull();
+  }, 15_000);
+
+  it("still marks the agent error for a genuine adapter crash (not a Risk Guard interception)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Risk Guard Genuine Error Company",
+      issuePrefix: `RE${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RiskGuardGenuineErrorCodex",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // LOW-risk task text so Risk Guard does not intercept and adapter.execute()
+    // is actually reached — the crash must come from the adapter itself, not
+    // from Risk Guard, to prove the fix does not mask real failures.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier: `RE-${issueId.slice(0, 8)}`,
+      title: "Read the current status report",
+      description: "Please summarize the current status for review.",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+
+    // Persistent (not "once") failure: heartbeat.ts auto-retries a genuine
+    // adapter crash via scheduleInteractionContinuationInfrastructureRetryIfEligible,
+    // and a retry that happens to succeed correctly returns the agent to
+    // "idle" (the system healed itself) — that is desired behavior, not a
+    // regression. To prove a persistently-failing agent still lands in
+    // "error", every attempt (the original run and any auto-retry) must fail.
+    adapterExecute.mockImplementation(async () => {
+      throw new Error("Simulated adapter crash — genuine runtime failure");
+    });
+
+    try {
+      const heartbeat = heartbeatService(db);
+      const queued = await heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        payload: { issueId, prompt: "Please summarize the current status for review." },
+        requestedByActorType: "user",
+        requestedByActorId: "responsible-user",
+      });
+
+      expect(queued).not.toBeNull();
+      const finished = await waitForRunToFinish(heartbeat, queued!.id);
+      expect(finished?.status).toBe("failed");
+      expect(adapterExecute.mock.calls.length).toBeGreaterThanOrEqual(1);
+
+      let agentRow = await db.select().from(agents).where(eq(agents.id, agentId)).then((r) => r[0]);
+      const agentDeadline = Date.now() + 5_000;
+      while (agentRow?.status === "running" && Date.now() < agentDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        agentRow = await db.select().from(agents).where(eq(agents.id, agentId)).then((r) => r[0]);
+      }
+      expect(agentRow?.status).toBe("error");
+      expect(agentRow?.errorReason).toBeTruthy();
+    } finally {
+      // Restore the shared mock's default success behavior so later tests
+      // in this file are unaffected.
+      adapterExecute.mockImplementation(async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        sessionParams: { sessionId: "risk-guard-session" },
+        sessionDisplayId: "risk-guard-session",
+        provider: "test",
+        model: "test-model",
+      }));
+    }
+  }, 15_000);
+
+  it("PROMPT-01: an explicit wake payload.prompt reaches the actual Claude-visible task markdown", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const explicitPrompt =
+      "Call append_rows EXACTLY once with spreadsheetId TEST_SHEET, range Envelope-Test!A1:C1, and values [[\"a\",\"b\",\"c\"]].";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Prompt Delivery Company",
+      issuePrefix: `PD${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "PromptDeliveryCodex",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier: `PD-${issueId.slice(0, 8)}`,
+      title: "Read the current status report",
+      description: "Please summarize the current status for review.",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId, prompt: explicitPrompt },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    });
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+
+    const callArgs = adapterExecute.mock.calls[0][0] as { context?: Record<string, unknown> };
+    const markdown = String(callArgs.context?.paperclipTaskMarkdown ?? "");
+    expect(markdown).toContain("Envelope-Test!A1:C1");
+    expect(markdown).toContain("Explicit wake instruction for this run:");
+  }, 15_000);
+
+  it("PROMPT-02: a wake with no explicit prompt renders no 'Explicit wake instruction' section", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Prompt Delivery Promptless Company",
+      issuePrefix: `PP${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "PromptlessCodex",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier: `PP-${issueId.slice(0, 8)}`,
+      title: "Read the current status report",
+      description: "Please summarize the current status for review.",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    });
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+
+    const callArgs = adapterExecute.mock.calls[0][0] as { context?: Record<string, unknown> };
+    const markdown = String(callArgs.context?.paperclipTaskMarkdown ?? "");
+    expect(markdown).not.toContain("Explicit wake instruction for this run:");
+    expect(markdown).toContain("Please summarize the current status for review.");
+  }, 15_000);
+
+  it("PROMPT-04: issue description and explicit prompt are both preserved together", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const explicitPrompt = "Use exact value MARKER-EXPLICIT-PROMPT-42 when reporting back.";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Prompt Delivery Both Company",
+      issuePrefix: `PB${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "PromptBothCodex",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier: `PB-${issueId.slice(0, 8)}`,
+      title: "Read the current status report",
+      description: "MARKER-ISSUE-DESCRIPTION-99: please summarize the current status for review.",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId, prompt: explicitPrompt },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    });
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+
+    const callArgs = adapterExecute.mock.calls[0][0] as { context?: Record<string, unknown> };
+    const markdown = String(callArgs.context?.paperclipTaskMarkdown ?? "");
+    expect(markdown).toContain("MARKER-ISSUE-DESCRIPTION-99");
+    expect(markdown).toContain("MARKER-EXPLICIT-PROMPT-42");
+  }, 15_000);
+
+  it("PROMPT-05: two concurrent runs' explicit prompts do not leak into each other", async () => {
+    const companyId = randomUUID();
+    const agentIdA = randomUUID();
+    const agentIdB = randomUUID();
+    const issueIdA = randomUUID();
+    const issueIdB = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Prompt Delivery Isolation Company",
+      issuePrefix: `PI${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: agentIdA,
+        companyId,
+        name: "PromptIsolationCodexA",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: agentIdB,
+        companyId,
+        name: "PromptIsolationCodexB",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: issueIdA,
+        companyId,
+        identifier: `PI-${issueIdA.slice(0, 8)}`,
+        title: "Read status A",
+        description: "Please summarize status A.",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentIdA,
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: issueIdB,
+        companyId,
+        identifier: `PI-${issueIdB.slice(0, 8)}`,
+        title: "Read status B",
+        description: "Please summarize status B.",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentIdB,
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const queuedA = await heartbeat.wakeup(agentIdA, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId: issueIdA, prompt: "MARKER-RUN-A-ONLY" },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    });
+    const finishedA = await waitForRunToFinish(heartbeat, queuedA!.id);
+    expect(finishedA?.status).toBe("succeeded");
+
+    const queuedB = await heartbeat.wakeup(agentIdB, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId: issueIdB, prompt: "MARKER-RUN-B-ONLY" },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    });
+    const finishedB = await waitForRunToFinish(heartbeat, queuedB!.id);
+    expect(finishedB?.status).toBe("succeeded");
+
+    expect(adapterExecute).toHaveBeenCalledTimes(2);
+    const markdownA = String((adapterExecute.mock.calls[0][0] as { context?: Record<string, unknown> }).context?.paperclipTaskMarkdown ?? "");
+    const markdownB = String((adapterExecute.mock.calls[1][0] as { context?: Record<string, unknown> }).context?.paperclipTaskMarkdown ?? "");
+    expect(markdownA).toContain("MARKER-RUN-A-ONLY");
+    expect(markdownA).not.toContain("MARKER-RUN-B-ONLY");
+    expect(markdownB).toContain("MARKER-RUN-B-ONLY");
+    expect(markdownB).not.toContain("MARKER-RUN-A-ONLY");
+  }, 15_000);
 });
 
 describeEmbeddedPostgres("Heartbeat Risk Guard — Approval Lifecycle Security integration (consumeApproval, retry-chain root)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  // drainActiveRunExecutions() closes over heartbeat.ts's module-level
+  // activeWakeupPromises/activeRunExecutionPromises Sets, not over `db`, so
+  // any heartbeatService(db) instance can drain them. Kept at describe scope
+  // purely so afterEach can reach it before tearing down tempDb.
+  let heartbeat!: ReturnType<typeof heartbeatService>;
 
   // Several of these tests call resumeQueuedRuns() (which scans queued runs
   // GLOBALLY, not scoped to one company) and exercise executeRun's full
@@ -352,6 +772,7 @@ describeEmbeddedPostgres("Heartbeat Risk Guard — Approval Lifecycle Security i
   beforeEach(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-risk-guard-lifecycle-");
     db = createDb(tempDb.connectionString);
+    heartbeat = heartbeatService(db);
     adapterExecute.mockClear();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -365,6 +786,13 @@ describeEmbeddedPostgres("Heartbeat Risk Guard — Approval Lifecycle Security i
   }, 20_000);
 
   afterEach(async () => {
+    // Drain every in-flight wakeup/run execution (including any a test's own
+    // retry/continuity chain cascaded into) before tearing down tempDb, so a
+    // still-settling background execution never races this describe block's
+    // next beforeEach/test against a torn-down connection. See the Set
+    // declarations and drainActiveRunExecutions() in heartbeat.ts for why
+    // this exists.
+    await heartbeat?.drainActiveRunExecutions();
     await tempDb?.cleanup();
     tempDb = null;
   });
@@ -380,7 +808,11 @@ describeEmbeddedPostgres("Heartbeat Risk Guard — Approval Lifecycle Security i
   // below, copying contextSnapshot verbatim and setting retryOfRunId only
   // where a test explicitly means "same retry chain".
 
-  async function seedCompanyAgentIssue(label: string, description = "Change production security permissions for customer accounts.") {
+  async function seedCompanyAgentIssue(
+    label: string,
+    description = "Change production security permissions for customer accounts.",
+    adapterType = "codex_local",
+  ) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -396,10 +828,10 @@ describeEmbeddedPostgres("Heartbeat Risk Guard — Approval Lifecycle Security i
     await db.insert(agents).values({
       id: agentId,
       companyId,
-      name: `${label}Codex`,
+      name: `${label}${adapterType}`,
       role: "engineer",
       status: "idle",
-      adapterType: "codex_local",
+      adapterType,
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
@@ -730,6 +1162,243 @@ describeEmbeddedPostgres("Heartbeat Risk Guard — Approval Lifecycle Security i
     expect(allApprovals.length).toBe(1);
   }, 20_000);
 
+  it("INVARIANT-01: a single Risk-Guard-blocked wake creates exactly one heartbeat run, one approval, and zero assignment_recovery children", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue("Invariant01");
+    const heartbeat = heartbeatService(db);
+
+    // No explicit second wake — this is the exact DEDUP-01 fixture shape
+    // (issue status "todo", no assigneeUserId, same assigned agent) that
+    // previously allowed releaseIssueExecutionAndPromote's
+    // issue_assignment_recovery branch to misfire on a Risk-Guard
+    // interception (heartbeat.ts:18228-18232).
+    const run1 = await wakeAndAwait(heartbeat, agentId, issueId);
+    expect(run1.status).toBe("failed");
+    expect(adapterExecute).not.toHaveBeenCalled();
+    const resultJson1 = run1.resultJson as Record<string, unknown>;
+    expect(resultJson1.approvalId).toBeDefined();
+
+    const allRunsForAgent = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(allRunsForAgent).toHaveLength(1);
+    for (const runRow of allRunsForAgent) {
+      const retryReason = (runRow.contextSnapshot as Record<string, unknown> | null)?.retryReason;
+      expect(retryReason).not.toBe("assignment_recovery");
+    }
+
+    const allApprovals = await findRiskGuardApproval(companyId, issueId);
+    expect(allApprovals.length).toBe(1);
+  }, 20_000);
+
+  it("INVARIANT-02 (positive control): a real adapter execution failure on the same todo/no-human-assignee shape still produces an assignment_recovery child run", async () => {
+    // seedCompanyAgentIssue hardcodes title "Update security permissions"
+    // (HIGH risk), which would route this through Risk Guard instead of the
+    // adapter. Seed a LOW-risk issue directly so this run actually reaches
+    // adapter.execute() and fails for a real (non-Risk-Guard) reason.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Invariant02 Company",
+      issuePrefix: `LC${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Invariant02codex_local",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier: `LC-${issueId.slice(0, 8)}`,
+      title: "Summarize recent activity",
+      description: "Read-only status check.",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+
+    adapterExecute.mockImplementationOnce(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "adapter_crashed",
+      summary: "Adapter process crashed unexpectedly.",
+    }));
+    const heartbeat = heartbeatService(db);
+
+    // wakeAndAwait() hardcodes a HIGH-risk prompt ("Change production
+    // security permissions..."), which would route this through Risk Guard
+    // instead of the adapter. Wake directly with a LOW-risk payload so this
+    // run actually reaches adapter.execute().
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId, prompt: "Summarize recent activity." },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    });
+    expect(queued).not.toBeNull();
+    const run1 = (await waitForRunToFinish(heartbeat, queued!.id))!;
+    expect(run1.status).toBe("failed");
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+
+    const recoveryChild = await waitForNewRun(agentId, run1.id);
+    expect(recoveryChild).not.toBeNull();
+    const recoveryContext = recoveryChild!.contextSnapshot as Record<string, unknown>;
+    expect(recoveryContext.retryReason).toBe("assignment_recovery");
+    expect(recoveryChild!.retryOfRunId).toBe(run1.id);
+  }, 20_000);
+
+  function createApprovalApp(companyId: string) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).actor = {
+        type: "board",
+        userId: "board-tester",
+        companyIds: [companyId],
+        source: "session",
+        isInstanceAdmin: true,
+      };
+      next();
+    });
+    app.use("/api", approvalRoutes(db));
+    app.use(errorHandler);
+    return app;
+  }
+
+  async function waitForNewRun(agentId: string, excludeRunId: string, timeoutMs = 5_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const [row] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId))
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(1);
+      if (row && row.id !== excludeRunId) return row;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("Timed out waiting for a new run to be created after approval");
+  }
+
+  it("RESUME-01: approving a Risk-Guard-intercepted run with a custom wake prompt replays the same prompt, preserves the fingerprint, and resumes to adapter execution without a duplicate approval", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue("Resume01");
+    const heartbeat = heartbeatService(db);
+    const customPrompt = "Change production security permissions for customer accounts. Use exact account ID ACC-42.";
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId, prompt: customPrompt },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    });
+    const intercepted = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(intercepted.status).toBe("failed");
+    expect(adapterExecute).not.toHaveBeenCalled();
+    const interceptedResult = intercepted.resultJson as Record<string, unknown>;
+    const approvalId = interceptedResult.approvalId as string;
+    expect(approvalId).toBeDefined();
+    const [approvalBefore] = await db.select().from(approvals).where(eq(approvals.id, approvalId));
+    const originalFingerprint = approvalBefore.taskFingerprint;
+
+    const app = createApprovalApp(companyId);
+    const approveResponse = await request(app).post(`/api/approvals/${approvalId}/approve`).send({});
+    expect(approveResponse.status).toBe(200);
+
+    const resumedRunRow = await waitForNewRun(agentId, intercepted.id);
+    const resumed = await waitForRunToFinish(heartbeat, resumedRunRow.id);
+
+    // The resumed run's own canonicalFingerprint (recomputed inside Risk
+    // Guard from the replayed prompt) must match what the human approved —
+    // proving the fix, not just its downstream effect.
+    const resumedApprovals = await findRiskGuardApproval(companyId, issueId);
+    expect(resumedApprovals).toHaveLength(1);
+    expect(resumedApprovals[0].id).toBe(approvalId);
+    expect(resumedApprovals[0].taskFingerprint).toBe(originalFingerprint);
+
+    expect(resumed.status).toBe("succeeded");
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+
+    // consumedByRunId is the retry chain's root run id (resolveRetryChainRootRunId),
+    // which heartbeat.wakeup()'s own issue-continuity linking can point at an
+    // earlier run in the chain rather than this exact resumed run — asserting
+    // only that it was consumed by some run, not which one, keeps this test
+    // scoped to what the fix actually claims (fingerprint match + resume).
+    const [approvalAfter] = await db.select().from(approvals).where(eq(approvals.id, approvalId));
+    expect(approvalAfter.consumedAt).not.toBeNull();
+    expect(approvalAfter.consumedByRunId).toBeTruthy();
+  }, 20_000);
+
+  it("RESUME-02: approving a Risk-Guard-intercepted run with the default (no custom prompt) wake still resumes without a duplicate approval", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue("Resume02");
+    const heartbeat = heartbeatService(db);
+
+    const intercepted = await wakeAndAwait(heartbeat, agentId, issueId);
+    expect(intercepted.status).toBe("failed");
+    const interceptedResult = intercepted.resultJson as Record<string, unknown>;
+    const approvalId = interceptedResult.approvalId as string;
+
+    const app = createApprovalApp(companyId);
+    const approveResponse = await request(app).post(`/api/approvals/${approvalId}/approve`).send({});
+    expect(approveResponse.status).toBe(200);
+
+    const resumedRunRow = await waitForNewRun(agentId, intercepted.id);
+    const resumed = await waitForRunToFinish(heartbeat, resumedRunRow.id);
+
+    const resumedApprovals = await findRiskGuardApproval(companyId, issueId);
+    expect(resumedApprovals).toHaveLength(1);
+    expect(resumed.status).toBe("succeeded");
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+  }, 20_000);
+
+  it("PROMPT-03: the original explicit wake prompt reaches the resumed adapter execution after approval", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue("Prompt03");
+    const heartbeat = heartbeatService(db);
+    const customPrompt = "Change production security permissions for customer accounts. Use exact account ID ACC-99.";
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId, prompt: customPrompt },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    });
+    const intercepted = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(intercepted.status).toBe("failed");
+    expect(adapterExecute).not.toHaveBeenCalled();
+    const interceptedResult = intercepted.resultJson as Record<string, unknown>;
+    const approvalId = interceptedResult.approvalId as string;
+
+    const app = createApprovalApp(companyId);
+    const approveResponse = await request(app).post(`/api/approvals/${approvalId}/approve`).send({});
+    expect(approveResponse.status).toBe(200);
+
+    const resumedRunRow = await waitForNewRun(agentId, intercepted.id);
+    const resumed = await waitForRunToFinish(heartbeat, resumedRunRow.id);
+    expect(resumed.status).toBe("succeeded");
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+
+    const callArgs = adapterExecute.mock.calls[0][0] as { context?: Record<string, unknown> };
+    const markdown = String(callArgs.context?.paperclipTaskMarkdown ?? "");
+    expect(markdown).toContain("ACC-99");
+    expect(markdown).toContain("Explicit wake instruction for this run:");
+  }, 20_000);
+
   it("DEDUP-02: expired pending approval is ignored and a fresh pending approval is created", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue("Dedup02");
     const heartbeat = heartbeatService(db);
@@ -890,5 +1559,125 @@ describeEmbeddedPostgres("Heartbeat Risk Guard — Approval Lifecycle Security i
     const issueApprovalRows = await findRiskGuardApproval(companyId, issueId);
     expect(issueApprovalRows).toHaveLength(1);
     expect(issueApprovalRows[0].status).toBe("pending");
+  }, 20_000);
+
+  it("ADAPTER-01: claude_local agent with HIGH-risk task is intercepted by Risk Guard", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue(
+      "ClaudeHigh",
+      "Change production security permissions for customer accounts.",
+      "claude_local",
+    );
+    const heartbeat = heartbeatService(db);
+
+    const run = await wakeAndAwait(heartbeat, agentId, issueId);
+    expect(run.status).toBe("failed");
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    const resultJson = run.resultJson as Record<string, unknown>;
+    expect(resultJson.risk).toBe("HIGH");
+    expect(resultJson.approvalId).toBeDefined();
+
+    const approvalRows = await findRiskGuardApproval(companyId, issueId);
+    expect(approvalRows).toHaveLength(1);
+    expect(approvalRows[0].status).toBe("pending");
+  }, 20_000);
+
+  it("ADAPTER-02: claude_local agent with approved approval executes successfully", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue(
+      "ClaudeApprove",
+      "Change production security permissions for customer accounts.",
+      "claude_local",
+    );
+    const heartbeat = heartbeatService(db);
+
+    const intercepted = await wakeAndAwait(heartbeat, agentId, issueId);
+    expect(intercepted.status).toBe("failed");
+    const approvalId = await approveLatest(companyId, issueId);
+
+    const finished = await insertQueuedRun(heartbeat, {
+      companyId,
+      agentId,
+      contextSnapshot: intercepted.contextSnapshot,
+    });
+    expect(finished.status).toBe("succeeded");
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+
+    const [approvalRow] = await db.select().from(approvals).where(eq(approvals.id, approvalId));
+    expect(approvalRow.consumedAt).not.toBeNull();
+    expect(approvalRow.consumedByRunId).toBe(finished.id);
+  }, 20_000);
+
+  it("ADAPTER-03: gemini_local agent with HIGH-risk task is intercepted by Risk Guard", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue(
+      "GeminiHigh",
+      "Delete customer database tables in production.",
+      "gemini_local",
+    );
+    const heartbeat = heartbeatService(db);
+
+    const run = await wakeAndAwait(heartbeat, agentId, issueId);
+    expect(run.status).toBe("failed");
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    const resultJson = run.resultJson as Record<string, unknown>;
+    expect(resultJson.risk).toBe("HIGH");
+  }, 20_000);
+
+  it("TIMER-01: generic timer wake with empty taskText is safely completed as succeeded idle tick without Risk Guard UNKNOWN interception", async () => {
+    const { companyId, agentId } = await seedCompanyAgentIssue("Timer01");
+    await db
+      .update(agents)
+      .set({
+        runtimeConfig: {
+          heartbeat: {
+            enabled: true,
+          },
+        },
+      })
+      .where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+
+    // 1. Before: Capture baseline approvals for the company directly from approvals table
+    const approvalsBefore = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.companyId, companyId));
+
+    // 2. Trigger generic empty timer wake (source: "timer", no issueId, no prompt)
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "scheduled_interval",
+      contextSnapshot: {
+        wakeReason: "heartbeat_timer",
+      },
+    });
+
+    expect(queued).not.toBeNull();
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished!.status).toBe("succeeded");
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    // 3. After: Verify zero new approvals were created for this company
+    const approvalsAfter = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.companyId, companyId));
+    expect(approvalsAfter).toHaveLength(approvalsBefore.length);
+
+    // 4. Verify specifically that no approval exists with sha256("") empty task fingerprint
+    const emptyTaskFingerprint = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const emptyTaskApprovals = approvalsAfter.filter(
+      (a) => a.taskFingerprint === emptyTaskFingerprint,
+    );
+    expect(emptyTaskApprovals).toHaveLength(0);
+
+    // 5. Verify agent remained in healthy idle status (never placed in error)
+    let agentRow = await db.select().from(agents).where(eq(agents.id, agentId)).then((r) => r[0]);
+    const agentDeadline = Date.now() + 3_000;
+    while (agentRow?.status === "running" && Date.now() < agentDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      agentRow = await db.select().from(agents).where(eq(agents.id, agentId)).then((r) => r[0]);
+    }
+    expect(agentRow?.status).toBe("idle");
   }, 20_000);
 });

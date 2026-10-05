@@ -57,7 +57,19 @@ function CompanyAwareBreadcrumbProvider({ children }: { children: React.ReactNod
   return <BreadcrumbProvider companyName={selectedCompany?.name ?? null}>{children}</BreadcrumbProvider>;
 }
 
-createRoot(document.getElementById("root")!).render(
+// The container outlives Vite HMR re-executions of this module, so stashing
+// the root on it (rather than a module-scope variable, which HMR resets)
+// lets a re-run reuse the existing root's `.render()` instead of calling
+// `createRoot()` on it a second time — React throws away the first root's
+// tree without warning when that happens, which is what actually produces
+// downstream "removeChild: not a child of this node" crashes.
+type RootContainer = HTMLElement & { __paperclipReactRoot?: ReturnType<typeof createRoot> };
+
+const container = document.getElementById("root")! as RootContainer;
+const root = container.__paperclipReactRoot ?? createRoot(container);
+container.__paperclipReactRoot = root;
+
+root.render(
   <StrictMode>
     <AppErrorBoundary>
       <QueryClientProvider client={queryClient}>

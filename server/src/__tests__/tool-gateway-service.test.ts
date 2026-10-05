@@ -770,6 +770,94 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect((result.result as { result?: { data?: { target?: string } } }).result?.data?.target).toBe("repo");
   });
 
+  it("rejects executeTool when the formal board approval is approved but expired (PAP-P4)", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review destructive tools",
+      policyType: "require_approval",
+      selectors: { toolName: "fixture:delete_everything" },
+    });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: fakePluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "fixture:delete_everything",
+      parameters: { target: "repo" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    const [approval] = await db.select().from(approvals).where(eq(approvals.id, actionRequest.approvalId!));
+
+    await db.update(issueThreadInteractions).set({
+      status: "accepted",
+      resolvedByUserId: "board-user",
+      resolvedAt: new Date(),
+      updatedAt: new Date(),
+    }).where(eq(issueThreadInteractions.id, actionRequest.interactionId!));
+
+    // Approved by a human, but the decision's TTL has already elapsed by the
+    // time the agent gets around to executing it.
+    await db.update(approvals).set({
+      status: "approved",
+      decidedByUserId: "board-user",
+      decidedAt: new Date(),
+      expiresAt: new Date(Date.now() - 1_000),
+      updatedAt: new Date(),
+    }).where(eq(approvals.id, approval.id));
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "fixture:delete_everything",
+      approvedActionRequestId: actionRequest.id,
+      parameters: { target: "tampered" },
+    })).rejects.toMatchObject({ reasonCode: "formal_approval_required" });
+  });
+
+  it("rejects approveActionRequest when the linked formal board approval is approved but expired (PAP-P4)", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review destructive tools",
+      policyType: "require_approval",
+      selectors: { toolName: "fixture:delete_everything" },
+    });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: fakePluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "fixture:delete_everything",
+      parameters: { target: "repo" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    const [approval] = await db.select().from(approvals).where(eq(approvals.id, actionRequest.approvalId!));
+
+    await db.update(approvals).set({
+      status: "approved",
+      decidedByUserId: "board-user",
+      decidedAt: new Date(),
+      expiresAt: new Date(Date.now() - 1_000),
+      updatedAt: new Date(),
+    }).where(eq(approvals.id, approval.id));
+
+    await expect(gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest.id,
+      actor: { userId: "board-user" },
+    })).rejects.toMatchObject({ reasonCode: "formal_approval_required" });
+  });
+
   it("maps remote MCP elicitation to a durable issue interaction", async () => {
     const { company, agent, run } = await createRunFixture(db);
     await createRemoteMcpToolFixture(db, company.id);

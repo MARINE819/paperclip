@@ -29,3 +29,13 @@ export interface AIOfficeStatus {
     databaseBackupMaxAgeHours: number;
   };
 }
+
+export interface OrgUnitStatus {
+  orgUnitId: string;
+  name: string;
+  agentCount: number;
+  activeCount: number;
+  runningCount: number;
+  errorCount: number;
+  currentTaskCount: number;
+}

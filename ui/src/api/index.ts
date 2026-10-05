@@ -21,3 +21,27 @@ export { sidebarPreferencesApi } from "./sidebarPreferences";
 export { resourceMembershipsApi } from "./resourceMemberships";
 export { inboxDismissalsApi } from "./inboxDismissals";
 export { companySkillsApi } from "./companySkills";
+export { evalsApi } from "./evals";
+export { incidentsApi } from "./incidents";
+export { dataLifecycleApi } from "./data-lifecycle";
+export { toolTrustApi } from "./tool-trust";
+export { secretsRegistryApi } from "./secrets";
+export { knowledgeApi } from "./knowledge";
+export { backupApi } from "./backup";
+export type {
+  MemoryOperationItem,
+  KnowledgeRecordItem,
+  ReviewMemoryOperationParams,
+  PromoteMemoryOperationParams,
+  PromoteMemoryOperationResult,
+  ListKnowledgeRecordsParams,
+} from "./knowledge";
+export type {
+  DatabaseBackupHealthStatus,
+  DatabaseBackupHealthWarning,
+  DatabaseBackupHealthWarningCode,
+  DatabaseBackupArtifactInfo,
+  DatabaseBackupRecoveryArtifactInfo,
+  DatabaseBackupLastFailureInfo,
+  ManualBackupResult,
+} from "./backup";

@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import express from "express";
 import { and, eq } from "drizzle-orm";
 import request from "supertest";
@@ -36,8 +39,10 @@ import {
   toolStdioCommandTemplates,
   toolRuntimeSlots,
   secretAccessEvents,
+  taskAuthorizationEnvelopes,
 } from "@paperclipai/db";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
+import { actorMiddleware } from "../middleware/auth.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
@@ -276,6 +281,11 @@ async function createLocalStdioMcpTool(
     healthStatus?: "unknown" | "healthy" | "degraded" | "failed" | "unchecked" | "ok" | "error" | "missing_secret";
     catalogStatus?: "active" | "disabled" | "quarantined" | "removed";
     riskLevel?: "read" | "write" | "destructive";
+    stdioScript?: string;
+    envKeys?: string[];
+    connectionConfig?: Record<string, unknown>;
+    stdioCommand?: string;
+    stdioArgs?: string[];
   } = {},
 ) {
   const applicationKey = input.applicationKey ?? `local-app-${randomUUID().slice(0, 8)}`;
@@ -306,8 +316,8 @@ rl.on("line", (line) => {
     companyId,
     templateKey,
     name: `Local stdio template ${randomUUID()}`,
-    command: process.execPath,
-    args: ["-e", stdioScript],
+    command: input.stdioCommand ?? process.execPath,
+    args: input.stdioArgs ?? ["-e", stdioScript],
     envKeys: input.envKeys ?? [],
     tools: [
       {
@@ -410,6 +420,20 @@ function createGatewayRouteApp(
       next();
     });
   }
+  app.use(mcpGatewayProtocolRoutes(gateway));
+  app.use("/api", toolGatewayRoutes(db, gateway));
+  return app;
+}
+
+// Unlike createGatewayRouteApp above, this mounts the real actorMiddleware in
+// front of the gateway routes — the exact production stack (app.ts) that the
+// isolated router tests above do not exercise. This is what previously let a
+// valid pcgw_ token be rejected by the board/agent/JWT chain before ever
+// reaching namedGatewaySessionFromBearer().
+function createFullStackGatewayApp(db: Db, gateway = createTestToolGatewayService(db)) {
+  const app = express();
+  app.use(express.json());
+  app.use(actorMiddleware(db, { deploymentMode: "local_trusted", resolveSession: async () => null }));
   app.use(mcpGatewayProtocolRoutes(gateway));
   app.use("/api", toolGatewayRoutes(db, gateway));
   return app;
@@ -1268,6 +1292,83 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       healthStatus: "ok",
     });
   });
+
+  it.runIf(process.platform === "win32")(
+    "spawns a .cmd-shimmed local stdio MCP command on Windows (regression for shell:true fix)",
+    async () => {
+      // Reproduces the real-world failure: pnpm generates Windows workspace
+      // bins as .cmd shims, and child_process.spawn only resolves/executes
+      // a .cmd file when `shell: true` is passed (CreateProcess does not do
+      // PATHEXT resolution on its own). command/args come from an
+      // admin-approved stdio template, not user input, so shelling out here
+      // carries no injection risk.
+      const scriptDir = mkdtempSync(join(tmpdir(), "paperclip-stdio-cmd-"));
+      const scriptPath = join(scriptDir, "echo-server.js");
+      writeFileSync(
+        scriptPath,
+        `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "cmd-shim-stdio", version: "0.0.0" } } }) + "\\n");
+    return;
+  }
+  if (message.method === "tools/call") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "shim:" + String(message.params?.arguments?.message ?? "") }], structuredContent: { echoed: message.params?.arguments?.message ?? null } } }) + "\\n");
+  }
+});
+`,
+      );
+      const cmdPath = join(scriptDir, "run-echo-server.cmd");
+      writeFileSync(cmdPath, `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`);
+
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const localTool = await createLocalStdioMcpTool(db, company.id, {
+        applicationKey: "local-cmd-shim",
+        connectionName: "Local Cmd Shim",
+        toolName: "echo",
+        title: "Cmd shim echo",
+        stdioCommand: cmdPath,
+        stdioArgs: [],
+      });
+      const expectedName = expectedConnectedToolName({
+        applicationKey: "local-cmd-shim",
+        connectionId: localTool.connection.id,
+        toolName: "echo",
+      });
+      const profile = await allowToolsForAgent(db, company.id, agent.id, []);
+      await db.insert(toolProfileEntries).values({
+        companyId: company.id,
+        profileId: profile.id,
+        selectorType: "catalog_entry",
+        effect: "include",
+        catalogEntryId: localTool.catalogEntry.id,
+      });
+
+      const gateway = createTestToolGatewayService(db, { runtimeSupervisor: { idleTtlMs: 10_000 } });
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: expectedName,
+        parameters: { message: "hello" },
+      })).resolves.toMatchObject({
+        status: "completed",
+        result: {
+          content: "shim:hello",
+          data: {
+            structuredContent: { echoed: "hello" },
+            transport: "local_stdio",
+            spawnedLocalProcess: true,
+          },
+        },
+      });
+    },
+  );
 
   it("passes only approved env values to local stdio MCP processes", async () => {
     const previousDatabaseUrl = process.env.DATABASE_URL;
@@ -3625,6 +3726,127 @@ rl.on("line", (line) => {
     expect(replay.body.error.data.reasonCode).toBe("gateway_token_run_inactive");
   });
 
+  it("reaches the named gateway verifier through the full production stack (actorMiddleware + gateway routes) with a valid run-bound pcgw_ token", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const profile = await allowToolsForAgent(db, company.id, agent.id, ["mcp-stdio-fixture:runtime_status"]);
+    const gateway = createTestToolGatewayService(db);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: { name: `Full-stack gateway ${randomUUID()}`, profileId: profile.id, defaultProfileMode: "gateway_only" },
+    });
+    const token = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: namedGateway.id,
+      body: {
+        name: "Runtime token",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        expiresAt: new Date(Date.now() + 60_000),
+      },
+      actor: { agentId: agent.id },
+    });
+    const app = createFullStackGatewayApp(db, gateway);
+
+    const listed = await request(app)
+      .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+      .set("authorization", `Bearer ${token.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+      .expect(200);
+    expect(listed.body.result.tools.map((tool: { name: string }) => tool.name)).toContain("mcp-stdio-fixture:runtime_status");
+  });
+
+  it("still rejects an invalid pcgw_ token through the full production stack", async () => {
+    const company = await createCompany(db);
+    const profile = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `full-stack-invalid-${randomUUID()}`,
+      name: `Full-stack invalid ${randomUUID()}`,
+      defaultAction: "deny",
+    }).returning().then((rows) => rows[0]);
+    const gateway = createTestToolGatewayService(db);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: { name: `Full-stack invalid gateway ${randomUUID()}`, profileId: profile.id },
+    });
+    const app = createFullStackGatewayApp(db, gateway);
+    const badToken = `pcgw_${randomUUID()}.not-a-real-secret`;
+
+    const res = await request(app)
+      .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+      .set("authorization", `Bearer ${badToken}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+      .expect(401);
+    expect(res.body.error.data.reasonCode).toBe("gateway_token_invalid");
+  });
+
+  it("still rejects an expired pcgw_ token through the full production stack", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const profile = await allowToolsForAgent(db, company.id, agent.id, ["mcp-stdio-fixture:runtime_status"]);
+    const gateway = createTestToolGatewayService(db);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: { name: `Full-stack expired gateway ${randomUUID()}`, profileId: profile.id, defaultProfileMode: "gateway_only" },
+    });
+    const token = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: namedGateway.id,
+      body: {
+        name: "Expired runtime token",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        expiresAt: new Date(Date.now() - 1_000),
+      },
+      actor: { agentId: agent.id },
+    });
+    const app = createFullStackGatewayApp(db, gateway);
+
+    const res = await request(app)
+      .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+      .set("authorization", `Bearer ${token.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+      .expect(401);
+    expect(res.body.error.data.reasonCode).toBe("gateway_token_expired");
+  });
+
+  it("still rejects a pcgw_ token bound to a different gateway through the full production stack", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const profile = await allowToolsForAgent(db, company.id, agent.id, ["mcp-stdio-fixture:runtime_status"]);
+    const gateway = createTestToolGatewayService(db);
+    const gatewayA = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: { name: `Full-stack gateway A ${randomUUID()}`, profileId: profile.id, defaultProfileMode: "gateway_only" },
+    });
+    const gatewayB = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: { name: `Full-stack gateway B ${randomUUID()}`, profileId: profile.id, defaultProfileMode: "gateway_only" },
+    });
+    const tokenForA = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: gatewayA.id,
+      body: {
+        name: "Runtime token for A",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        expiresAt: new Date(Date.now() + 60_000),
+      },
+      actor: { agentId: agent.id },
+    });
+    const app = createFullStackGatewayApp(db, gateway);
+
+    const res = await request(app)
+      .post(`/api/tool-gateway/gateways/${gatewayB.id}/mcp`)
+      .set("authorization", `Bearer ${tokenForA.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+      .expect(401);
+    expect(res.body.error.data.reasonCode).toBe("gateway_token_invalid");
+  });
+
   it("rejects expired, revoked, and tampered durable sessions without auditing token values", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -4145,4 +4367,223 @@ rl.on("line", (line) => {
       (error) => expectGatewayError(error, 403, "run_context_mismatch"),
     );
   });
+
+  // NEXORA — Trusted Tool Identity fix regression coverage. Before the fix,
+  // authorizeAndConsumeEnvelope() was called with the gateway-namespaced
+  // tool.name (e.g. "mcp.app-...:append-rows") instead of the plain trusted
+  // catalog name tool.upstreamToolName carries ("append_rows") — every
+  // Google Sheets Envelope call was denied with "unsupported_or_untrusted_tool"
+  // regardless of arguments. These tests exercise the real gateway
+  // executeTool() path (not authorizeAndConsumeEnvelope() directly, which the
+  // pre-existing task-authorization-envelope-tool-gateway.test.ts suite
+  // already covers exhaustively and is unaffected by this one-line fix).
+  async function createLocalStdioGoogleSheetsTool(
+    db: Db,
+    companyId: string,
+    input: { toolName: "append_rows" | "update_values" },
+  ) {
+    const applicationKey = `google-sheets-trust-${randomUUID().slice(0, 8)}`;
+    const [application] = await db.insert(toolApplications).values({
+      companyId,
+      applicationKey,
+      name: "Google Sheets (trust fixture)",
+      type: "mcp_stdio",
+      status: "active",
+    }).returning();
+    const templateKey = `test.google-sheets.${randomUUID()}`;
+    const inputSchema = {
+      type: "object",
+      properties: {
+        spreadsheetId: { type: "string" },
+        range: { type: "string" },
+        values: { type: "array" },
+      },
+      required: ["spreadsheetId", "range", "values"],
+      additionalProperties: false,
+    };
+    const stdioScript = `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "test-sheets-stdio", version: "0.0.0" } } }) + "\\n");
+    return;
+  }
+  if (message.method === "tools/call") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "ok" }], structuredContent: { appended: message.params?.arguments ?? null } } }) + "\\n");
+  }
+});
+`;
+    await db.insert(toolStdioCommandTemplates).values({
+      companyId,
+      templateKey,
+      name: `Google Sheets trust template ${randomUUID()}`,
+      command: process.execPath,
+      args: ["-e", stdioScript],
+      envKeys: [],
+      tools: [
+        {
+          name: input.toolName,
+          title: input.toolName,
+          description: `Call ${input.toolName}`,
+          inputSchema,
+          annotations: { readOnlyHint: false },
+        },
+      ],
+    });
+    const [connection] = await db.insert(toolConnections).values({
+      companyId,
+      applicationId: application!.id,
+      name: `Google Sheets trust connection ${randomUUID()}`,
+      uid: `test/${randomUUID()}`,
+      transport: "local_stdio",
+      status: "active",
+      enabled: true,
+      healthStatus: "ok",
+      config: { templateId: templateKey, sourceTemplateKey: "google-sheets" },
+      transportConfig: { templateId: templateKey, sourceTemplateKey: "google-sheets" },
+    }).returning();
+    // name must equal toolName here — resolveTrustedGoogleSheetsTool() matches
+    // on toolCatalogEntries.name, which is what the real Google Sheets catalog
+    // entries carry (verified live: both name and toolName are "append_rows").
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId,
+      applicationId: application!.id,
+      connectionId: connection!.id,
+      entryKind: "tool",
+      name: input.toolName,
+      toolName: input.toolName,
+      title: input.toolName,
+      description: `Call ${input.toolName}`,
+      inputSchema,
+      annotations: { readOnlyHint: false },
+      riskLevel: "write",
+      isReadOnly: false,
+      isWrite: true,
+      isDestructive: false,
+      status: "active",
+      versionHash: randomUUID(),
+    }).returning();
+    return { application: application!, connection: connection!, catalogEntry: catalogEntry! };
+  }
+
+  async function setUpTrustedToolEnvelopeFixture(toolName: "append_rows" | "update_values") {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const { application, connection, catalogEntry } = await createLocalStdioGoogleSheetsTool(db, company.id, { toolName });
+    const gatewayToolName = expectedConnectedToolName({
+      applicationKey: application.applicationKey,
+      connectionId: connection.id,
+      toolName: catalogEntry.toolName,
+    });
+    await allowToolsForAgent(db, company.id, agent.id, [gatewayToolName]);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review Google Sheets writes",
+      policyType: "require_approval",
+      selectors: { connectionId: connection.id },
+      description: "Google Sheets writes need review unless envelope-authorized.",
+      priority: 10,
+    });
+    await db.insert(taskAuthorizationEnvelopes).values({
+      companyId: company.id,
+      issueId: issue.id,
+      agentId: agent.id,
+      level: "safe_mutation",
+      riskCeiling: "LOW",
+      allowedResources: [{ type: "google_sheet", spreadsheetId: "sheet-trust-1", sheetName: "Sheet1" }],
+      maxOperations: 3,
+      expiresAt: new Date(Date.now() + 60_000),
+      issuedByUserId: "board-tester",
+    });
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    return { company, agent, issue, run, connection, gateway, session, gatewayToolName };
+  }
+
+  it("TRUST-01: a namespaced Google Sheets append_rows call is authorized by a matching Envelope (Trusted Tool Identity fix)", async () => {
+    const { company, gateway, session, gatewayToolName } = await setUpTrustedToolEnvelopeFixture("append_rows");
+
+    const result = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: gatewayToolName,
+      parameters: { spreadsheetId: "sheet-trust-1", range: "Sheet1!A1:B2", values: [["a", "b"]] },
+    });
+    expect(result.status).toBe("completed");
+
+    const [envelopeRow] = await db
+      .select()
+      .from(taskAuthorizationEnvelopes)
+      .where(eq(taskAuthorizationEnvelopes.companyId, company.id));
+    expect(envelopeRow.operationsConsumed).toBe(1);
+
+    // recordInvocation() always inserts a toolActionRequests row up front
+    // whenever the underlying policy says "require_approval" — that happens
+    // before the Envelope is even evaluated, so its existence is not the
+    // right signal here (that's pre-existing, unrelated architecture). The
+    // real "was a human actually asked" signal is whether a human-facing
+    // interaction thread was created — requestApprovalForRecordedToolCall()
+    // is what creates that, and it is skipped whenever envelopeAuthorized.
+    const interactions = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.companyId, company.id));
+    expect(interactions).toHaveLength(0);
+  }, 15_000);
+
+  it("TRUST-02: a namespaced Google Sheets update_values call is authorized by a matching Envelope", async () => {
+    const { company, gateway, session, gatewayToolName } = await setUpTrustedToolEnvelopeFixture("update_values");
+
+    const result = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: gatewayToolName,
+      parameters: { spreadsheetId: "sheet-trust-1", range: "Sheet1!A1:B2", values: [["x", "y"]] },
+    });
+    expect(result.status).toBe("completed");
+
+    const [envelopeRow] = await db
+      .select()
+      .from(taskAuthorizationEnvelopes)
+      .where(eq(taskAuthorizationEnvelopes.companyId, company.id));
+    expect(envelopeRow.operationsConsumed).toBe(1);
+
+    const interactions = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.companyId, company.id));
+    expect(interactions).toHaveLength(0);
+  }, 15_000);
+
+  it("TRUST-03: a mismatched sheet name still falls back to a tool-level approval, not the Envelope (scope enforcement preserved)", async () => {
+    const { company, gateway, session, gatewayToolName } = await setUpTrustedToolEnvelopeFixture("append_rows");
+
+    const result = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: gatewayToolName,
+      // "OtherSheet", not the Envelope's allow-listed "Sheet1" — must still
+      // fail closed to a human approval request, proving the fix does not
+      // weaken resource-scope matching.
+      parameters: { spreadsheetId: "sheet-trust-1", range: "OtherSheet!A1:B2", values: [["a", "b"]] },
+    }).then(
+      () => {
+        throw new Error("Expected an out-of-scope sheet to require approval, not execute");
+      },
+      (error) => expectGatewayError(error, 409, "approval_required"),
+    );
+    void result;
+
+    const [envelopeRow] = await db
+      .select()
+      .from(taskAuthorizationEnvelopes)
+      .where(eq(taskAuthorizationEnvelopes.companyId, company.id));
+    expect(envelopeRow.operationsConsumed).toBe(0);
+
+    const pendingApprovals = await db
+      .select()
+      .from(toolActionRequests)
+      .where(eq(toolActionRequests.companyId, company.id));
+    expect(pendingApprovals).toHaveLength(1);
+  }, 15_000);
 });

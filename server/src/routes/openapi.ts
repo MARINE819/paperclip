@@ -975,6 +975,21 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/companies",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
+  "GET /api/instance/incidents",
+  "POST /api/instance/incidents/{id}/promote-failure-memory",
+  "GET /api/evals/benchmarks",
+  "GET /api/evals/runs",
+  "GET /api/evals/runs/{id}",
+  "GET /api/evals/summary",
+  "GET /api/evals/agents/{agentId}/summary",
+  "GET /api/tools/trust-registry",
+  "GET /api/tools/trust-registry/{id}",
+  "POST /api/tools/trust-registry/plugins/{pluginId}/review",
+  "GET /api/data-lifecycle/policies",
+  "GET /api/data-lifecycle/summary",
+  "GET /api/data-lifecycle/dry-run",
+  "POST /api/evals/benchmarks",
+  "POST /api/evals/runs",
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
   "PUT /api/admin/users/{userId}/company-access",
@@ -1029,6 +1044,8 @@ const CREATED_OPERATIONS = new Set([
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
+  "POST /api/evals/benchmarks",
+  "POST /api/evals/runs",
   "POST /api/companies/{companyId}/tools/applications",
   "POST /api/companies/{companyId}/tools/connections",
   "POST /api/companies/{companyId}/tools/action-requests/{actionRequestId}/trust-rule",
@@ -1214,6 +1231,14 @@ registry.registerPath({
           mtime: z.string().datetime(),
           ageHours: z.number(),
           sizeBytes: z.number(),
+        }).nullable().optional(),
+        latestRecoveryArtifact: z.object({
+          name: z.string(),
+          path: z.string(),
+          mtime: z.string().datetime(),
+          ageHours: z.number(),
+          sizeBytes: z.number(),
+          reason: z.string(),
         }).nullable().optional(),
         lastFailure: z.object({
           path: z.string(),
@@ -6093,6 +6118,489 @@ registry.registerPath({
   tags: ["instance"],
   summary: "Trigger a database backup",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+// ─── Instance runtime incidents (F-06) ────────────────────────────────────────
+
+const runtimeIncidentSummarySchema = z.object({
+  id: z.string(),
+  code: z.string(),
+  severity: z.enum(["low", "medium", "high", "critical"]),
+  status: z.enum(["open", "recovering", "resolved"]),
+  affectedComponents: z.array(z.string()),
+  detectedAt: z.coerce.date(),
+  lastObservedAt: z.coerce.date(),
+  resolvedAt: z.coerce.date().nullable(),
+  occurrenceCount: z.number(),
+  recoveryAttempted: z.boolean(),
+  recoveryResult: z.string().nullable(),
+  rootCauseStatus: z.enum(["known", "unknown", "investigating"]),
+  failureMemoryCandidate: z.boolean(),
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/incidents",
+  tags: ["instance"],
+  summary: "List open and recently resolved runtime/Supervisor incidents",
+  request: {
+    query: z.object({ instanceId: z.string().optional() }),
+  },
+  responses: {
+    200: r.ok(z.object({
+      open: z.array(runtimeIncidentSummarySchema),
+      resolved: z.array(runtimeIncidentSummarySchema),
+    })),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+// JARVIS-01: Board-triggered only. Creates a reviewable memoryOperations
+// candidate (status="candidate", reviewState="pending") — never auto-
+// verified knowledge. Requires both instance-admin and access to the
+// target company. Only a minimum provenance allowlist is ever stored —
+// see docs/contracts/jarvis-01-failure-memory-closure-loop.md.
+const failureMemoryPromotionResultSchema = z.union([
+  z.object({
+    outcome: z.enum(["created", "deduplicated"]),
+    operation: z.record(z.string(), z.unknown()),
+  }),
+]);
+
+registry.registerPath({
+  method: "post",
+  path: "/api/instance/incidents/{id}/promote-failure-memory",
+  tags: ["instance"],
+  summary: "Promote a resolved incident's failure-memory draft into a reviewable memory-operation candidate (instance-admin + target-company access required)",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({ companyId: z.string() })),
+  },
+  responses: {
+    201: r.ok(failureMemoryPromotionResultSchema),
+    200: r.ok(failureMemoryPromotionResultSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+// ─── F-04 Agent Eval / Simulation Lab ──────────────────────────────────────────
+
+const evalBenchmarkSummarySchema = z.object({
+  id: z.string(),
+  key: z.string(),
+  version: z.number(),
+  name: z.string(),
+  description: z.string().nullable(),
+  category: z.string(),
+  active: z.boolean(),
+  validatorSpec: z.array(z.record(z.string(), z.unknown())),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+});
+
+const evalRunStatusSchema = z.enum(["queued", "running", "passed", "failed", "error", "judged_only"]);
+
+const evalRunSummarySchema = z.object({
+  id: z.string(),
+  taskId: z.string(),
+  benchmarkKey: z.string(),
+  benchmarkVersion: z.number(),
+  agentId: z.string().nullable(),
+  modelProvider: z.string(),
+  modelName: z.string(),
+  status: evalRunStatusSchema,
+  startedAt: z.coerce.date().nullable(),
+  completedAt: z.coerce.date().nullable(),
+  success: z.enum(["true", "false"]).nullable(),
+  accuracy: z.number().nullable(),
+  latencyMs: z.number().nullable(),
+  tokenUsage: z.object({ input: z.number().optional(), output: z.number().optional(), total: z.number().optional() }).nullable(),
+  costEstimated: z.number().nullable(),
+  costActual: z.number().nullable(),
+  failureType: z.string().nullable(),
+  retryCount: z.number(),
+  retryOfRunId: z.string().nullable(),
+  createdAt: z.coerce.date(),
+});
+
+const evalValidatorResultSchema = z.object({
+  type: z.string(),
+  deterministic: z.boolean(),
+  passed: z.boolean(),
+  details: z.string(),
+  expected: z.unknown().optional(),
+  actual: z.unknown().optional(),
+});
+
+const evalRegressionFindingSchema = z.object({
+  kind: z.enum(["accuracy_degradation", "failure_rate_increase", "latency_increase", "cost_increase"]),
+  previous: z.union([z.number(), z.string(), z.null()]),
+  current: z.union([z.number(), z.string(), z.null()]),
+  message: z.string(),
+});
+
+const evalSummaryEntrySchema = z.object({
+  benchmarkKey: z.string(),
+  benchmarkVersion: z.number(),
+  modelProvider: z.string(),
+  modelName: z.string(),
+  totalRuns: z.number(),
+  passedRuns: z.number(),
+  failedRuns: z.number(),
+  passRate: z.number(),
+  latestStatus: evalRunStatusSchema.nullable(),
+  latestRunId: z.string().nullable(),
+  latestRunAt: z.coerce.date().nullable(),
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/evals/benchmarks",
+  tags: ["evals"],
+  summary: "List F-04 eval benchmark case definitions",
+  request: {
+    query: z.object({ activeOnly: z.string().optional(), category: z.string().optional() }),
+  },
+  responses: {
+    200: r.ok(z.object({ benchmarks: z.array(evalBenchmarkSummarySchema) })),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/evals/runs",
+  tags: ["evals"],
+  summary: "List F-04 eval runs (filterable)",
+  request: {
+    query: z.object({
+      taskId: z.string().optional(),
+      benchmarkKey: z.string().optional(),
+      agentId: z.string().optional(),
+      modelProvider: z.string().optional(),
+      modelName: z.string().optional(),
+      status: evalRunStatusSchema.optional(),
+      limit: z.string().optional(),
+    }),
+  },
+  responses: {
+    200: r.ok(z.object({ runs: z.array(evalRunSummarySchema) })),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/evals/runs/{id}",
+  tags: ["evals"],
+  summary: "Get one F-04 eval run's full detail (evidence, validator results, regression vs previous verified run)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({
+      run: evalRunSummarySchema.extend({
+        evidence: z.array(z.record(z.string(), z.unknown())),
+        validatorResults: z.array(evalValidatorResultSchema),
+      }),
+      regression: z.object({
+        currentRunId: z.string(),
+        previousRunId: z.string().nullable(),
+        findings: z.array(evalRegressionFindingSchema),
+      }).nullable(),
+    })),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/evals/summary",
+  tags: ["evals"],
+  summary: "Aggregate pass rate / latest status per (benchmark, version, provider, model)",
+  request: { query: z.object({ benchmarkKey: z.string().optional() }) },
+  responses: {
+    200: r.ok(z.object({ summary: z.array(evalSummaryEntrySchema) })),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+const evalAgentSummarySchema = z.object({
+  agentId: z.string(),
+  latestEval: evalRunSummarySchema.nullable(),
+  passRate: z.number().nullable(),
+  avgLatencyMs: z.number().nullable(),
+  avgCost: z.number().nullable(),
+  recentRegression: z.object({
+    currentRunId: z.string(),
+    previousRunId: z.string().nullable(),
+    findings: z.array(evalRegressionFindingSchema),
+  }).nullable(),
+  recentRuns: z.array(evalRunSummarySchema),
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/evals/agents/{agentId}/summary",
+  tags: ["evals"],
+  summary: "Server-computed per-agent eval summary (passRate/avgLatencyMs/avgCost/recentRegression) — the frontend never computes these",
+  request: {
+    params: z.object({ agentId: z.string() }),
+    query: z.object({ recentRunsLimit: z.string().optional() }),
+  },
+  responses: {
+    200: r.ok(z.object({ agent: evalAgentSummarySchema })),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/evals/benchmarks",
+  tags: ["evals"],
+  summary: "Create a benchmark case (Claude-internal, not part of the Antigravity UI contract)",
+  responses: {
+    201: r.ok(z.object({ benchmark: evalBenchmarkSummarySchema })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/evals/runs",
+  tags: ["evals"],
+  summary: "Record a completed eval run (Claude-internal, not part of the Antigravity UI contract)",
+  responses: {
+    201: r.ok(z.object({ run: evalRunSummarySchema })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+// ─── F-05 Tool / Plugin Trust Registry ────────────────────────────────────────
+
+const trustRegistryEntrySchema = z.object({
+  id: z.string(),
+  type: z.enum(["tool", "mcp", "plugin"]),
+  name: z.string(),
+  provider: z.string().nullable(),
+  version: z.string().nullable(),
+  source: z.string(),
+  sourceUrl: z.string().nullable(),
+  trustStatus: z.enum(["unreviewed", "trusted", "restricted", "blocked", "revoked"]),
+  riskLevel: z.string().nullable(),
+  requestedScopes: z.array(z.string()),
+  approvedScopes: z.array(z.string()),
+  signature: z.string().nullable(),
+  signatureVerified: z.boolean(),
+  enabled: z.boolean(),
+  reviewedAt: z.string().nullable(),
+  reviewedBy: z.string().nullable(),
+  companyId: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/tools/trust-registry",
+  tags: ["tools"],
+  summary: "List Tool/MCP/Plugin trust registry entries (instance-wide)",
+  request: {
+    query: z.object({
+      type: z.enum(["tool", "mcp", "plugin"]).optional(),
+      trustStatus: z.enum(["unreviewed", "trusted", "restricted", "blocked", "revoked"]).optional(),
+      enabled: z.string().optional(),
+    }),
+  },
+  responses: {
+    200: r.ok(z.object({ entries: z.array(trustRegistryEntrySchema) })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/tools/trust-registry/{id}",
+  tags: ["tools"],
+  summary: "Get one trust registry entry",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({ entry: trustRegistryEntrySchema })),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/tools/trust-registry/plugins/{pluginId}/review",
+  tags: ["tools"],
+  summary: "Set a plugin's trust status (Claude-internal/admin — the sole write path; requires a human reviewedByUserId)",
+  request: { params: z.object({ pluginId: z.string() }) },
+  responses: {
+    200: r.ok(z.object({ entry: trustRegistryEntrySchema })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+// ─── F-02 Secrets / Credential Registry (unified read projection) ─────────────
+
+const secretsRegistryEntrySchema = z.object({
+  id: z.string(),
+  type: z.enum(["secret", "agent_api_key", "board_api_key"]),
+  provider: z.string().nullable(),
+  ownerType: z.enum(["company", "user", "agent"]),
+  ownerId: z.string(),
+  scope: z.string(),
+  status: z.string(),
+  maskedIdentifier: z.string().nullable(),
+  label: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string().nullable(),
+  lastUsedAt: z.string().nullable(),
+  expiresAt: z.string().nullable(),
+  revokedAt: z.string().nullable(),
+  createdBy: z.string().nullable(),
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/secrets",
+  tags: ["secrets"],
+  summary: "List credential metadata for one company (company_secrets + agent_api_keys, plus the caller's own board_api_keys) — never plaintext",
+  request: {
+    query: z.object({
+      companyId: z.string(),
+      type: z.enum(["secret", "agent_api_key", "board_api_key"]).optional(),
+    }),
+  },
+  responses: {
+    200: r.ok(z.object({ entries: z.array(secretsRegistryEntrySchema) })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/secrets/{id}",
+  tags: ["secrets"],
+  summary: "Get one credential registry entry's metadata — never plaintext",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: z.object({ companyId: z.string() }),
+  },
+  responses: {
+    200: r.ok(z.object({ entry: secretsRegistryEntrySchema })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+// ─── F-01 Data Lifecycle / Data Governance (READ-ONLY) ────────────────────────
+
+const dataLifecyclePolicySchema = z.object({
+  id: z.string(),
+  dataClass: z.string(),
+  retentionMode: z.enum(["retain", "archive", "delete", "archive_then_delete"]),
+  retentionDays: z.number().nullable(),
+  archiveAfterDays: z.number().nullable(),
+  hardDeleteAfterDays: z.number().nullable(),
+  legalHold: z.boolean(),
+  enabled: z.boolean(),
+  source: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+
+const dataLifecycleTableMappingSchema = z.object({
+  table: z.string(),
+  ageColumn: z.literal("createdAt"),
+  archivedColumn: z.literal("archivedAt").optional(),
+  deletedColumn: z.literal("deletedAt").optional(),
+});
+
+const dataLifecycleClassificationSchema = z.object({
+  dataClass: z.string(),
+  description: z.string(),
+  status: z.enum(["mapped", "unmapped", "file_based"]),
+  tables: z.array(dataLifecycleTableMappingSchema),
+  notes: z.string(),
+  policy: dataLifecyclePolicySchema.nullable(),
+});
+
+const dataLifecycleDryRunResultSchema = z.object({
+  dataClass: z.string(),
+  source: z.string(),
+  action: z.string(),
+  candidateCount: z.number(),
+  oldestCandidate: z.string().nullable(),
+  newestCandidate: z.string().nullable(),
+  estimatedRows: z.number(),
+  reason: z.string(),
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/data-lifecycle/policies",
+  tags: ["data-lifecycle"],
+  summary: "List configured data lifecycle retention policies (instance-wide; instance-admin only)",
+  responses: {
+    200: r.ok(z.object({ policies: z.array(dataLifecyclePolicySchema) })),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/data-lifecycle/summary",
+  tags: ["data-lifecycle"],
+  summary: "List every recognized data class with its table classification and configured policy, if any",
+  responses: {
+    200: r.ok(z.object({ classifications: z.array(dataLifecycleClassificationSchema) })),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/data-lifecycle/dry-run",
+  tags: ["data-lifecycle"],
+  summary: "READ-ONLY candidate calculation for one data class — zero mutation, never deletes or archives",
+  request: {
+    query: z.object({ dataClass: z.string() }),
+  },
+  responses: {
+    200: r.ok(z.object({ result: dataLifecycleDryRunResultSchema })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
 });
 
 // ─── LLM text endpoints ───────────────────────────────────────────────────────

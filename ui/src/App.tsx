@@ -79,6 +79,7 @@ import { CompanyImport } from "./pages/CompanyImport";
 import { DesignGuide } from "./pages/DesignGuide";
 import { InstanceExperimentalSettings } from "./pages/InstanceExperimentalSettings";
 import { InstanceAccess } from "./pages/InstanceAccess";
+import { AIOfficeStatus } from "./pages/AIOfficeStatus";
 import { InstanceSettings } from "./pages/InstanceSettings";
 import { ProfileSettings } from "./pages/ProfileSettings";
 import { PluginManager } from "./pages/PluginManager";
@@ -194,6 +195,7 @@ function boardRoutes() {
       <Route element={<HiddenSettingsPageGate pageKey="instance.experimental" />}>
         <Route path="company/settings/instance/experimental" element={<InstanceExperimentalSettings />} />
       </Route>
+      <Route path="company/settings/instance/ai-office-status" element={<AIOfficeStatus />} />
       <Route element={<HiddenSettingsPageGate pageKey="instance.plugins" />}>
         <Route path="company/settings/instance/plugins" element={<PluginManager />} />
         <Route path="company/settings/instance/plugins/:pluginId" element={<PluginSettings />} />

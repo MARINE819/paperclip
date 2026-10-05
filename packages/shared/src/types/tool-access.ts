@@ -28,6 +28,7 @@ import type {
   ToolProfileStatus,
   ToolRateLimitWindowKind,
   ToolRiskLevel,
+  ToolTrustStatus,
   ToolRuntimeKind,
   ToolRuntimeSlotStatus,
 } from "../constants.js";
@@ -62,6 +63,7 @@ export type {
   ToolProfileStatus,
   ToolRateLimitWindowKind,
   ToolRiskLevel,
+  ToolTrustStatus,
   ToolRuntimeKind,
   ToolRuntimeSlotStatus,
 };

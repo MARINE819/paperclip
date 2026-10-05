@@ -1,0 +1,5 @@
+packages/paperclip-runner/protocol/schemas/** text eol=lf
+packages/paperclip-runner/protocol/fixtures/** text eol=lf
+packages/paperclip-runner/protocol/manifest.json text eol=lf
+packages/paperclip-runner/src/protocol/generated/schema-bundle.ts text eol=lf
+packages/paperclip-runner/generated/semantic-action-catalog.json text eol=lf

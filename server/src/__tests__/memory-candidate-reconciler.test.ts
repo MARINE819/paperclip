@@ -14,6 +14,7 @@ import {
   heartbeatRuns,
   issueDocuments,
   issues,
+  issueWorkProducts,
   memoryOperations,
   principalPermissionGrants,
 } from "@paperclipai/db";
@@ -47,6 +48,7 @@ import {
 async function resetFixtures(db: Db) {
   await db.delete(activityLog);
   await db.delete(memoryOperations);
+  await db.delete(issueWorkProducts);
   await db.delete(issueDocuments);
   await db.delete(documentRevisions);
   await db.delete(documents);
@@ -122,6 +124,23 @@ describeEmbeddedPostgres("automatic memory candidate reconciliation (Phase 3.0B)
       key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
     });
     return { documentId, revisionId, body };
+  }
+
+  async function seedWorkProduct(
+    companyId: string,
+    issueId: string,
+    opts: { healthStatus?: "unknown" | "healthy" | "unhealthy"; reviewState?: string } = {},
+  ) {
+    await ctx.db.insert(issueWorkProducts).values({
+      companyId,
+      issueId,
+      type: "pull_request",
+      provider: "github",
+      title: "Test work product",
+      status: "active",
+      healthStatus: opts.healthStatus ?? "unknown",
+      reviewState: opts.reviewState ?? "none",
+    });
   }
 
   function buildApp(actor: BoardActor) {
@@ -567,6 +586,79 @@ describeEmbeddedPostgres("automatic memory candidate reconciliation (Phase 3.0B)
         delete process.env.PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_INTERVAL_MS;
       }
     }
+  });
+
+  describe("M2-03-B05 evidence-informed candidate confidence", () => {
+    it("no work products -> confidence stays null (no evidence, never fabricated)", async () => {
+      const company = await seedCompanyWithBoardAccess(ctx.db, "Reconciler Co");
+      const issueId = await seedIssue(company.companyId);
+      await seedContinuationSummary(company.companyId, issueId);
+
+      const result = await extractMemoryOperationCandidateFromCompletedIssue(ctx.db, company.companyId, issueId, {
+        actorType: "user",
+        actorId: company.userId,
+        agentId: null,
+        runId: null,
+      });
+      expect(result.outcome).toBe("created");
+      const [row] = await ctx.db.select().from(memoryOperations).where(eq(memoryOperations.sourceIssueId, issueId));
+      expect(row!.confidence).toBeNull();
+    });
+
+    it("all work products healthy + board-approved -> confidence 0.8", async () => {
+      const company = await seedCompanyWithBoardAccess(ctx.db, "Reconciler Co");
+      const issueId = await seedIssue(company.companyId);
+      await seedContinuationSummary(company.companyId, issueId);
+      await seedWorkProduct(company.companyId, issueId, { healthStatus: "healthy", reviewState: "approved" });
+
+      await extractMemoryOperationCandidateFromCompletedIssue(ctx.db, company.companyId, issueId, {
+        actorType: "user",
+        actorId: company.userId,
+        agentId: null,
+        runId: null,
+      });
+      const [row] = await ctx.db.select().from(memoryOperations).where(eq(memoryOperations.sourceIssueId, issueId));
+      expect(row!.confidence).toBe(0.8);
+    });
+
+    it("all work products healthy but unreviewed -> confidence 0.5 (weaker, uncorroborated evidence)", async () => {
+      const company = await seedCompanyWithBoardAccess(ctx.db, "Reconciler Co");
+      const issueId = await seedIssue(company.companyId);
+      await seedContinuationSummary(company.companyId, issueId);
+      await seedWorkProduct(company.companyId, issueId, { healthStatus: "healthy", reviewState: "none" });
+
+      await extractMemoryOperationCandidateFromCompletedIssue(ctx.db, company.companyId, issueId, {
+        actorType: "user",
+        actorId: company.userId,
+        agentId: null,
+        runId: null,
+      });
+      const [row] = await ctx.db.select().from(memoryOperations).where(eq(memoryOperations.sourceIssueId, issueId));
+      expect(row!.confidence).toBe(0.5);
+    });
+
+    it("any unhealthy or changes-requested work product -> confidence stays null, never a deflated-but-asserted number", async () => {
+      const company = await seedCompanyWithBoardAccess(ctx.db, "Reconciler Co");
+      const issueIdUnhealthy = await seedIssue(company.companyId);
+      await seedContinuationSummary(company.companyId, issueIdUnhealthy, { body: "# A" });
+      await seedWorkProduct(company.companyId, issueIdUnhealthy, { healthStatus: "healthy", reviewState: "approved" });
+      await seedWorkProduct(company.companyId, issueIdUnhealthy, { healthStatus: "unhealthy", reviewState: "none" });
+
+      const issueIdChangesRequested = await seedIssue(company.companyId);
+      await seedContinuationSummary(company.companyId, issueIdChangesRequested, { body: "# B" });
+      await seedWorkProduct(company.companyId, issueIdChangesRequested, { healthStatus: "healthy", reviewState: "changes_requested" });
+
+      for (const issueId of [issueIdUnhealthy, issueIdChangesRequested]) {
+        await extractMemoryOperationCandidateFromCompletedIssue(ctx.db, company.companyId, issueId, {
+          actorType: "user",
+          actorId: company.userId,
+          agentId: null,
+          runId: null,
+        });
+        const [row] = await ctx.db.select().from(memoryOperations).where(eq(memoryOperations.sourceIssueId, issueId));
+        expect(row!.confidence).toBeNull();
+      }
+    });
   });
 });
 

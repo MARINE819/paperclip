@@ -10,6 +10,7 @@ import {
   createDb,
   heartbeatRuns,
   issues,
+  issueWorkProducts,
   knowledgeRecords,
   memoryOperations,
 } from "@paperclipai/db";
@@ -59,6 +60,7 @@ describeEmbeddedPostgres("Knowledge Layer integration tests", () => {
     await db.delete(activityLog);
     await db.delete(knowledgeRecords);
     await db.delete(memoryOperations);
+    await db.delete(issueWorkProducts);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -308,6 +310,74 @@ describeEmbeddedPostgres("Knowledge Layer integration tests", () => {
       const emptyQ = await svc.listKnowledgeRecords(company1Id, { q: "   " });
       expect(emptyQ).toHaveLength(3);
     });
+
+    it("M2-03-B03: rejected is excluded by default, verified ranks ahead of unverified, and explicit filters/includeRejected override the defaults", async () => {
+      await seedCompany(company1Id);
+      await seedCompany(company2Id);
+      const svc = knowledgeService(db);
+
+      // Older verified record and a newer unverified one -- recency alone
+      // would put the unverified one first; verification rank must win.
+      const olderVerified = new Date("2026-01-01T00:00:00Z");
+      const newerUnverified = new Date("2026-02-01T00:00:00Z");
+      const [verifiedRow] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id,
+        title: "Verified Older",
+        body: "body",
+        verificationStatus: "verified",
+        knowledgeType: "FACT",
+        createdAt: olderVerified,
+      }).returning();
+      const [unverifiedRow] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id,
+        title: "Unverified Newer",
+        body: "body",
+        verificationStatus: "unverified",
+        knowledgeType: "OPINION",
+        createdAt: newerUnverified,
+      }).returning();
+      const [rejectedRow] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id,
+        title: "Rejected Record",
+        body: "body",
+        verificationStatus: "rejected",
+        createdAt: newerUnverified,
+      }).returning();
+      // Company isolation control row: same title keyword, different company.
+      await db.insert(knowledgeRecords).values({
+        companyId: company2Id,
+        title: "Verified Older",
+        body: "body",
+        verificationStatus: "verified",
+      });
+
+      // 1. Default: rejected excluded, verified ranks ahead of unverified
+      //    despite being older.
+      const defaultList = await svc.listKnowledgeRecords(company1Id);
+      expect(defaultList.map((r) => r.id)).toEqual([verifiedRow!.id, unverifiedRow!.id]);
+
+      // 2. includeRejected=true surfaces it, still ranked last.
+      const withRejected = await svc.listKnowledgeRecords(company1Id, { includeRejected: true });
+      expect(withRejected.map((r) => r.id)).toEqual([verifiedRow!.id, unverifiedRow!.id, rejectedRow!.id]);
+
+      // 3. Explicit verificationStatus: "rejected" filter works even
+      //    WITHOUT includeRejected -- deliberate intent overrides the default.
+      const onlyRejected = await svc.listKnowledgeRecords(company1Id, { verificationStatus: "rejected" });
+      expect(onlyRejected.map((r) => r.id)).toEqual([rejectedRow!.id]);
+
+      // 4. verificationStatus filter narrows to exactly that state.
+      const onlyVerified = await svc.listKnowledgeRecords(company1Id, { verificationStatus: "verified" });
+      expect(onlyVerified.map((r) => r.id)).toEqual([verifiedRow!.id]);
+
+      // 5. knowledgeType filter.
+      const onlyFact = await svc.listKnowledgeRecords(company1Id, { knowledgeType: "FACT" });
+      expect(onlyFact.map((r) => r.id)).toEqual([verifiedRow!.id]);
+
+      // 6. Company isolation preserved under the new filters too.
+      const company2Default = await svc.listKnowledgeRecords(company2Id);
+      expect(company2Default).toHaveLength(1);
+      expect(company2Default[0]!.companyId).toBe(company2Id);
+    });
   });
 
   describe("M2-03-B01 Knowledge Revision & Confidence Hardening", () => {
@@ -474,6 +544,245 @@ describeEmbeddedPostgres("Knowledge Layer integration tests", () => {
       });
       expect(afterSecondResave.confidence).toBe(0.4);
       expect(afterSecondResave.revisionNumber).toBe(3);
+    });
+  });
+
+  describe("M2-03-B02 Knowledge Verification Status & Type Taxonomy", () => {
+    it("promotion sets verificationStatus='verified', since it already requires reviewState='approved'", async () => {
+      await seedCompany(company1Id);
+      const [op] = await db.insert(memoryOperations).values({
+        companyId: company1Id,
+        sourceType: "issue",
+        sourceId: "ISS-B02-1",
+        content: "Verified fact",
+        status: "candidate",
+        reviewState: "approved",
+      }).returning();
+
+      const svc = knowledgeService(db);
+      const { knowledgeRecord } = await svc.promoteMemoryOperation(op.id, {
+        title: "B02 Wiki Page",
+        body: "Verified fact body",
+      });
+
+      expect(knowledgeRecord.verificationStatus).toBe("verified");
+    });
+
+    it("a direct insert with an invalid knowledgeType is rejected by the DB CHECK constraint", async () => {
+      await seedCompany(company1Id);
+      await expect(
+        db.insert(knowledgeRecords).values({
+          companyId: company1Id,
+          knowledgeType: "NOT_A_REAL_TYPE",
+          title: "Invalid Type Page",
+          body: "Body text",
+        }),
+      ).rejects.toThrow();
+    });
+
+    it("NULL knowledgeType remains valid (backward compatibility for every existing and most new rows)", async () => {
+      await seedCompany(company1Id);
+      const [row] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id,
+        knowledgeType: null,
+        title: "Untyped Page",
+        body: "Body text",
+      }).returning();
+      expect(row!.knowledgeType).toBeNull();
+    });
+
+    it("each of the four constrained knowledgeType values is accepted", async () => {
+      await seedCompany(company1Id);
+      for (const kt of ["FACT", "OPINION", "ANALYSIS", "DECISION"] as const) {
+        const [row] = await db.insert(knowledgeRecords).values({
+          companyId: company1Id,
+          knowledgeType: kt,
+          title: `${kt} Page`,
+          body: "Body text",
+        }).returning();
+        expect(row!.knowledgeType).toBe(kt);
+      }
+    });
+
+    it("a direct insert with an invalid verificationStatus is rejected by the DB CHECK constraint", async () => {
+      await seedCompany(company1Id);
+      await expect(
+        db.insert(knowledgeRecords).values({
+          companyId: company1Id,
+          verificationStatus: "NOT_A_REAL_STATUS" as never,
+          title: "Invalid Status Page",
+          body: "Body text",
+        }),
+      ).rejects.toThrow();
+    });
+
+    it("a row written without an explicit verificationStatus defaults to 'unverified'", async () => {
+      await seedCompany(company1Id);
+      const [row] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id,
+        title: "Default Status Page",
+        body: "Body text",
+      }).returning();
+      expect(row!.verificationStatus).toBe("unverified");
+    });
+  });
+
+  describe("M2-03-B07 getKnowledgeUsageEffectiveness", () => {
+    async function seedRunWithIssueAndWorkProduct(
+      companyId: string,
+      agentId: string,
+      opts: { issueStatus?: string; healthStatus?: "unknown" | "healthy" | "unhealthy"; costUsd?: string; actualExecutor?: string } = {},
+    ) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Fix the thing",
+        identifier: `NEX-${issueId.slice(0, 8)}`,
+        status: opts.issueStatus ?? "done",
+      });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        nativeIssueId: issueId,
+        resultJson: { total_cost_usd: opts.costUsd ?? "0.12", actualExecutor: opts.actualExecutor ?? "codex_local" },
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        createdByRunId: runId,
+        type: "pull_request",
+        provider: "github",
+        title: "PR for the fix",
+        status: "active",
+        healthStatus: opts.healthStatus ?? "healthy",
+      });
+      return { issueId, runId };
+    }
+
+    it("links a knowledge record's usage to the exact run, work product, outcome, cost, and executor", async () => {
+      await seedCompany(company1Id);
+      await seedAgent(company1Id, agent1Id);
+      const [record] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id,
+        title: "Reusable fix pattern",
+        body: "body",
+        verificationStatus: "verified",
+      }).returning();
+      const { issueId, runId } = await seedRunWithIssueAndWorkProduct(company1Id, agent1Id, {
+        issueStatus: "done",
+        healthStatus: "healthy",
+        costUsd: "0.42",
+        actualExecutor: "claude_local",
+      });
+      await db.insert(activityLog).values({
+        companyId: company1Id,
+        actorType: "system",
+        actorId: "heartbeat_context_build",
+        entityType: "knowledge_record",
+        entityId: record!.id,
+        agentId: agent1Id,
+        runId,
+        action: "knowledge_record.injected_into_context",
+      });
+
+      const svc = knowledgeService(db);
+      const entries = await svc.getKnowledgeUsageEffectiveness(company1Id, record!.id);
+
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        runId,
+        agentId: agent1Id,
+        issueId,
+        issueStatus: "done",
+        costUsd: "0.42",
+        actualExecutor: "claude_local",
+      });
+      expect(entries[0]!.workProducts).toHaveLength(1);
+      expect(entries[0]!.workProducts[0]).toMatchObject({ healthStatus: "healthy" });
+    });
+
+    it("returns an empty array for a knowledge record that was never used in any run", async () => {
+      await seedCompany(company1Id);
+      const [record] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id,
+        title: "Never used",
+        body: "body",
+        verificationStatus: "verified",
+      }).returning();
+
+      const svc = knowledgeService(db);
+      expect(await svc.getKnowledgeUsageEffectiveness(company1Id, record!.id)).toEqual([]);
+    });
+
+    it("never includes another company's usage, even for the same knowledge-record id collision window", async () => {
+      await seedCompany(company1Id);
+      await seedCompany(company2Id);
+      await seedAgent(company1Id, agent1Id);
+      await seedAgent(company2Id, agent2Id);
+      const [record1] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id,
+        title: "Company 1 knowledge",
+        body: "body",
+        verificationStatus: "verified",
+      }).returning();
+      const { runId: run1Id } = await seedRunWithIssueAndWorkProduct(company1Id, agent1Id);
+      await db.insert(activityLog).values({
+        companyId: company1Id,
+        actorType: "system",
+        actorId: "heartbeat_context_build",
+        entityType: "knowledge_record",
+        entityId: record1!.id,
+        agentId: agent1Id,
+        runId: run1Id,
+        action: "knowledge_record.injected_into_context",
+      });
+      // A different company's activity for an unrelated entityId -- must never surface
+      // when querying company1's record, even though both companies share this table.
+      const { runId: run2Id } = await seedRunWithIssueAndWorkProduct(company2Id, agent2Id);
+      await db.insert(activityLog).values({
+        companyId: company2Id,
+        actorType: "system",
+        actorId: "heartbeat_context_build",
+        entityType: "knowledge_record",
+        entityId: randomUUID(),
+        agentId: agent2Id,
+        runId: run2Id,
+        action: "knowledge_record.injected_into_context",
+      });
+
+      const svc = knowledgeService(db);
+      const entries = await svc.getKnowledgeUsageEffectiveness(company1Id, record1!.id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!.runId).toBe(run1Id);
+    });
+
+    it("excludes a run that did not actually use this specific knowledge record, even if other activity exists for the same run", async () => {
+      await seedCompany(company1Id);
+      await seedAgent(company1Id, agent1Id);
+      const [recordA] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id, title: "A", body: "body", verificationStatus: "verified",
+      }).returning();
+      const [recordB] = await db.insert(knowledgeRecords).values({
+        companyId: company1Id, title: "B", body: "body", verificationStatus: "verified",
+      }).returning();
+      const { runId } = await seedRunWithIssueAndWorkProduct(company1Id, agent1Id);
+      // Only recordA was actually injected into this run's context.
+      await db.insert(activityLog).values({
+        companyId: company1Id,
+        actorType: "system",
+        actorId: "heartbeat_context_build",
+        entityType: "knowledge_record",
+        entityId: recordA!.id,
+        agentId: agent1Id,
+        runId,
+        action: "knowledge_record.injected_into_context",
+      });
+
+      const svc = knowledgeService(db);
+      expect(await svc.getKnowledgeUsageEffectiveness(company1Id, recordB!.id)).toEqual([]);
     });
   });
 });

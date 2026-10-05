@@ -9,11 +9,13 @@ import {
   index,
   uniqueIndex,
   jsonb,
+  check,
 } from "drizzle-orm/pg-core";
 import type {
   KnowledgeRecordStatus,
   ObsidianSyncState,
   KnowledgeSyncState,
+  KnowledgeVerificationStatus,
 } from "@paperclipai/shared";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
@@ -79,6 +81,17 @@ export const knowledgeRecords = pgTable(
     // transaction as the row itself.
     latestRevisionId: uuid("latest_revision_id"),
     revisionNumber: integer("revision_number").notNull().default(1),
+    // M2-03-B02 Knowledge Verification & Type Taxonomy — additive only.
+    // verificationStatus is set to "verified" by the existing promotion gate
+    // (promoteMemoryOperation already requires reviewState === "approved"
+    // before a knowledge record can even be created) — this is not a new
+    // approval mechanism, just a durable record of the one that already
+    // exists. Defaults to "unverified" for any row written through a path
+    // that doesn't explicitly set it.
+    verificationStatus: text("verification_status")
+      .$type<KnowledgeVerificationStatus>()
+      .notNull()
+      .default("unverified"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -111,5 +124,18 @@ export const knowledgeRecords = pgTable(
     sourceMemoryOperationUq: uniqueIndex("knowledge_records_source_mem_op_uq")
       .on(table.sourceMemoryOperationId)
       .where(sql`${table.sourceMemoryOperationId} IS NOT NULL`),
+    // M2-03-B02: knowledgeType stays free-text at the column level (so a
+    // historical pre-B02 value is never rejected by a migration), but every
+    // NEW write is constrained here. NULL remains explicitly allowed —
+    // every row written before B02 (and most written after, until a caller
+    // opts in) has knowledgeType === NULL, which must stay valid forever.
+    knowledgeTypeCheck: check(
+      "knowledge_records_knowledge_type_check",
+      sql`${table.knowledgeType} IS NULL OR ${table.knowledgeType} IN ('FACT', 'OPINION', 'ANALYSIS', 'DECISION')`,
+    ),
+    verificationStatusCheck: check(
+      "knowledge_records_verification_status_check",
+      sql`${table.verificationStatus} IN ('unverified', 'verified', 'rejected')`,
+    ),
   }),
 );

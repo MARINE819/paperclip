@@ -14,6 +14,13 @@ import type { KnowledgeServiceOptions } from "../services/knowledge.js";
 import { extractMemoryOperationCandidateFromCompletedIssue } from "../services/memory-candidate-extraction.js";
 import { assertCompanyAccess, assertBoard, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 
+// M2-03-B03: the authoritative allow-lists this route validates query params
+// against, mirroring the DB CHECK constraints added in B02 -- kept as a
+// local array rather than importing the shared union type's members, since
+// TypeScript unions aren't iterable at runtime.
+const KNOWLEDGE_VERIFICATION_STATUSES = ["unverified", "verified", "rejected"] as const;
+const KNOWLEDGE_TYPES = ["FACT", "OPINION", "ANALYSIS", "DECISION"] as const;
+
 export function knowledgeRoutes(db: Db, options: KnowledgeServiceOptions = {}) {
   const router = Router();
   const service = knowledgeService(db, options);
@@ -114,7 +121,15 @@ export function knowledgeRoutes(db: Db, options: KnowledgeServiceOptions = {}) {
         limit = Math.floor(parsed);
       }
     }
-    res.json(await service.listKnowledgeRecords(companyId, { q, limit }));
+    // M2-03-B03: an unrecognized value for either filter is dropped rather
+    // than passed through -- a malformed query param should never silently
+    // become an always-false (or always-true) filter.
+    const verificationStatus = KNOWLEDGE_VERIFICATION_STATUSES.find((v) => v === req.query.verificationStatus);
+    const knowledgeType = KNOWLEDGE_TYPES.find((t) => t === req.query.knowledgeType);
+    const includeRejected = req.query.includeRejected === "true";
+    res.json(
+      await service.listKnowledgeRecords(companyId, { q, limit, verificationStatus, knowledgeType, includeRejected }),
+    );
   });
 
   router.get("/knowledge-records/:id", async (req, res) => {

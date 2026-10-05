@@ -20,6 +20,7 @@ import {
 } from "./memory-candidate-failure-cooldown.js";
 import { getIssueContinuationSummaryDocument } from "./issue-continuation-summary.js";
 import { assertOptionalCompanyReference } from "./knowledge.js";
+import { workProductService } from "./work-products.js";
 
 /**
  * Deterministic Memory Operation candidate extraction from a completed
@@ -87,6 +88,36 @@ export function buildContinuationSummaryExtractionKey(input: {
   );
 }
 
+// M2-03-B05: derives confidence ONLY from the issue's own existing, already-
+// populated IssueWorkProduct rows (healthStatus / reviewState) -- the one
+// real, live-written verification signal available for a completed issue.
+// (work_assessments/completion_contracts were evaluated and rejected as a
+// source: confirmed by repo-wide search to have zero populating service
+// code anywhere, and an undocumented assessmentJson/contractJson shape --
+// deriving confidence from an unobserved, unpopulated contract would itself
+// be the "fabricated confidence" this function exists to prevent.)
+//
+// No evidence -> null (never 0, which would assert "confirmed untrustworthy"
+// rather than "no signal available"). Any unhealthy or changes-requested
+// work product -> null, never a deflated-but-still-asserted number: mixed/
+// failed evidence must not produce a confidence claim at all. Only when
+// EVERY work product is healthy do we return a positive value, and only
+// 0.8 (not 1.0) when at least one was also board-approved -- reviewed
+// evidence is stronger than merely "ran without error," but neither case
+// is treated as certainty.
+async function deriveConfidenceFromWorkProducts(db: Db, issueId: string): Promise<number | null> {
+  const products = await workProductService(db).listForIssue(issueId);
+  if (products.length === 0) return null;
+  const anyUnhealthyOrRejected = products.some(
+    (p) => p.healthStatus === "unhealthy" || p.reviewState === "changes_requested",
+  );
+  if (anyUnhealthyOrRejected) return null;
+  const allHealthy = products.every((p) => p.healthStatus === "healthy");
+  if (!allHealthy) return null;
+  const anyApproved = products.some((p) => p.reviewState === "approved");
+  return anyApproved ? 0.8 : 0.5;
+}
+
 export async function extractMemoryOperationCandidateFromCompletedIssue(
   db: Db,
   companyId: string,
@@ -129,6 +160,7 @@ export async function extractMemoryOperationCandidateFromCompletedIssue(
 
   const contentHash = sha256Hex(revision.body);
   const extractionKey = buildContinuationSummaryExtractionKey({ companyId, sourceId: revision.id, contentHash });
+  const confidence = await deriveConfidenceFromWorkProducts(db, issue.id);
 
   const values = {
     companyId,
@@ -140,7 +172,7 @@ export async function extractMemoryOperationCandidateFromCompletedIssue(
     title: `${issue.identifier ?? issue.id} — Continuation Summary`,
     summary: null,
     content: revision.body,
-    confidence: null,
+    confidence,
     extractionKey,
     metadata: {
       extractorVersion: MEMORY_CANDIDATE_EXTRACTOR_VERSION,

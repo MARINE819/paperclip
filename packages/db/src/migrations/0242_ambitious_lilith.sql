@@ -1,0 +1,3 @@
+ALTER TABLE "knowledge_records" ADD COLUMN "verification_status" text DEFAULT 'unverified' NOT NULL;--> statement-breakpoint
+ALTER TABLE "knowledge_records" ADD CONSTRAINT "knowledge_records_knowledge_type_check" CHECK ("knowledge_records"."knowledge_type" IS NULL OR "knowledge_records"."knowledge_type" IN ('FACT', 'OPINION', 'ANALYSIS', 'DECISION'));--> statement-breakpoint
+ALTER TABLE "knowledge_records" ADD CONSTRAINT "knowledge_records_verification_status_check" CHECK ("knowledge_records"."verification_status" IN ('unverified', 'verified', 'rejected'));

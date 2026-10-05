@@ -1,15 +1,17 @@
 import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agents,
   approvals,
   heartbeatRuns,
   issues,
+  issueWorkProducts,
   knowledgeRecords,
   knowledgeRecordRevisions,
   memoryOperations,
 } from "@paperclipai/db";
-import type { MemorySourceType } from "@paperclipai/shared";
+import type { MemorySourceType, KnowledgeVerificationStatus, KnowledgeType } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { knowledgeRecordLockKey, withKnowledgeRecordLock } from "./knowledge-record-lock.js";
 import {
@@ -45,6 +47,18 @@ type PromoteMemoryOperationInput = {
 export type ListKnowledgeRecordsOptions = {
   q?: string;
   limit?: number;
+  // M2-03-B03: narrow to a specific verification state. Independent of
+  // includeRejected below — passing verificationStatus: "rejected" explicitly
+  // still works even with includeRejected left false, since an explicit
+  // filter is deliberate caller intent, not the default "don't show me
+  // rejected material by accident" behavior includeRejected guards against.
+  verificationStatus?: KnowledgeVerificationStatus;
+  knowledgeType?: KnowledgeType;
+  // M2-03-B03: rejected knowledge is excluded from the default result set —
+  // a human explicitly rejected that content, so surfacing it by default
+  // (even ranked last) risks presenting disapproved material as if it were
+  // just low-priority. Only an explicit opt-in returns it.
+  includeRejected?: boolean;
 };
 
 // M2-03-B01: baseRevisionId is required and compared against the record's
@@ -276,6 +290,11 @@ export function knowledgeService(db: Db, options: KnowledgeServiceOptions = {}) 
         // new independent evidence about the content's truth.
         confidence: operation.confidence,
         revisionNumber: 1,
+        // M2-03-B02: this is the SAME human approval already checked above
+        // (operation.reviewState === "approved") — not a new gate. Promotion
+        // is the only path that creates a knowledge_records row, so every
+        // row this function produces is "verified" by construction.
+        verificationStatus: "verified",
       }).returning();
       // M2-03-B01: revision 1 is created in the SAME transaction as the
       // knowledge record itself, so a record can never exist without its
@@ -376,11 +395,30 @@ export function knowledgeService(db: Db, options: KnowledgeServiceOptions = {}) 
           )!,
         );
       }
+      if (options?.verificationStatus) {
+        // Explicit filter wins outright -- even for "rejected", independent
+        // of includeRejected below (deliberate caller intent, not the
+        // accidental-default case that flag guards against).
+        conditions.push(eq(knowledgeRecords.verificationStatus, options.verificationStatus));
+      } else if (!options?.includeRejected) {
+        conditions.push(sql`${knowledgeRecords.verificationStatus} <> 'rejected'`);
+      }
+      if (options?.knowledgeType) {
+        conditions.push(eq(knowledgeRecords.knowledgeType, options.knowledgeType));
+      }
       const baseQuery = db
         .select()
         .from(knowledgeRecords)
         .where(and(...conditions))
-        .orderBy(desc(knowledgeRecords.createdAt), desc(knowledgeRecords.id));
+        .orderBy(
+          // M2-03-B03: verified ranks ahead of unverified ranks ahead of
+          // rejected (reachable only via an explicit filter/includeRejected,
+          // per above) -- recency remains the tie-break WITHIN each rank,
+          // never overriding it.
+          sql`case ${knowledgeRecords.verificationStatus} when 'verified' then 0 when 'unverified' then 1 else 2 end`,
+          desc(knowledgeRecords.createdAt),
+          desc(knowledgeRecords.id),
+        );
       if (typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
         return baseQuery.limit(Math.min(Math.floor(options.limit), 500));
       }
@@ -401,5 +439,59 @@ export function knowledgeService(db: Db, options: KnowledgeServiceOptions = {}) 
     // instead of duplicating it.
     syncKnowledgeRecordObsidian: (companyId: string, id: string) =>
       syncKnowledgeRecordToBackend(db, backend, companyId, id),
+
+    // M2-03-B07: pure measurement, read-only. Joins the B06 usage log
+    // (activityLog, action "knowledge_record.injected_into_context") back to
+    // each run's own already-existing signals -- never fabricates an
+    // outcome, never touches confidence/verificationStatus/ranking, and
+    // reads NOTHING from work_assessments/completion_contracts (confirmed in
+    // B05 to have no live producer and no documented contract -- using them
+    // here would be the same unverifiable-signal risk, not "more evidence").
+    getKnowledgeUsageEffectiveness: async (companyId: string, knowledgeRecordId: string) => {
+      const usageRows = await db
+        .select({ runId: activityLog.runId, agentId: activityLog.agentId, usedAt: activityLog.createdAt })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.entityType, "knowledge_record"),
+            eq(activityLog.entityId, knowledgeRecordId),
+            eq(activityLog.action, "knowledge_record.injected_into_context"),
+          ),
+        )
+        .orderBy(desc(activityLog.createdAt));
+
+      const entries = [];
+      for (const usage of usageRows) {
+        if (!usage.runId) continue;
+        const run = await db.select().from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, usage.runId), eq(heartbeatRuns.companyId, companyId)))
+          .limit(1).then((rows) => rows[0] ?? null);
+        if (!run) continue;
+        const issue = run.nativeIssueId
+          ? await db.select({ status: issues.status }).from(issues)
+            .where(and(eq(issues.id, run.nativeIssueId), eq(issues.companyId, companyId)))
+            .limit(1).then((rows) => rows[0] ?? null)
+          : null;
+        const workProducts = await db
+          .select({ id: issueWorkProducts.id, healthStatus: issueWorkProducts.healthStatus, reviewState: issueWorkProducts.reviewState })
+          .from(issueWorkProducts)
+          .where(and(eq(issueWorkProducts.createdByRunId, usage.runId), eq(issueWorkProducts.companyId, companyId)));
+        const resultJson = run.resultJson as Record<string, unknown> | null;
+        const costUsd = typeof resultJson?.total_cost_usd === "string" ? resultJson.total_cost_usd : null;
+        const actualExecutor = typeof resultJson?.actualExecutor === "string" ? resultJson.actualExecutor : null;
+        entries.push({
+          runId: usage.runId,
+          agentId: usage.agentId,
+          usedAt: usage.usedAt,
+          issueId: run.nativeIssueId,
+          issueStatus: issue?.status ?? null,
+          costUsd,
+          actualExecutor,
+          workProducts,
+        });
+      }
+      return entries;
+    },
   };
 }

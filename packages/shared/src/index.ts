@@ -2599,7 +2599,10 @@ export type {
   KnowledgeRecordStatus,
   ObsidianSyncState,
   KnowledgeSyncState,
+  KnowledgeVerificationStatus,
+  KnowledgeType,
   MemoryOperation,
   KnowledgeRecord,
+  KnowledgeRecordRevision,
 } from "./types/knowledge.js";
 

@@ -27,6 +27,17 @@ export type KnowledgeSyncState = "pending" | "synced" | "failed";
 
 export type ObsidianSyncState = KnowledgeSyncState;
 
+// M2-03-B02 — durable record of the ALREADY-EXISTING promotion/review gate's
+// outcome, not a new approval mechanism. "verified" is set automatically by
+// promoteMemoryOperation (which already requires reviewState === "approved").
+export type KnowledgeVerificationStatus = "unverified" | "verified" | "rejected";
+
+// M2-03-B02 — constrained classification. NULL stays valid everywhere (every
+// row written before this batch, and most written after unless a caller
+// opts in, has knowledgeType === null) — this is a narrowing of what NEW
+// non-null values may be, never a requirement that existing rows change.
+export type KnowledgeType = "FACT" | "OPINION" | "ANALYSIS" | "DECISION";
+
 export interface MemoryOperation {
   id: string;
   companyId: string;
@@ -79,6 +90,8 @@ export interface KnowledgeRecord {
   confidence: number | null;
   latestRevisionId: string | null;
   revisionNumber: number;
+  // M2-03-B02 Knowledge Verification & Type Taxonomy — additive only.
+  verificationStatus: KnowledgeVerificationStatus;
   createdAt: Date;
   updatedAt: Date;
   archivedAt: Date | null;

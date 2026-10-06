@@ -69,6 +69,8 @@ export function projectJarvisParentReport(
     acceptedPlanChildIssueIds: [...input.acceptedPlan.childIssueIds].sort(),
     outcome: reconciliation.outcome,
     childStatus: reconciliation.childStatus,
+    reviewRequired: Boolean(reconciliation.reviewRequired),
+    reviewer: reconciliation.reviewer ?? null,
     evidence: acceptedEvidence.map(({ id, fingerprint }) => ({ id, fingerprint })),
     evidenceAcceptance: reconciliation.evidence,
     approvals: [...reconciliation.approvals].sort((a, b) => a.id.localeCompare(b.id)),
@@ -85,6 +87,9 @@ export function projectJarvisParentReport(
   const approvalLines = input.reconciliation.approvals.length
     ? input.reconciliation.approvals.map((approval) => `- ${approval.id}: ${approval.status}`)
     : ["- 연결된 Approval 없음 (현재 canonical execution state에서 필수 아님)"];
+  const reviewLine = reconciliation.reviewRequired
+    ? `- Independent review: PASS (reviewer: ${reconciliation.reviewer ? `${reconciliation.reviewer.type} ${reconciliation.reviewer.id}` : "unknown"}; policy: not_creator)`
+    : "- Independent review: not required";
   const body = [
     "## JARVIS 부모 통합 보고서",
     "",
@@ -94,6 +99,7 @@ export function projectJarvisParentReport(
     `- Accepted plan: ${input.acceptedPlan.decompositionId} / ${input.acceptedPlan.fingerprint}`,
     `- Reconciliation outcome: ${input.reconciliation.outcome}`,
     `- Child status: ${input.reconciliation.childStatus}`,
+    reviewLine,
     `- Execution state fingerprint: ${input.executionStateFingerprint}`,
     `- Approval state fingerprint: ${input.approvalStateFingerprint}`,
     "",
@@ -108,6 +114,11 @@ export function projectJarvisParentReport(
     "",
     `<!-- jarvis-parent-report:${fingerprint} -->`,
   ].join("\n");
+  const reviewerRows = reconciliation.reviewer?.type === "agent"
+    ? [{ type: "agent_link" as const, label: "Independent Reviewer", agentId: reconciliation.reviewer.id }]
+    : reconciliation.reviewer?.type === "user"
+    ? [{ type: "key_value" as const, label: "Independent Reviewer", value: `user:${reconciliation.reviewer.id}` }]
+    : [];
   const metadata: IssueCommentMetadata = {
     version: 1,
     sections: [{
@@ -117,6 +128,7 @@ export function projectJarvisParentReport(
         { type: "issue_link", label: "Parent Issue", issueId: input.parent.id, identifier: input.parent.identifier },
         { type: "issue_link", label: "Child Issue", issueId: input.child.id, identifier: input.child.identifier },
         { type: "agent_link", label: "JARVIS", agentId: input.jarvisAgentId },
+        ...reviewerRows,
       ],
     }],
   };

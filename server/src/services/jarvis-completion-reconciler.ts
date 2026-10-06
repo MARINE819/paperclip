@@ -24,7 +24,11 @@ interface ReconciliationContext {
 }
 
 export type JarvisCompletionReconciliationResult =
-  | (ReconciliationContext & { outcome: "ready_for_jarvis_review"; evidence: JarvisEvidenceAcceptanceResult })
+  | (ReconciliationContext & {
+      outcome: "ready_for_jarvis_review";
+      evidence: JarvisEvidenceAcceptanceResult;
+      reviewer?: IssueReviewVerdictActor | null;
+    })
   | (ReconciliationContext & { outcome: "awaiting_independent_review" })
   | (ReconciliationContext & { outcome: "child_not_terminal" })
   | (ReconciliationContext & { outcome: "missing_evidence"; evidence: JarvisEvidenceAcceptanceResult })
@@ -153,6 +157,7 @@ export async function reconcileDelegatedChildCompletion(
   if (workProducts.length === 0) return { ...context, outcome: "missing_evidence", evidence };
   if (!evidence.accepted) return { ...context, outcome: "invalid_or_unreadable_work_product", evidence };
 
+  let reviewer: IssueReviewVerdictActor | null = null;
   if (reviewRequired) {
     const verdictActor = await resolveIssueReviewVerdictActor(db, child);
     if (!verdictActor) {
@@ -179,7 +184,8 @@ export async function reconcileDelegatedChildCompletion(
         reason: "unable_to_verify_review_authorization",
       };
     }
+    reviewer = verdictActor;
   }
 
-  return { ...context, outcome: "ready_for_jarvis_review", evidence };
+  return { ...context, outcome: "ready_for_jarvis_review", evidence, reviewer };
 }

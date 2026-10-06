@@ -274,6 +274,7 @@ describe("reconcileDelegatedChildCompletion", () => {
     expect(result).toMatchObject({
       outcome: "ready_for_jarvis_review",
       reviewRequired: true,
+      reviewer: { type: "agent", id: "reviewer-1" },
     });
     expect(mocks.assertIssueReviewVerdictActorAllowed).toHaveBeenCalledWith(
       db,
@@ -283,6 +284,20 @@ describe("reconcileDelegatedChildCompletion", () => {
         reviewPolicy: "not_creator",
       }),
     );
+  });
+
+  it("preserves reviewer as null when reviewRequired is false", async () => {
+    const result = await reconcileDelegatedChildCompletion({} as never, {
+      companyId: "company",
+      parentIssueId: "parent",
+      resolvedChildIssueId: "child",
+      reviewRequired: false,
+    });
+    expect(result).toMatchObject({
+      outcome: "ready_for_jarvis_review",
+      reviewRequired: false,
+      reviewer: null,
+    });
   });
 });
 });

@@ -144,7 +144,10 @@ import { artifactReviewDocumentService } from "../services/artifact-review-docum
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
 import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
 import { reconcileDelegatedChildCompletion } from "../services/jarvis-completion-reconciler.js";
-import { runJarvisParentReportAction } from "../services/jarvis-parent-report-action.js";
+import {
+  attemptAutomaticJarvisParentReport,
+  runJarvisParentReportAction,
+} from "../services/jarvis-parent-report-action.js";
 import { shouldBlockAgentDelegatedParentCompletion } from "../services/jarvis-parent-completion-guard.js";
 import { shouldBlockAgentSelfActionOnOwnWorkProduct } from "../services/work-product-self-action-guard.js";
 import { submitToJarvis } from "../services/jarvis-delegation-orchestrator.js";
@@ -11027,6 +11030,12 @@ export function issueRoutes(
               childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
             },
           });
+          await attemptAutomaticJarvisParentReport(db, {
+            companyId: issue.companyId,
+            parentIssueId: parent.id,
+            parentAssigneeAgentId: parent.assigneeAgentId,
+            completedChildIssueId: issue.id,
+          });
         }
       }
 
@@ -12988,6 +12997,12 @@ export function issueRoutes(
               childIssueSummaries: parent.childIssueSummaries,
               childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
             },
+          });
+          await attemptAutomaticJarvisParentReport(db, {
+            companyId: currentIssue.companyId,
+            parentIssueId: parent.id,
+            parentAssigneeAgentId: parent.assigneeAgentId,
+            completedChildIssueId: currentIssue.id,
           });
         }
       }

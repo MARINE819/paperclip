@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { runJarvisParentReportAction } from "./jarvis-parent-report-action.js";
+import { attemptAutomaticJarvisParentReport, runJarvisParentReportAction } from "./jarvis-parent-report-action.js";
 
 const mocks = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -244,5 +244,107 @@ describe("runJarvisParentReportAction", () => {
       const fromSecond = mocks.project.mock.calls[0][0].children.map((c: { id: string }) => c.id).sort();
       expect(fromSecond).toEqual(fromFirst);
     });
+  });
+});
+
+describe("attemptAutomaticJarvisParentReport", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getById.mockImplementation(issuesById({ [parentId]: parent, [childId]: child }));
+    mocks.listAcceptedPlanDecompositions.mockResolvedValue([{ id: "d-1", requestFingerprint: "plan-fp", childIssueIds: [childId] }]);
+    mocks.listForIssue.mockResolvedValue([{ id: "wp-1", type: "document", status: "ready", reviewState: "accepted", healthStatus: "healthy", url: "https://example.test", metadata: null, updatedAt: new Date("2026-01-01") }]);
+    mocks.listApprovalsForIssue.mockResolvedValue([]);
+    mocks.reconcile.mockResolvedValue(ready);
+    mocks.project.mockReturnValue({ fingerprint: "fp", canonical: {}, body: "report", metadata: {} });
+    mocks.write.mockResolvedValue({ outcome: "created", fingerprint: "fp", commentId: "comment-1" });
+  });
+
+  it("returns null and never reconciles when the parent has no accepted-plan decomposition for this child (ordinary issue, no effect)", async () => {
+    mocks.listAcceptedPlanDecompositions.mockResolvedValue([]);
+    const result = await attemptAutomaticJarvisParentReport({} as never, {
+      companyId,
+      parentIssueId: parentId,
+      parentAssigneeAgentId: jarvisId,
+      completedChildIssueId: childId,
+    });
+    expect(result).toBeNull();
+    expect(mocks.reconcile).not.toHaveBeenCalled();
+    expect(mocks.project).not.toHaveBeenCalled();
+    expect(mocks.write).not.toHaveBeenCalled();
+  });
+
+  it("writes the aggregated report automatically when the decomposition is fully ready", async () => {
+    const result = await attemptAutomaticJarvisParentReport({} as never, {
+      companyId,
+      parentIssueId: parentId,
+      parentAssigneeAgentId: jarvisId,
+      completedChildIssueId: childId,
+    });
+    expect(result?.report.outcome).toBe("created");
+    expect(mocks.write).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves not_written (and does not throw) when a sibling is not ready yet", async () => {
+    mocks.getById.mockImplementation(issuesById({ [parentId]: parent, [childId]: child, [childId2]: child2 }));
+    mocks.listAcceptedPlanDecompositions.mockResolvedValue([{ id: "d-1", requestFingerprint: "plan-fp", childIssueIds: [childId, childId2] }]);
+    mocks.reconcile.mockImplementation(async (_db: never, input: { resolvedChildIssueId: string }) =>
+      input.resolvedChildIssueId === childId2
+        ? { ...readyFor(childId2), outcome: "revision_required", reason: "changes_requested" }
+        : readyFor(childId),
+    );
+    const result = await attemptAutomaticJarvisParentReport({} as never, {
+      companyId,
+      parentIssueId: parentId,
+      parentAssigneeAgentId: jarvisId,
+      completedChildIssueId: childId,
+    });
+    expect(result?.report).toEqual({ outcome: "not_written" });
+    expect(mocks.project).not.toHaveBeenCalled();
+    expect(mocks.write).not.toHaveBeenCalled();
+  });
+
+  it("resolves not_written when reviewer PASS is still missing", async () => {
+    mocks.reconcile.mockResolvedValue({ ...ready, outcome: "missing_independent_review", reason: "missing_reviewer" });
+    const result = await attemptAutomaticJarvisParentReport({} as never, {
+      companyId,
+      parentIssueId: parentId,
+      parentAssigneeAgentId: jarvisId,
+      completedChildIssueId: childId,
+    });
+    expect(result?.report).toEqual({ outcome: "not_written" });
+    expect(mocks.write).not.toHaveBeenCalled();
+  });
+
+  it("swallows internal errors and returns null instead of throwing (best-effort, never breaks the caller)", async () => {
+    mocks.listAcceptedPlanDecompositions.mockRejectedValue(new Error("boom"));
+    await expect(
+      attemptAutomaticJarvisParentReport({} as never, {
+        companyId,
+        parentIssueId: parentId,
+        parentAssigneeAgentId: jarvisId,
+        completedChildIssueId: childId,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("relies on the existing fingerprint dedup: a repeated trigger for the same ready state does not create a second report", async () => {
+    mocks.write
+      .mockResolvedValueOnce({ outcome: "created", fingerprint: "fp", commentId: "comment-1" })
+      .mockResolvedValueOnce({ outcome: "deduplicated", fingerprint: "fp", commentId: "comment-1" });
+    const first = await attemptAutomaticJarvisParentReport({} as never, {
+      companyId,
+      parentIssueId: parentId,
+      parentAssigneeAgentId: jarvisId,
+      completedChildIssueId: childId,
+    });
+    const second = await attemptAutomaticJarvisParentReport({} as never, {
+      companyId,
+      parentIssueId: parentId,
+      parentAssigneeAgentId: jarvisId,
+      completedChildIssueId: childId,
+    });
+    expect(first?.report.outcome).toBe("created");
+    expect(second?.report.outcome).toBe("deduplicated");
+    expect(mocks.write).toHaveBeenCalledTimes(2);
   });
 });

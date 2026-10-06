@@ -185,3 +185,42 @@ export async function runJarvisParentReportAction(
   const report = await writeJarvisParentReport(db, projection, actor);
   return { reconciliation, report };
 }
+
+/**
+ * Best-effort auto-trigger for the existing, already-verified
+ * runJarvisParentReportAction flow. Callers fire this immediately after a
+ * child issue becomes terminal (the same moment that already queues the
+ * "issue_children_completed" wakeup) so the canonical Parent Report gets
+ * written the instant every sibling is ready, instead of only when some
+ * agent happens to call the HTTP route directly. A no-op for every issue
+ * that isn't part of a JARVIS accepted-plan decomposition, and never throws
+ * -- a failure here must never break the caller's own terminal-state
+ * transition.
+ */
+export async function attemptAutomaticJarvisParentReport(
+  db: Db,
+  input: {
+    companyId: string;
+    parentIssueId: string;
+    parentAssigneeAgentId: string;
+    completedChildIssueId: string;
+  },
+): Promise<JarvisParentReportActionResult | null> {
+  try {
+    const decompositions = await issueService(db).listAcceptedPlanDecompositions(input.parentIssueId);
+    const matched = decompositions.find((entry) => entry.childIssueIds.includes(input.completedChildIssueId));
+    if (!matched) return null;
+    return await runJarvisParentReportAction(
+      db,
+      {
+        companyId: input.companyId,
+        parentIssueId: input.parentIssueId,
+        resolvedChildIssueId: input.completedChildIssueId,
+      },
+      { agentId: input.parentAssigneeAgentId },
+    );
+  } catch (err) {
+    console.error("[jarvis-parent-report] automatic trigger failed", err);
+    return null;
+  }
+}

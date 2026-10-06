@@ -18,6 +18,11 @@ vi.setConfig({ testTimeout: 30000 });
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 const mockFindExistingIssueBlockersResolvedWakeForReadyState = vi.hoisted(() => vi.fn(async () => null));
+const mockAttemptAutomaticJarvisParentReport = vi.hoisted(() => vi.fn(async () => null));
+vi.mock("../services/jarvis-parent-report-action.js", () => ({
+  attemptAutomaticJarvisParentReport: mockAttemptAutomaticJarvisParentReport,
+  runJarvisParentReportAction: vi.fn(),
+}));
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -181,6 +186,7 @@ describe("issue dependency wakeups in issue routes", () => {
     });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockAttemptAutomaticJarvisParentReport.mockResolvedValue(null);
   });
 
   it("wakes dependents when the final blocker transitions to done", async () => {
@@ -404,6 +410,103 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       );
     });
+  });
+
+  it("also attempts the automatic JARVIS parent report for the same parent/child pair", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "child-1",
+      companyId: "company-1",
+      identifier: "PAP-101",
+      title: "Last child",
+      description: null,
+      status: "in_progress",
+      priority: "medium",
+      parentId: "parent-1",
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: "child-1",
+      companyId: "company-1",
+      identifier: "PAP-101",
+      title: "Last child",
+      description: null,
+      status: "done",
+      priority: "medium",
+      parentId: "parent-1",
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
+      id: "parent-1",
+      assigneeAgentId: "agent-9",
+      childIssueIds: ["child-0", "child-1"],
+      childIssueSummaries: [],
+      childIssueSummaryTruncated: false,
+    });
+
+    const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "done" });
+    expect(res.status).toBe(200);
+    expect(mockAttemptAutomaticJarvisParentReport).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        companyId: "company-1",
+        parentIssueId: "parent-1",
+        parentAssigneeAgentId: "agent-9",
+        completedChildIssueId: "child-1",
+      },
+    );
+  });
+
+  it("does not attempt the automatic JARVIS parent report for an ordinary issue with no wakeable parent", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "child-1",
+      companyId: "company-1",
+      identifier: "PAP-101",
+      title: "Ordinary issue",
+      description: null,
+      status: "in_progress",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: "child-1",
+      companyId: "company-1",
+      identifier: "PAP-101",
+      title: "Ordinary issue",
+      description: null,
+      status: "done",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+
+    const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "done" });
+    expect(res.status).toBe(200);
+    expect(mockAttemptAutomaticJarvisParentReport).not.toHaveBeenCalled();
   });
 
   function issueRecord(overrides: Record<string, unknown> = {}) {

@@ -9,11 +9,13 @@ const mocks = vi.hoisted(() => ({
   reconcile: vi.fn(),
   project: vi.fn(),
   write: vi.fn(),
+  update: vi.fn(),
 }));
 
 vi.mock("./issues.js", () => ({ issueService: () => ({
   getById: mocks.getById,
   listAcceptedPlanDecompositions: mocks.listAcceptedPlanDecompositions,
+  update: mocks.update,
 }) }));
 vi.mock("./work-products.js", () => ({ workProductService: () => ({ listForIssue: mocks.listForIssue }) }));
 vi.mock("./issue-approvals.js", () => ({ issueApprovalService: () => ({ listApprovalsForIssue: mocks.listApprovalsForIssue }) }));
@@ -244,6 +246,96 @@ describe("runJarvisParentReportAction", () => {
       const fromSecond = mocks.project.mock.calls[0][0].children.map((c: { id: string }) => c.id).sort();
       expect(fromSecond).toEqual(fromFirst);
     });
+  });
+});
+
+describe("runJarvisParentReportAction - parent completion visibility", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.listAcceptedPlanDecompositions.mockResolvedValue([{ id: "d-1", requestFingerprint: "plan-fp", childIssueIds: [childId] }]);
+    mocks.listForIssue.mockResolvedValue([{ id: "wp-1", type: "document", status: "ready", reviewState: "accepted", healthStatus: "healthy", url: "https://example.test", metadata: null, updatedAt: new Date("2026-01-01") }]);
+    mocks.listApprovalsForIssue.mockResolvedValue([]);
+    mocks.reconcile.mockResolvedValue(ready);
+    mocks.project.mockReturnValue({ fingerprint: "fp", canonical: {}, body: "report", metadata: {} });
+    mocks.update.mockResolvedValue({ status: "in_review" });
+  });
+
+  async function runWithParentStatus(status: string) {
+    mocks.getById.mockImplementation(issuesById({ [parentId]: { ...parent, status: status }, [childId]: child }));
+    return runJarvisParentReportAction({} as never, { companyId: companyId, parentIssueId: parentId, resolvedChildIssueId: childId }, { agentId: jarvisId });
+  }
+
+  it("A1: advances an active parent in todo status to in_review when the report is newly created", async () => {
+    mocks.write.mockResolvedValue({ outcome: "created", fingerprint: "fp", commentId: "comment-1" });
+    const result = await runWithParentStatus("todo");
+    expect(result.report.outcome).toBe("created");
+    expect(mocks.update).toHaveBeenCalledTimes(1);
+    expect(mocks.update).toHaveBeenCalledWith(parentId, { status: "in_review", actorAgentId: jarvisId });
+  });
+
+  it("A2: advances an active parent in in_progress status to in_review when the report is newly created", async () => {
+    mocks.write.mockResolvedValue({ outcome: "created", fingerprint: "fp", commentId: "comment-1" });
+    const result = await runWithParentStatus("in_progress");
+    expect(result.report.outcome).toBe("created");
+    expect(mocks.update).toHaveBeenCalledTimes(1);
+    expect(mocks.update).toHaveBeenCalledWith(parentId, { status: "in_review", actorAgentId: jarvisId });
+  });
+
+  it("B: never calls update when the parent is already in_review", async () => {
+    mocks.write.mockResolvedValue({ outcome: "created", fingerprint: "fp", commentId: "comment-1" });
+    const result = await runWithParentStatus("in_review");
+    expect(result.report.outcome).toBe("created");
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("C: never calls update when the parent is already done", async () => {
+    mocks.write.mockResolvedValue({ outcome: "created", fingerprint: "fp", commentId: "comment-1" });
+    const result = await runWithParentStatus("done");
+    expect(result.report.outcome).toBe("created");
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("D: never calls update when the parent is already cancelled", async () => {
+    mocks.write.mockResolvedValue({ outcome: "created", fingerprint: "fp", commentId: "comment-1" });
+    const result = await runWithParentStatus("cancelled");
+    expect(result.report.outcome).toBe("created");
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("E: never calls update when the parent is blocked", async () => {
+    mocks.write.mockResolvedValue({ outcome: "created", fingerprint: "fp", commentId: "comment-1" });
+    const result = await runWithParentStatus("blocked");
+    expect(result.report.outcome).toBe("created");
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("F: never calls update when the report was not written", async () => {
+    mocks.reconcile.mockResolvedValue({
+      outcome: "child_not_terminal",
+      parentIssueId: parentId,
+      childIssueId: childId,
+      childStatus: "in_progress",
+      executionState: null,
+      approvalRequired: false,
+      approvals: [],
+    });
+    const result = await runWithParentStatus("in_progress");
+    expect(result.report).toEqual({ outcome: "not_written" });
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("G: never calls update when the report was deduplicated", async () => {
+    mocks.write.mockResolvedValue({ outcome: "deduplicated", fingerprint: "fp", commentId: "comment-1" });
+    const result = await runWithParentStatus("in_progress");
+    expect(result.report.outcome).toBe("deduplicated");
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("does not let a transition failure turn an already-successful report into a failure", async () => {
+    mocks.write.mockResolvedValue({ outcome: "created", fingerprint: "fp", commentId: "comment-1" });
+    mocks.update.mockRejectedValue(new Error("db unavailable"));
+    const result = await runWithParentStatus("in_progress");
+    expect(result.report.outcome).toBe("created");
   });
 });
 

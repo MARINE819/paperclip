@@ -19,6 +19,13 @@ export type JarvisParentReportActionResult = {
   report: JarvisParentReportWriteResult | { outcome: "not_written" };
 };
 
+// Deny-by-default allow-list: a Parent is only ever auto-advanced to
+// "in_review" from one of these statuses. Every lifecycle-protected status
+// (in_review itself, done, cancelled, blocked, and anything else not
+// explicitly listed here) is left untouched -- a freshly written report
+// must never overwrite a status a human (or another workflow) already set.
+const PARENT_AUTO_IN_REVIEW_SOURCE_STATUSES = new Set(["todo", "in_progress"]);
+
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -183,6 +190,22 @@ export async function runJarvisParentReportAction(
   const projection = projectJarvisParentReport(canonical);
   if (!projection) throw new Error("parent_report_projection_failed");
   const report = await writeJarvisParentReport(db, projection, actor);
+
+  // Integration-gap fix only: a freshly created report (never a
+  // deduplicated/not_written one) advances the Parent into the same
+  // "in_review" surface AI Office already polls for human attention -- but
+  // only from a status that is unambiguously still active. freshParent was
+  // already read above in this same call, before the write; nothing in this
+  // flow touches issues.status before this point, so it is still the
+  // authoritative pre-write snapshot.
+  if (report.outcome === "created" && PARENT_AUTO_IN_REVIEW_SOURCE_STATUSES.has(freshParent.status)) {
+    try {
+      await issueSvc.update(freshParent.id, { status: "in_review", actorAgentId: actor.agentId });
+    } catch (err) {
+      console.error("[jarvis-parent-report] failed to auto-advance parent to in_review", err);
+    }
+  }
+
   return { reconciliation, report };
 }
 

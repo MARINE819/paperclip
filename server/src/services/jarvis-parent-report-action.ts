@@ -38,10 +38,14 @@ function resourceRef(metadata: Record<string, unknown> | null): { kind: string; 
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
   if (typeof record.kind !== "string" || !record.kind.trim()) return null;
-  const path = typeof record.relativePath === "string"
-    ? record.relativePath
-    : typeof record.path === "string" ? record.path : null;
-  return { kind: record.kind, path };
+  const path = typeof record.relativePath === "string" && record.relativePath.trim().length > 0
+    ? record.relativePath.trim()
+    : typeof record.path === "string" && record.path.trim().length > 0
+    ? record.path.trim()
+    : typeof record.displayPath === "string" && record.displayPath.trim().length > 0
+    ? record.displayPath.trim()
+    : null;
+  return { kind: record.kind.trim(), path };
 }
 
 export async function runJarvisParentReportAction(

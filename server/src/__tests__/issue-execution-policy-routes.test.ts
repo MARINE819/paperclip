@@ -15,6 +15,7 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  listAcceptedPlanDecompositions: vi.fn(async () => []),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({

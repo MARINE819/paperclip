@@ -389,6 +389,26 @@ export async function submitToJarvis(
       status: CHILD_ISSUE_STATUS,
       assigneeAgentId: selectedAgentId,
       reviewPolicy: reviewerAgentId ? "not_creator" : null,
+      // Reuse the existing generic executionPolicy review-stage/returnAssignee/
+      // round-limit infrastructure (issue-execution-policy.ts) instead of a
+      // new JARVIS-specific mechanism: the already-selected reviewerAgentId
+      // becomes that stage's sole participant, so the same stage machine that
+      // governs every other reviewPolicy issue now also governs rework for
+      // this child. Omitted entirely (no key at all) when there is no
+      // reviewer, so a non-reviewRequired child's executionPolicy is
+      // untouched -- never an empty/explicit null policy.
+      ...(reviewerAgentId
+        ? {
+            executionPolicy: {
+              stages: [
+                {
+                  type: "review" as const,
+                  participants: [{ type: "agent" as const, agentId: reviewerAgentId }],
+                },
+              ],
+            },
+          }
+        : {}),
       acceptanceCriteria: plan.acceptanceCriteria,
       blockParentUntilDone: true,
       idempotencyKey: `${planFingerprint}:${index}`,

@@ -469,6 +469,14 @@ describe("submitToJarvis — reviewRequired and independent reviewer selection",
         children: [
           expect.objectContaining({
             reviewPolicy: "not_creator",
+            executionPolicy: {
+              stages: [
+                {
+                  type: "review",
+                  participants: [{ type: "agent", agentId: REVIEWER_ID }],
+                },
+              ],
+            },
           }),
         ],
       }),
@@ -519,6 +527,8 @@ describe("submitToJarvis — reviewRequired and independent reviewer selection",
         ],
       }),
     );
+    const childArgs = mockDecomposeAcceptedPlan.mock.calls[0]![1].children[0];
+    expect(childArgs.executionPolicy).toBeUndefined();
   });
 });
 

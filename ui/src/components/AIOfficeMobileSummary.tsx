@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { Agent, Approval, CostByAgentModel, DashboardSummary, Issue, IssueWorkProduct } from "@paperclipai/shared";
+import type { Agent, Approval, CostByAgentModel, DashboardSummary, Issue, IssueComment, IssueWorkProduct } from "@paperclipai/shared";
 import type { LiveRunForIssue } from "@/api/heartbeats";
 import { issuesApi } from "@/api/issues";
 import { approvalsApi } from "@/api/approvals";
@@ -252,6 +252,7 @@ export interface AIOfficeMobileSummaryProps {
   dashboardData?: DashboardSummary | null;
   costByAgentModel?: CostByAgentModel[];
   onSelectAgent?: (agentId: string) => void;
+  jarvisReportComments?: Map<string, IssueComment>;
 }
 
 export function AIOfficeMobileSummary({
@@ -265,6 +266,7 @@ export function AIOfficeMobileSummary({
   dashboardData,
   costByAgentModel = [],
   onSelectAgent,
+  jarvisReportComments,
 }: AIOfficeMobileSummaryProps) {
   const effectiveCompanyId =
     companyId ??
@@ -630,25 +632,44 @@ export function AIOfficeMobileSummary({
             </div>
           </CardHeader>
           <CardContent className="space-y-2 p-3 pt-1">
-            {inReviewIssues.map((issue) => (
-              <a
-                key={issue.id}
-                href={`/issues/${issue.id}`}
-                data-testid={`mobile-in-review-item-${issue.id}`}
-                className="flex flex-col gap-1 rounded-lg border border-sky-500/20 bg-background/90 p-2.5 text-xs shadow-xs hover:border-sky-500/40 transition-colors"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-semibold text-foreground truncate">
-                    {issue.identifier ? `${issue.identifier} · ` : ""}{issue.title}
-                  </span>
-                  <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-                </div>
-                <div className="flex items-center justify-between text-muted-foreground">
-                  <span>담당: {issue.assigneeAgentId ? (agentById.get(issue.assigneeAgentId)?.name ?? "AI 에이전트") : "미할당"}</span>
-                  <span className="rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-600 dark:text-sky-400 font-medium">검토 대기</span>
-                </div>
-              </a>
-            ))}
+            {inReviewIssues.map((issue) => {
+              const reportComment = jarvisReportComments?.get(issue.id);
+              const isJarvisReport = Boolean(reportComment);
+              return (
+                <a
+                  key={issue.id}
+                  href={isJarvisReport && reportComment ? `/issues/${issue.id}#comment-${reportComment.id}` : `/issues/${issue.id}`}
+                  data-testid={`mobile-in-review-item-${issue.id}`}
+                  className={`flex flex-col gap-1 rounded-lg border p-2.5 text-xs shadow-xs transition-colors ${
+                    isJarvisReport
+                      ? "border-primary/40 bg-background/90 hover:border-primary/60"
+                      : "border-sky-500/20 bg-background/90 hover:border-sky-500/40"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-foreground truncate">
+                      {issue.identifier ? `${issue.identifier} · ` : ""}{issue.title}
+                    </span>
+                    <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                  </div>
+                  <div className="flex items-center justify-between text-muted-foreground">
+                    <span>담당: {issue.assigneeAgentId ? (agentById.get(issue.assigneeAgentId)?.name ?? "AI 에이전트") : "미할당"}</span>
+                    {isJarvisReport ? (
+                      <span
+                        className="rounded bg-primary/20 px-1.5 py-0.5 text-primary font-medium"
+                        data-testid={`mobile-jarvis-report-badge-${issue.id}`}
+                      >
+                        JARVIS 최종 보고
+                      </span>
+                    ) : (
+                      <span className="rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-600 dark:text-sky-400 font-medium">
+                        검토 대기
+                      </span>
+                    )}
+                  </div>
+                </a>
+              );
+            })}
           </CardContent>
         </Card>
       ) : null}

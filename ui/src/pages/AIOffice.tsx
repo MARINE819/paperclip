@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery } from "@tanstack/react-query";
+import type { IssueComment } from "@paperclipai/shared";
 import { Bot, Building2, Coffee, DoorOpen, ShieldAlert, Sofa, Sprout, Users } from "lucide-react";
 import { JarvisNeuralCommandInterface } from "@/components/neural/JarvisNeuralCommandInterface";
 import { agentsApi } from "@/api/agents";
@@ -331,6 +332,39 @@ export function AIOffice() {
   const jarvis = agents.find((agent) => agent.name === "JARVIS");
   const atlas = agents.find((agent) => agent.name === "Atlas");
 
+  // N+1 Optimization: candidate pre-filtering for root parent issues assigned to JARVIS
+  const jarvisInReviewCandidates = useMemo(() => {
+    if (!jarvis) return [];
+    return (inReviewIssuesQuery.data ?? []).filter(
+      (issue) => issue.parentId === null && issue.assigneeAgentId === jarvis.id,
+    );
+  }, [inReviewIssuesQuery.data, jarvis]);
+
+  const jarvisReportCommentQueries = useQueries({
+    queries: jarvisInReviewCandidates.map((issue) => ({
+      queryKey: ["ai-office-jarvis-report-comments", issue.id],
+      queryFn: () => issuesApi.listComments(issue.id, { order: "desc", limit: 5 }),
+      staleTime: 15_000,
+      retry: false,
+    })),
+  });
+
+  // Source of Truth: ONLY comment.metadata?.authorizationReason === "canonical_jarvis_parent_report"
+  const jarvisReportCommentByIssueId = useMemo(() => {
+    const map = new Map<string, IssueComment>();
+    jarvisReportCommentQueries.forEach((q, idx) => {
+      const candidate = jarvisInReviewCandidates[idx];
+      if (!candidate || !q.data || !Array.isArray(q.data)) return;
+      const reportComment = q.data.find(
+        (comment) => comment.metadata?.authorizationReason === "canonical_jarvis_parent_report",
+      );
+      if (reportComment) {
+        map.set(candidate.id, reportComment);
+      }
+    });
+    return map;
+  }, [jarvisReportCommentQueries, jarvisInReviewCandidates]);
+
   const mappedOrgUnitNames = new Set(
     DEPARTMENT_ROOMS.map((room) => room.orgUnitName).filter((name): name is string => !!name),
   );
@@ -579,6 +613,7 @@ export function AIOffice() {
           onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
           inReviewIssues={inReviewIssuesQuery.data ?? []}
           completedIssues={completedIssuesQuery.data ?? []}
+          jarvisReportComments={jarvisReportCommentByIssueId}
         />
       ) : (
         /* 중앙 2D 사무실 + 우측 운영 패널 */
@@ -741,24 +776,41 @@ export function AIOffice() {
                   const assignee = issue.assigneeAgentId
                     ? agents.find((a) => a.id === issue.assigneeAgentId)?.name ?? issue.assigneeAgentId
                     : "미배정";
+                  const reportComment = jarvisReportCommentByIssueId.get(issue.id);
+                  const isJarvisReport = Boolean(reportComment);
                   return (
                     <a
                       key={issue.id}
-                      href={`/issues/${issue.id}`}
-                      className="flex flex-col gap-1 rounded-md border border-amber-500/30 bg-amber-500/5 p-2 transition-colors hover:bg-amber-500/10"
+                      href={isJarvisReport && reportComment ? `/issues/${issue.id}#comment-${reportComment.id}` : `/issues/${issue.id}`}
+                      className={`flex flex-col gap-1 rounded-md border p-2 transition-colors ${
+                        isJarvisReport
+                          ? "border-primary/40 bg-primary/5 hover:bg-primary/10"
+                          : "border-amber-500/30 bg-amber-500/5 hover:bg-amber-500/10"
+                      }`}
                       data-testid={`desktop-in-review-item-${issue.id}`}
                     >
                       <div className="flex items-center justify-between gap-1">
                         <span className="font-semibold text-foreground truncate">
                           {issue.identifier ? `${issue.identifier} ` : ""}{issue.title}
                         </span>
-                        <span className="shrink-0 rounded bg-amber-500/20 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-300">
-                          검토 대기
-                        </span>
+                        {isJarvisReport ? (
+                          <span
+                            className="shrink-0 rounded bg-primary/20 px-1.5 py-0.5 text-xs font-medium text-primary"
+                            data-testid={`desktop-jarvis-report-badge-${issue.id}`}
+                          >
+                            JARVIS 최종 보고
+                          </span>
+                        ) : (
+                          <span className="shrink-0 rounded bg-amber-500/20 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-300">
+                            검토 대기
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center justify-between text-xs text-muted-foreground">
                         <span>담당: {assignee}</span>
-                        <span className="text-primary hover:underline">이슈 열기 →</span>
+                        <span className="text-primary hover:underline">
+                          {isJarvisReport ? "최종 보고서 확인 →" : "이슈 열기 →"}
+                        </span>
                       </div>
                     </a>
                   );

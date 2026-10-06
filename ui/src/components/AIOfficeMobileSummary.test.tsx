@@ -814,6 +814,123 @@ describe("AIOfficeMobileSummary", () => {
     act(() => root.unmount());
   });
 
+  it("renders JARVIS 최종 보고 badge and #comment- deep link when jarvisReportComments contains canonical report", () => {
+    const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS" });
+    const inReviewIssue = {
+      id: "issue-parent-mob-1",
+      identifier: "NEX-200",
+      title: "Mobile JARVIS Parent Task",
+      assigneeAgentId: "agent-jarvis",
+      status: "in_review",
+    } as any;
+
+    const reportComment = {
+      id: "comment-mob-report-1",
+      issueId: "issue-parent-mob-1",
+      authorType: "agent",
+      authorAgentId: "agent-jarvis",
+      body: "## JARVIS 부모 통합 보고서",
+      metadata: {
+        version: 1,
+        authorizationReason: "canonical_jarvis_parent_report",
+        sections: [],
+      },
+    } as any;
+
+    const jarvisReportComments = new Map([["issue-parent-mob-1", reportComment]]);
+
+    const root = render(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[jarvis]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        inReviewIssues={[inReviewIssue]}
+        jarvisReportComments={jarvisReportComments}
+        errorAgents={[]}
+      />,
+    );
+
+    const queueCard = container.querySelector('[data-testid="mobile-in-review-card"]');
+    expect(queueCard).not.toBeNull();
+    const itemLink = queueCard?.querySelector('[data-testid="mobile-in-review-item-issue-parent-mob-1"]') as HTMLAnchorElement;
+    expect(itemLink).not.toBeNull();
+    expect(itemLink?.getAttribute("href")).toBe("/issues/issue-parent-mob-1#comment-comment-mob-report-1");
+    expect(itemLink?.textContent).toContain("JARVIS 최종 보고");
+    expect(itemLink?.textContent).not.toContain("검토 대기");
+
+    const badge = queueCard?.querySelector('[data-testid="mobile-jarvis-report-badge-issue-parent-mob-1"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toBe("JARVIS 최종 보고");
+
+    act(() => root.unmount());
+  });
+
+  it("renders both JARVIS final report and regular in-review items accurately side by side", () => {
+    const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS" });
+    const worker = makeAgent({ id: "agent-worker", name: "Worker1" });
+
+    const parentIssue = {
+      id: "issue-p-1",
+      identifier: "NEX-201",
+      title: "Parent with report",
+      assigneeAgentId: "agent-jarvis",
+      status: "in_review",
+    } as any;
+
+    const regularIssue = {
+      id: "issue-r-1",
+      identifier: "NEX-202",
+      title: "Regular worker issue",
+      assigneeAgentId: "agent-worker",
+      status: "in_review",
+    } as any;
+
+    const reportComment = {
+      id: "comment-canonical-p1",
+      issueId: "issue-p-1",
+      authorType: "agent",
+      authorAgentId: "agent-jarvis",
+      body: "## JARVIS 부모 통합 보고서",
+      metadata: {
+        version: 1,
+        authorizationReason: "canonical_jarvis_parent_report",
+        sections: [],
+      },
+    } as any;
+
+    const jarvisReportComments = new Map([["issue-p-1", reportComment]]);
+
+    const root = render(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[jarvis, worker]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        inReviewIssues={[parentIssue, regularIssue]}
+        jarvisReportComments={jarvisReportComments}
+        errorAgents={[]}
+      />,
+    );
+
+    const queueCard = container.querySelector('[data-testid="mobile-in-review-card"]');
+    expect(queueCard).not.toBeNull();
+    expect(queueCard?.textContent).toContain("독립 검토 대기 업무 (2건)");
+
+    // Parent issue item
+    const parentLink = queueCard?.querySelector('[data-testid="mobile-in-review-item-issue-p-1"]') as HTMLAnchorElement;
+    expect(parentLink?.getAttribute("href")).toBe("/issues/issue-p-1#comment-comment-canonical-p1");
+    expect(parentLink?.textContent).toContain("JARVIS 최종 보고");
+
+    // Regular issue item
+    const regularLink = queueCard?.querySelector('[data-testid="mobile-in-review-item-issue-r-1"]') as HTMLAnchorElement;
+    expect(regularLink?.getAttribute("href")).toBe("/issues/issue-r-1");
+    expect(regularLink?.textContent).toContain("검토 대기");
+    expect(regularLink?.textContent).not.toContain("JARVIS 최종 보고");
+
+    act(() => root.unmount());
+  });
+
   it("renders live run issue chip as clickable link to issue without selecting agent", async () => {
     const onSelect = vi.fn();
     const agent = makeAgent({ id: "agent-1", name: "Alpha" });

@@ -25,6 +25,7 @@ const mockApprovalsApi = vi.hoisted(() => ({
 const mockIssuesApi = vi.hoisted(() => ({
   list: vi.fn(),
   listWorkProducts: vi.fn(),
+  listComments: vi.fn(),
 }));
 
 const mockCostsApi = vi.hoisted(() => ({
@@ -287,6 +288,7 @@ describe("AIOffice", () => {
     mockApprovalsApi.list.mockResolvedValue([]);
     mockIssuesApi.list.mockResolvedValue([]);
     mockIssuesApi.listWorkProducts.mockResolvedValue([]);
+    mockIssuesApi.listComments.mockResolvedValue([]);
     mockCostsApi.byAgentModel.mockResolvedValue([]);
     mockCostsApi.byProvider.mockResolvedValue([]);
     mockCostsApi.quotaWindows.mockResolvedValue([]);
@@ -1196,5 +1198,216 @@ describe("AIOffice", () => {
     expect(errorCard?.textContent).toContain("Process crashed with out-of-memory error (OOM)");
 
     act(() => root.unmount());
+  });
+
+  describe("JARVIS Parent Final Report Visibility (Identity Gate)", () => {
+    it("Test A: displays JARVIS 최종 보고 badge and #comment- deep-link when canonical report comment exists", async () => {
+      const now = new Date();
+      const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+      mockAgentsApi.list.mockResolvedValue([jarvis]);
+      mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+      mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string }) => {
+        if (filter?.status === "in_review") {
+          return Promise.resolve([
+            {
+              id: "issue-parent-1",
+              identifier: "PAP-100",
+              title: "Parent Orchestration Task",
+              status: "in_review",
+              parentId: null,
+              assigneeAgentId: "agent-jarvis",
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockIssuesApi.listComments.mockImplementation((issueId: string) => {
+        if (issueId === "issue-parent-1") {
+          return Promise.resolve([
+            {
+              id: "comment-canonical-1",
+              issueId: "issue-parent-1",
+              authorType: "agent",
+              authorAgentId: "agent-jarvis",
+              body: "## JARVIS 부모 통합 보고서\n- Completed all children",
+              metadata: {
+                version: 1,
+                authorizationReason: "canonical_jarvis_parent_report",
+                sections: [],
+              },
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const root = await renderPage();
+      await flushReact();
+      await flushReact();
+
+      const inReviewItem = container.querySelector('[data-testid="desktop-in-review-item-issue-parent-1"]') as HTMLAnchorElement;
+      expect(inReviewItem).not.toBeNull();
+      expect(inReviewItem.getAttribute("href")).toBe("/issues/issue-parent-1#comment-comment-canonical-1");
+      expect(inReviewItem.textContent).toContain("JARVIS 최종 보고");
+      expect(inReviewItem.textContent).toContain("최종 보고서 확인 →");
+
+      act(() => root.unmount());
+    });
+
+    it("Test B: displays standard 검토 대기 without deep-link when parent is assigned to JARVIS but has no comments", async () => {
+      const now = new Date();
+      const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+      mockAgentsApi.list.mockResolvedValue([jarvis]);
+      mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+      mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string }) => {
+        if (filter?.status === "in_review") {
+          return Promise.resolve([
+            {
+              id: "issue-parent-2",
+              identifier: "PAP-101",
+              title: "Parent without report",
+              status: "in_review",
+              parentId: null,
+              assigneeAgentId: "agent-jarvis",
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockIssuesApi.listComments.mockResolvedValue([]);
+
+      const root = await renderPage();
+
+      const inReviewItem = container.querySelector('[data-testid="desktop-in-review-item-issue-parent-2"]') as HTMLAnchorElement;
+      expect(inReviewItem).not.toBeNull();
+      expect(inReviewItem.getAttribute("href")).toBe("/issues/issue-parent-2");
+      expect(inReviewItem.textContent).toContain("검토 대기");
+      expect(inReviewItem.textContent).not.toContain("JARVIS 최종 보고");
+      expect(inReviewItem.textContent).toContain("이슈 열기 →");
+
+      act(() => root.unmount());
+    });
+
+    it("Test C: displays standard 검토 대기 when only regular comments exist without canonical authorizationReason", async () => {
+      const now = new Date();
+      const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+      mockAgentsApi.list.mockResolvedValue([jarvis]);
+      mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+      mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string }) => {
+        if (filter?.status === "in_review") {
+          return Promise.resolve([
+            {
+              id: "issue-parent-3",
+              identifier: "PAP-102",
+              title: "Parent with standard comments",
+              status: "in_review",
+              parentId: null,
+              assigneeAgentId: "agent-jarvis",
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockIssuesApi.listComments.mockResolvedValue([
+        {
+          id: "comment-regular-1",
+          issueId: "issue-parent-3",
+          authorType: "agent",
+          authorAgentId: "agent-jarvis",
+          body: "Progress update comment",
+          metadata: {
+            version: 1,
+            authorizationReason: "internal_agent_write",
+            sections: [],
+          },
+        },
+      ]);
+
+      const root = await renderPage();
+
+      const inReviewItem = container.querySelector('[data-testid="desktop-in-review-item-issue-parent-3"]') as HTMLAnchorElement;
+      expect(inReviewItem).not.toBeNull();
+      expect(inReviewItem.getAttribute("href")).toBe("/issues/issue-parent-3");
+      expect(inReviewItem.textContent).toContain("검토 대기");
+      expect(inReviewItem.textContent).not.toContain("JARVIS 최종 보고");
+
+      act(() => root.unmount());
+    });
+
+    it("Test D: preserves regular child in-review issues without regression", async () => {
+      const now = new Date();
+      const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+      const dev = makeAgent({ id: "agent-dev", name: "Developer", status: "idle", lastHeartbeatAt: now });
+      mockAgentsApi.list.mockResolvedValue([jarvis, dev]);
+      mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+      mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string }) => {
+        if (filter?.status === "in_review") {
+          return Promise.resolve([
+            {
+              id: "issue-child-1",
+              identifier: "PAP-103",
+              title: "Child task in review",
+              status: "in_review",
+              parentId: "issue-parent-1",
+              assigneeAgentId: "agent-dev",
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const root = await renderPage();
+
+      const inReviewItem = container.querySelector('[data-testid="desktop-in-review-item-issue-child-1"]') as HTMLAnchorElement;
+      expect(inReviewItem).not.toBeNull();
+      expect(inReviewItem.getAttribute("href")).toBe("/issues/issue-child-1");
+      expect(inReviewItem.textContent).toContain("검토 대기");
+      expect(inReviewItem.textContent).not.toContain("JARVIS 최종 보고");
+      expect(mockIssuesApi.listComments).not.toHaveBeenCalledWith("issue-child-1", expect.anything());
+
+      act(() => root.unmount());
+    });
+
+    it("Test E: gracefully falls back to standard in-review display if comments API fails", async () => {
+      const now = new Date();
+      const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+      mockAgentsApi.list.mockResolvedValue([jarvis]);
+      mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+      mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string }) => {
+        if (filter?.status === "in_review") {
+          return Promise.resolve([
+            {
+              id: "issue-parent-err",
+              identifier: "PAP-104",
+              title: "Parent with API failure",
+              status: "in_review",
+              parentId: null,
+              assigneeAgentId: "agent-jarvis",
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockIssuesApi.listComments.mockRejectedValue(new Error("Network timeout"));
+
+      const root = await renderPage();
+
+      const inReviewItem = container.querySelector('[data-testid="desktop-in-review-item-issue-parent-err"]') as HTMLAnchorElement;
+      expect(inReviewItem).not.toBeNull();
+      expect(inReviewItem.getAttribute("href")).toBe("/issues/issue-parent-err");
+      expect(inReviewItem.textContent).toContain("검토 대기");
+      expect(inReviewItem.textContent).not.toContain("JARVIS 최종 보고");
+
+      act(() => root.unmount());
+    });
   });
 });

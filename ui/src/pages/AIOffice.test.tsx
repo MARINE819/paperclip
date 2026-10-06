@@ -1068,4 +1068,66 @@ describe("AIOffice", () => {
     act(() => root.unmount());
     window.history.replaceState({}, "", originalHref);
   });
+
+  it("renders desktop in-review queue card and completed work card in right panel with direct issue links", async () => {
+    const now = new Date();
+    const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+    const engineer = makeAgent({ id: "agent-eng", name: "Engineer1", status: "idle", orgUnitId: "org-dev", lastHeartbeatAt: now });
+    const devOrg = makeOrgUnitStatus({ orgUnitId: "org-dev", name: "개발팀" });
+    mockAgentsApi.list.mockResolvedValue([jarvis, engineer]);
+    mockAgentsApi.orgUnitsStatus.mockResolvedValue([devOrg]);
+
+    mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string }) => {
+      if (filter?.status === "in_review") {
+        return Promise.resolve([
+          {
+            id: "issue-rev-10",
+            identifier: "NEX-100",
+            title: "Security Gate Review Task",
+            status: "in_review",
+            assigneeAgentId: "agent-eng",
+          },
+        ]);
+      }
+      if (filter?.status === "done") {
+        return Promise.resolve([
+          {
+            id: "issue-done-20",
+            identifier: "NEX-200",
+            title: "Multi-Child Orchestration Delivery",
+            status: "done",
+            assigneeAgentId: "agent-jarvis",
+          },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+
+    const root = await renderPage();
+
+    // Verify In-Review Card in Desktop Right Panel
+    const inReviewCard = container.querySelector('[data-testid="desktop-in-review-card"]');
+    expect(inReviewCard).not.toBeNull();
+    expect(inReviewCard?.textContent).toContain("검토 대기 (In-Review)");
+    expect(inReviewCard?.textContent).toContain("1건");
+    expect(inReviewCard?.textContent).toContain("NEX-100");
+    expect(inReviewCard?.textContent).toContain("Security Gate Review Task");
+
+    const inReviewLink = inReviewCard?.querySelector('[data-testid="desktop-in-review-item-issue-rev-10"]') as HTMLAnchorElement;
+    expect(inReviewLink).not.toBeNull();
+    expect(inReviewLink?.getAttribute("href")).toBe("/issues/issue-rev-10");
+
+    // Verify Completed Work Card in Desktop Right Panel
+    const completedCard = container.querySelector('[data-testid="desktop-completed-card"]');
+    expect(completedCard).not.toBeNull();
+    expect(completedCard?.textContent).toContain("최근 완료 업무");
+    expect(completedCard?.textContent).toContain("NEX-200");
+    expect(completedCard?.textContent).toContain("Multi-Child Orchestration Delivery");
+
+    const completedLink = completedCard?.querySelector('[data-testid="desktop-completed-item-issue-done-20"]') as HTMLAnchorElement;
+    expect(completedLink).not.toBeNull();
+    expect(completedLink?.getAttribute("href")).toBe("/issues/issue-done-20");
+
+    act(() => root.unmount());
+  });
 });

@@ -790,6 +790,39 @@ describe("AIOfficeFloor", () => {
     expect(head.style.backgroundColor).toBe("var(--status-task-in_review)");
     act(() => root.unmount());
   });
+
+  it("AgentDetailSheet renders issue card with identifier, title, and direct link when currentIssueId is present", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const root = render(
+      <QueryClientProvider client={qc}>
+        <AgentDetailSheet
+          onOpenChange={vi.fn()}
+          agent={{
+            agentId: "agent-1",
+            name: "JARVIS",
+            role: "orchestrator",
+            state: "in-review",
+            currentIssueId: "issue-123",
+            currentIssueIdentifier: "NEX-42",
+            currentIssueTitle: "Multi-Child Delegation Test",
+            taskSummary: "[검토 대기] Multi-Child Delegation Test",
+          }}
+        />
+      </QueryClientProvider>,
+    );
+
+    const issueCard = document.body.querySelector('[data-testid="agent-detail-issue-card"]');
+    expect(issueCard).not.toBeNull();
+    expect(issueCard?.textContent).toContain("NEX-42");
+    expect(issueCard?.textContent).toContain("Multi-Child Delegation Test");
+    expect(issueCard?.textContent).toContain("독립 검토 대기 중");
+
+    const issueLink = document.body.querySelector('[data-testid="agent-detail-issue-link"]') as HTMLAnchorElement;
+    expect(issueLink).not.toBeNull();
+    expect(issueLink?.getAttribute("href")).toBe("/issues/issue-123");
+
+    act(() => root.unmount());
+  });
 });
 
 

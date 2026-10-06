@@ -287,6 +287,10 @@ export interface AgentDetailInfo {
   currentRunCostCents?: number | null;
   /** Associated active or recent issue ID for work product discovery */
   currentIssueId?: string | null;
+  /** Associated issue identifier (e.g. "PAP-12") */
+  currentIssueIdentifier?: string | null;
+  /** Associated issue title */
+  currentIssueTitle?: string | null;
 }
 
 function AgentEvalBadge({ status }: { status: EvalRunStatus }) {
@@ -641,6 +645,33 @@ export function AgentDetailSheet({
                 <div className="flex items-center gap-2">
                   <span className="text-muted-foreground">현재 업무</span>
                   <span className="truncate">{agent.taskSummary}</span>
+                </div>
+              ) : null}
+
+              {agent.currentIssueId ? (
+                <div className="flex items-center justify-between gap-2 rounded-lg border border-border/80 bg-muted/30 p-2.5 text-xs" data-testid="agent-detail-issue-card">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <FileText className="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
+                    <div className="flex flex-col min-w-0">
+                      <span className="font-semibold text-foreground truncate">
+                        {agent.currentIssueIdentifier ? `${agent.currentIssueIdentifier}: ` : ""}
+                        {agent.currentIssueTitle || "연동된 이슈"}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {agent.state === "in-review" ? "독립 검토 대기 중" : "담당 작업"}
+                      </span>
+                    </div>
+                  </div>
+                  <a
+                    href={`/issues/${agent.currentIssueId}`}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className={cn(buttonVariants({ variant: "outline", size: "sm" }), "h-7 shrink-0 text-xs gap-1")}
+                    data-testid="agent-detail-issue-link"
+                  >
+                    <span>이슈 열기</span>
+                    <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                  </a>
                 </div>
               ) : null}
 

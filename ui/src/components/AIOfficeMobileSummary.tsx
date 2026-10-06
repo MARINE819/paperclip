@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { Agent, Approval, CostByAgentModel, DashboardSummary, IssueWorkProduct } from "@paperclipai/shared";
+import type { Agent, Approval, CostByAgentModel, DashboardSummary, Issue, IssueWorkProduct } from "@paperclipai/shared";
 import type { LiveRunForIssue } from "@/api/heartbeats";
 import { issuesApi } from "@/api/issues";
 import { approvalsApi } from "@/api/approvals";
@@ -246,6 +246,7 @@ export interface AIOfficeMobileSummaryProps {
   agents: Agent[];
   liveRuns: LiveRunForIssue[];
   pendingApprovals: Approval[];
+  inReviewIssues?: Issue[];
   errorAgents: Agent[];
   dashboardData?: DashboardSummary | null;
   costByAgentModel?: CostByAgentModel[];
@@ -257,6 +258,7 @@ export function AIOfficeMobileSummary({
   agents,
   liveRuns,
   pendingApprovals,
+  inReviewIssues = [],
   errorAgents,
   dashboardData,
   costByAgentModel = [],
@@ -333,8 +335,14 @@ export function AIOfficeMobileSummary({
         ids.push(run.issueId);
       }
     }
+    for (const issue of inReviewIssues) {
+      if (issue.id && !seen.has(issue.id)) {
+        seen.add(issue.id);
+        ids.push(issue.id);
+      }
+    }
     return ids;
-  }, [liveRuns]);
+  }, [liveRuns, inReviewIssues]);
 
   const agentNameByIssueId = useMemo(() => {
     const map = new Map<string, string>();
@@ -344,8 +352,14 @@ export function AIOfficeMobileSummary({
         map.set(run.issueId, agent?.name ?? run.agentName);
       }
     }
+    for (const issue of inReviewIssues) {
+      if (issue.id && !map.has(issue.id) && issue.assigneeAgentId) {
+        const agent = agentById.get(issue.assigneeAgentId);
+        if (agent) map.set(issue.id, agent.name);
+      }
+    }
     return map;
-  }, [liveRuns, agentById]);
+  }, [liveRuns, inReviewIssues, agentById]);
 
   const pendingApprovalsCount = pendingApprovals.filter(
     (a) =>
@@ -410,7 +424,7 @@ export function AIOfficeMobileSummary({
       />
 
       {/* 1. 경영진 핵심 브리핑 바 (Top Executive Metrics) */}
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
         {/* 승인 대기 카드 */}
         <div
           className={cn(
@@ -432,6 +446,28 @@ export function AIOfficeMobileSummary({
             >
               모바일 승인 →
             </a>
+          ) : (
+            <span className="text-muted-foreground">대기 없음</span>
+          )}
+        </div>
+
+        {/* 검토 대기 카드 */}
+        <div
+          data-testid="mobile-in-review-metric"
+          className={cn(
+            "flex flex-col gap-1 rounded-lg border p-3 text-xs",
+            inReviewIssues.length > 0
+              ? "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300"
+              : "border-border/60 bg-muted/20",
+          )}
+        >
+          <div className="flex items-center justify-between">
+            <span className="font-medium text-muted-foreground">검토 대기</span>
+            <FileCheck className="h-4 w-4" aria-hidden="true" />
+          </div>
+          <div className="text-xl font-bold">{inReviewIssues.length}건</div>
+          {inReviewIssues.length > 0 ? (
+            <span className="text-muted-foreground">독립 검토 대기</span>
           ) : (
             <span className="text-muted-foreground">대기 없음</span>
           )}
@@ -577,6 +613,44 @@ export function AIOfficeMobileSummary({
         </Card>
       ) : null}
 
+      {/* 2.5 독립 검토 대기 업무 (In-Review Queue) */}
+      {inReviewIssues.length > 0 ? (
+        <Card className="border-sky-500/40 bg-sky-500/5" data-testid="mobile-in-review-card">
+          <CardHeader className="p-3 pb-1">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <FileCheck className="h-4 w-4 text-sky-600 dark:text-sky-400" aria-hidden="true" />
+                <CardTitle className="text-xs font-semibold text-sky-900 dark:text-sky-100">
+                  독립 검토 대기 업무 ({inReviewIssues.length}건)
+                </CardTitle>
+              </div>
+              <span className="text-xs text-muted-foreground">검토자 대기</span>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-2 p-3 pt-1">
+            {inReviewIssues.map((issue) => (
+              <a
+                key={issue.id}
+                href={`/issues/${issue.id}`}
+                data-testid={`mobile-in-review-item-${issue.id}`}
+                className="flex flex-col gap-1 rounded-lg border border-sky-500/20 bg-background/90 p-2.5 text-xs shadow-xs hover:border-sky-500/40 transition-colors"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-foreground truncate">
+                    {issue.identifier ? `${issue.identifier} · ` : ""}{issue.title}
+                  </span>
+                  <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                </div>
+                <div className="flex items-center justify-between text-muted-foreground">
+                  <span>담당: {issue.assigneeAgentId ? (agentById.get(issue.assigneeAgentId)?.name ?? "AI 에이전트") : "미할당"}</span>
+                  <span className="rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-600 dark:text-sky-400 font-medium">검토 대기</span>
+                </div>
+              </a>
+            ))}
+          </CardContent>
+        </Card>
+      ) : null}
+
       {/* 3. 실시간 근무 현황 (Active AI Employees & Execution Observability) */}
       <Card>
         <CardHeader className="p-4 pb-2">
@@ -648,10 +722,16 @@ export function AIOfficeMobileSummary({
                     ) : null}
 
                     {run.issueId ? (
-                      <div className="flex items-center gap-1 rounded border bg-background px-1.5 py-0.5 font-mono text-muted-foreground">
+                      <a
+                        href={`/issues/${run.issueId}`}
+                        onClick={(e) => e.stopPropagation()}
+                        data-testid={`mobile-live-run-issue-link-${run.issueId}`}
+                        className="flex items-center gap-1 rounded border bg-background px-1.5 py-0.5 font-mono text-muted-foreground hover:text-foreground hover:bg-muted"
+                      >
                         <FileCheck className="h-3 w-3" aria-hidden="true" />
                         <span>Issue 연동됨</span>
-                      </div>
+                        <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                      </a>
                     ) : null}
                   </div>
                 </div>

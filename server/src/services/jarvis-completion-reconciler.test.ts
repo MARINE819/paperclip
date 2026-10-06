@@ -302,4 +302,90 @@ describe("reconcileDelegatedChildCompletion", () => {
 });
 });
 
+describe("reconcileDelegatedChildCompletion — multi-child sibling-aware reconciliation", () => {
+  const childA = { id: "child-a", companyId: "company", parentId: "parent", status: "done", executionState: null, assigneeAgentId: "specialist-a", reviewPolicy: null };
+  const childB = { id: "child-b", companyId: "company", parentId: "parent", status: "done", executionState: null, assigneeAgentId: "specialist-b", reviewPolicy: null };
+  const evidenceFor = (issueId: string) => ({ ...evidence, id: `wp-${issueId}`, issueId });
+
+  function setupTwoChildren(overrideB: Record<string, unknown> = {}) {
+    const bRow = { ...childB, ...overrideB };
+    mocks.getById.mockImplementation((id: string) => {
+      if (id === "parent") return parent;
+      if (id === "child-a") return childA;
+      if (id === "child-b") return bRow;
+      return null;
+    });
+    mocks.listAcceptedPlanDecompositions.mockResolvedValue([{ childIssueIds: ["child-a", "child-b"] }]);
+    mocks.listApprovalsForIssue.mockResolvedValue([]);
+    mocks.listForIssue.mockImplementation((issueId: string) => Promise.resolve([evidenceFor(issueId)]));
+  }
+
+  const reconcilePrimary = (resolvedChildIssueId = "child-a") =>
+    reconcileDelegatedChildCompletion(mockDb(), { companyId: "company", parentIssueId: "parent", resolvedChildIssueId });
+
+  it("A: a sibling still working (not terminal) -> siblings_not_ready, not ready_for_jarvis_review", async () => {
+    setupTwoChildren({ status: "in_progress" });
+    const result = await reconcilePrimary();
+    expect(result).toMatchObject({ outcome: "siblings_not_ready", notReadySiblingIds: ["child-b"] });
+  });
+
+  it("B: a sibling cancelled -> siblings_not_ready", async () => {
+    setupTwoChildren({ status: "cancelled" });
+    const result = await reconcilePrimary();
+    expect(result).toMatchObject({ outcome: "siblings_not_ready", notReadySiblingIds: ["child-b"] });
+  });
+
+  it("C: a sibling done but its own required independent review is incomplete -> siblings_not_ready", async () => {
+    setupTwoChildren({ status: "done", reviewPolicy: "not_creator" });
+    // No activityLog in_review->done transition recorded for child-b (mockDb()
+    // with no transition arg) -> evaluateChildReadiness(child-b) resolves to
+    // missing_independent_review, so the sibling is correctly not ready.
+    const result = await reconcilePrimary();
+    expect(result).toMatchObject({ outcome: "siblings_not_ready", notReadySiblingIds: ["child-b"] });
+  });
+
+  it("D: every child done, with evidence and any required independent review satisfied -> ready_for_jarvis_review", async () => {
+    setupTwoChildren({ status: "done" }); // neither child requires review (reviewPolicy: null)
+    const result = await reconcilePrimary();
+    expect(result).toMatchObject({ outcome: "ready_for_jarvis_review" });
+  });
+
+  it("does not evaluate siblings at all when the primary itself is not ready (short-circuits before the sibling loop)", async () => {
+    setupTwoChildren({ status: "done" });
+    mocks.getById.mockImplementation((id: string) => {
+      if (id === "parent") return parent;
+      if (id === "child-a") return { ...childA, status: "in_progress" };
+      if (id === "child-b") return childB;
+      return null;
+    });
+    const result = await reconcilePrimary();
+    expect(result).toMatchObject({ outcome: "child_not_terminal" });
+  });
+
+  it("treats a sibling that cannot be resolved at all as not ready (fails closed, never silently ignored)", async () => {
+    setupTwoChildren({ status: "done" });
+    mocks.getById.mockImplementation((id: string) => {
+      if (id === "parent") return parent;
+      if (id === "child-a") return childA;
+      return null; // child-b unresolvable
+    });
+    const result = await reconcilePrimary();
+    expect(result).toMatchObject({ outcome: "siblings_not_ready", notReadySiblingIds: ["child-b"] });
+  });
+
+  it("E: a single-child decomposition (today's only real case) is completely unaffected -- identical to pre-existing behavior", async () => {
+    mocks.getById.mockImplementation((id: string) => id === "parent" ? parent : child);
+    mocks.listAcceptedPlanDecompositions.mockResolvedValue([{ childIssueIds: ["child"] }]);
+    mocks.listApprovalsForIssue.mockResolvedValue([]);
+    mocks.listForIssue.mockResolvedValue([evidence]);
+    const result = await reconcileDelegatedChildCompletion({} as never, {
+      companyId: "company",
+      parentIssueId: "parent",
+      resolvedChildIssueId: "child",
+    });
+    expect(result).toMatchObject({ outcome: "ready_for_jarvis_review", approvalRequired: false });
+    expect(result).not.toHaveProperty("notReadySiblingIds");
+  });
+});
+
 

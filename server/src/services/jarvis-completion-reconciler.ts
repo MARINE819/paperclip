@@ -39,6 +39,7 @@ export type JarvisCompletionReconciliationResult =
   | (ReconciliationContext & { outcome: "missing_required_approval" })
   | (ReconciliationContext & { outcome: "missing_independent_review"; reason: "missing_reviewer" | "unable_to_verify_review_authorization" | string })
   | (ReconciliationContext & { outcome: "invalid_reviewer"; reason: "executor_cannot_self_review" | "review_policy_denied" | string })
+  | (ReconciliationContext & { outcome: "siblings_not_ready"; notReadySiblingIds: string[] })
   | { outcome: "invalid_company_or_issue_relationship"; reason: "issue_not_found" | "company_mismatch" | "parent_mismatch" | "child_not_in_accepted_plan" };
 
 async function resolveIssueReviewVerdictActor(
@@ -83,39 +84,27 @@ async function resolveIssueReviewVerdictActor(
   return null;
 }
 
-export async function reconcileDelegatedChildCompletion(
+// Evaluates ONE child issue's own readiness against the exact same rules
+// M2-QA-LANE already verified: terminal status, linked-approval state,
+// changes-requested, Evidence Acceptance, and (when required) an
+// independently-verified reviewer. Parametrized on `child`/`parentIssueId`
+// so reconcileDelegatedChildCompletion can call this once for the primary
+// child (preserving its exact historical single-child behavior/shape) and
+// reuse it unchanged for each sibling in a multi-child decomposition --
+// never a second, divergent copy of these rules.
+async function evaluateChildReadiness(
   db: Db,
-  input: {
-    companyId: string;
-    parentIssueId: string;
-    resolvedChildIssueId: string;
-    reviewRequired?: boolean;
-  },
+  parentIssueId: string,
+  child: Awaited<ReturnType<ReturnType<typeof issueService>["getById"]>> & { id: string },
+  reviewRequiredOverride: boolean | undefined,
 ): Promise<JarvisCompletionReconciliationResult> {
-  const issues = issueService(db);
-  const [parent, child] = await Promise.all([
-    issues.getById(input.parentIssueId),
-    issues.getById(input.resolvedChildIssueId),
-  ]);
-  if (!parent || !child) return { outcome: "invalid_company_or_issue_relationship", reason: "issue_not_found" };
-  if (parent.companyId !== input.companyId || child.companyId !== input.companyId) {
-    return { outcome: "invalid_company_or_issue_relationship", reason: "company_mismatch" };
-  }
-  if (child.parentId !== parent.id) {
-    return { outcome: "invalid_company_or_issue_relationship", reason: "parent_mismatch" };
-  }
-  const decompositions = await issues.listAcceptedPlanDecompositions(parent.id);
-  if (!decompositions.some((entry) => entry.childIssueIds.includes(child.id))) {
-    return { outcome: "invalid_company_or_issue_relationship", reason: "child_not_in_accepted_plan" };
-  }
-
-  const reviewRequired = child.reviewPolicy === "not_creator" || Boolean(input.reviewRequired);
+  const reviewRequired = child.reviewPolicy === "not_creator" || Boolean(reviewRequiredOverride);
   const executionState = parseIssueExecutionState(child.executionState);
   const approvalRequired = executionState?.status === "pending" && executionState.currentParticipant?.type === "user";
   const linkedApprovals = await issueApprovalService(db).listApprovalsForIssue(child.id);
   const approvals = linkedApprovals.map(({ id, status }) => ({ id, status }));
   const context: ReconciliationContext = {
-    parentIssueId: parent.id,
+    parentIssueId,
     childIssueId: child.id,
     childStatus: child.status,
     executionState,
@@ -188,4 +177,65 @@ export async function reconcileDelegatedChildCompletion(
   }
 
   return { ...context, outcome: "ready_for_jarvis_review", evidence, reviewer };
+}
+
+export async function reconcileDelegatedChildCompletion(
+  db: Db,
+  input: {
+    companyId: string;
+    parentIssueId: string;
+    resolvedChildIssueId: string;
+    reviewRequired?: boolean;
+  },
+): Promise<JarvisCompletionReconciliationResult> {
+  const issues = issueService(db);
+  const [parent, child] = await Promise.all([
+    issues.getById(input.parentIssueId),
+    issues.getById(input.resolvedChildIssueId),
+  ]);
+  if (!parent || !child) return { outcome: "invalid_company_or_issue_relationship", reason: "issue_not_found" };
+  if (parent.companyId !== input.companyId || child.companyId !== input.companyId) {
+    return { outcome: "invalid_company_or_issue_relationship", reason: "company_mismatch" };
+  }
+  if (child.parentId !== parent.id) {
+    return { outcome: "invalid_company_or_issue_relationship", reason: "parent_mismatch" };
+  }
+  const decompositions = await issues.listAcceptedPlanDecompositions(parent.id);
+  const matchedDecomposition = decompositions.find((entry) => entry.childIssueIds.includes(child.id));
+  if (!matchedDecomposition) {
+    return { outcome: "invalid_company_or_issue_relationship", reason: "child_not_in_accepted_plan" };
+  }
+
+  const primaryResult = await evaluateChildReadiness(db, parent.id, child, input.reviewRequired);
+  if (primaryResult.outcome !== "ready_for_jarvis_review") return primaryResult;
+
+  // Multi-child-safe: a decomposition with more than one child must have
+  // EVERY sibling independently ready (its own terminal status, approvals,
+  // changes-requested, evidence, and -- when its own reviewPolicy requires
+  // it -- an independently-verified reviewer) before the primary's own
+  // readiness can be trusted as the parent's readiness. A sibling's
+  // reviewRequired is always its OWN reviewPolicy's call, never the
+  // primary's caller-supplied override. Today's only reachable case
+  // (assertSingleSpecialistPlan still limits submitToJarvis to one child)
+  // has zero siblings, so this loop never runs and behavior is unchanged.
+  const siblingIds = matchedDecomposition.childIssueIds.filter((id) => id !== child.id);
+  if (siblingIds.length > 0) {
+    const notReadySiblingIds: string[] = [];
+    for (const siblingId of siblingIds) {
+      const sibling = await issues.getById(siblingId);
+      if (!sibling || sibling.companyId !== input.companyId) {
+        notReadySiblingIds.push(siblingId);
+        continue;
+      }
+      const siblingResult = await evaluateChildReadiness(db, parent.id, sibling, undefined);
+      if (siblingResult.outcome !== "ready_for_jarvis_review") {
+        notReadySiblingIds.push(siblingId);
+      }
+    }
+    if (notReadySiblingIds.length > 0) {
+      return { ...primaryResult, outcome: "siblings_not_ready", notReadySiblingIds };
+    }
+  }
+
+  return primaryResult;
 }

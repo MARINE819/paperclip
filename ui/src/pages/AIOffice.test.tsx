@@ -1410,4 +1410,126 @@ describe("AIOffice", () => {
       act(() => root.unmount());
     });
   });
+
+  describe("AI Office Operational Consistency", () => {
+    it("queries completed issues sorted by updated descending and renders deep-link for canonical report", async () => {
+      const now = new Date();
+      const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+      mockAgentsApi.list.mockResolvedValue([jarvis]);
+      mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+      mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string; sortField?: string; sortDir?: string }) => {
+        if (filter?.status === "done") {
+          return Promise.resolve([
+            {
+              id: "issue-done-p1",
+              identifier: "PAP-200",
+              title: "Completed Parent Delivery",
+              status: "done",
+              parentId: null,
+              assigneeAgentId: "agent-jarvis",
+            },
+            {
+              id: "issue-done-r1",
+              identifier: "PAP-201",
+              title: "Regular Done Task",
+              status: "done",
+              parentId: null,
+              assigneeAgentId: "agent-other",
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockIssuesApi.listComments.mockImplementation((issueId: string) => {
+        if (issueId === "issue-done-p1") {
+          return Promise.resolve([
+            {
+              id: "comment-canonical-done-1",
+              issueId: "issue-done-p1",
+              authorType: "agent",
+              authorAgentId: "agent-jarvis",
+              body: "Completed final report",
+              metadata: {
+                version: 1,
+                authorizationReason: "canonical_jarvis_parent_report",
+                sections: [],
+              },
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const root = await renderPage();
+      await flushReact();
+      await flushReact();
+
+      // Verify list called with sortField: "updated", sortDir: "desc"
+      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", {
+        status: "done",
+        sortField: "updated",
+        sortDir: "desc",
+      });
+
+      // Completed card items
+      const doneParentLink = container.querySelector('[data-testid="desktop-completed-item-issue-done-p1"]') as HTMLAnchorElement;
+      expect(doneParentLink).not.toBeNull();
+      expect(doneParentLink.getAttribute("href")).toBe("/issues/issue-done-p1#comment-comment-canonical-done-1");
+      expect(doneParentLink.textContent).toContain("PAP-200: Completed Parent Delivery");
+
+      const doneRegularLink = container.querySelector('[data-testid="desktop-completed-item-issue-done-r1"]') as HTMLAnchorElement;
+      expect(doneRegularLink).not.toBeNull();
+      expect(doneRegularLink.getAttribute("href")).toBe("/issues/issue-done-r1");
+      expect(doneRegularLink.textContent).toContain("PAP-201: Regular Done Task");
+
+      act(() => root.unmount());
+    });
+
+    it("unifies desktop top pending approval metric to reflect pending + revision_requested count", async () => {
+      const now = new Date();
+      const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+      mockAgentsApi.list.mockResolvedValue([jarvis]);
+      mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+      const pendingApproval: Approval = {
+        id: "approval-1",
+        companyId: "company-1",
+        type: "budget_increase",
+        status: "pending",
+        requestedByAgentId: "agent-jarvis",
+        payload: {},
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as Approval;
+
+      const revisionApproval: Approval = {
+        id: "approval-2",
+        companyId: "company-1",
+        type: "tool_execution",
+        status: "revision_requested",
+        requestedByAgentId: "agent-jarvis",
+        payload: {},
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as Approval;
+
+      mockApprovalsApi.list.mockImplementation((_companyId: string, status?: string) => {
+        if (status === "pending") return Promise.resolve([pendingApproval]);
+        if (status === "revision_requested") return Promise.resolve([revisionApproval]);
+        return Promise.resolve([]);
+      });
+
+      const root = await renderPage();
+      await flushReact();
+
+      const metricCard = container.querySelector('[data-testid="desktop-pending-approvals-metric"]');
+      expect(metricCard).not.toBeNull();
+      // Total 2 approvals (1 pending + 1 revision_requested)
+      expect(metricCard?.textContent).toContain("2");
+
+      act(() => root.unmount());
+    });
+  });
 });

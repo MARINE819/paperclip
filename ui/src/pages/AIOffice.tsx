@@ -222,7 +222,11 @@ export function AIOffice() {
 
   const completedIssuesQuery = useQuery({
     queryKey: ["ai-office-2d-issues-completed", selectedCompanyId],
-    queryFn: () => issuesApi.list(selectedCompanyId!, { status: "done" }),
+    queryFn: () => issuesApi.list(selectedCompanyId!, {
+      status: "done",
+      sortField: "updated",
+      sortDir: "desc",
+    }),
     enabled: !!selectedCompanyId,
     refetchInterval: 30_000,
   });
@@ -332,16 +336,23 @@ export function AIOffice() {
   const jarvis = agents.find((agent) => agent.name === "JARVIS");
   const atlas = agents.find((agent) => agent.name === "Atlas");
 
-  // N+1 Optimization: candidate pre-filtering for root parent issues assigned to JARVIS
-  const jarvisInReviewCandidates = useMemo(() => {
+  // N+1 Optimization: candidate pre-filtering for root parent issues assigned to JARVIS (in-review + recent completed)
+  const jarvisReportCandidates = useMemo(() => {
     if (!jarvis) return [];
-    return (inReviewIssuesQuery.data ?? []).filter(
-      (issue) => issue.parentId === null && issue.assigneeAgentId === jarvis.id,
-    );
-  }, [inReviewIssuesQuery.data, jarvis]);
+    const inReview = inReviewIssuesQuery.data ?? [];
+    const completed = (completedIssuesQuery.data ?? []).slice(0, 5);
+    const combined = [...inReview, ...completed];
+    const seen = new Set<string>();
+    return combined.filter((issue) => {
+      if (issue.parentId !== null || issue.assigneeAgentId !== jarvis.id) return false;
+      if (seen.has(issue.id)) return false;
+      seen.add(issue.id);
+      return true;
+    });
+  }, [inReviewIssuesQuery.data, completedIssuesQuery.data, jarvis]);
 
   const jarvisReportCommentQueries = useQueries({
-    queries: jarvisInReviewCandidates.map((issue) => ({
+    queries: jarvisReportCandidates.map((issue) => ({
       queryKey: ["ai-office-jarvis-report-comments", issue.id],
       queryFn: () => issuesApi.listComments(issue.id, { order: "desc", limit: 5 }),
       staleTime: 15_000,
@@ -353,7 +364,7 @@ export function AIOffice() {
   const jarvisReportCommentByIssueId = useMemo(() => {
     const map = new Map<string, IssueComment>();
     jarvisReportCommentQueries.forEach((q, idx) => {
-      const candidate = jarvisInReviewCandidates[idx];
+      const candidate = jarvisReportCandidates[idx];
       if (!candidate || !q.data || !Array.isArray(q.data)) return;
       const reportComment = q.data.find(
         (comment) => comment.metadata?.authorizationReason === "canonical_jarvis_parent_report",
@@ -363,7 +374,7 @@ export function AIOffice() {
       }
     });
     return map;
-  }, [jarvisReportCommentQueries, jarvisInReviewCandidates]);
+  }, [jarvisReportCommentQueries, jarvisReportCandidates]);
 
   const mappedOrgUnitNames = new Set(
     DEPARTMENT_ROOMS.map((room) => room.orgUnitName).filter((name): name is string => !!name),
@@ -511,10 +522,10 @@ export function AIOffice() {
             <StatValue state={inReviewIssuesState} value={(inReviewIssuesQuery.data ?? []).length} />
           </CardContent>
         </Card>
-        <Card>
+        <Card data-testid="desktop-pending-approvals-metric">
           <CardContent className="flex flex-col gap-1 p-3 text-sm">
             <span className="text-xs text-muted-foreground">승인 대기</span>
-            <StatValue state={pendingApprovalsState} value={pendingApprovalAgentIds.size} />
+            <StatValue state={pendingApprovalsState} value={allPendingApprovals.length} />
           </CardContent>
         </Card>
         <Card>
@@ -917,19 +928,22 @@ export function AIOffice() {
                   errorPrefix="완료 데이터 조회 실패"
                 />
               ) : (
-                (completedIssuesQuery.data ?? []).slice(0, 3).map((issue) => (
-                  <a
-                    key={issue.id}
-                    href={`/issues/${issue.id}`}
-                    className="flex items-center justify-between gap-2 border-t pt-2 first:border-t-0 first:pt-0 hover:bg-muted/40 rounded p-1 -mx-1 transition-colors"
-                    data-testid={`desktop-completed-item-${issue.id}`}
-                  >
-                    <span className="truncate font-medium">
-                      {issue.identifier ? `${issue.identifier}: ` : ""}{issue.title}
-                    </span>
-                    <span className="shrink-0 text-xs text-primary">보고서/산출물 →</span>
-                  </a>
-                ))
+                (completedIssuesQuery.data ?? []).slice(0, 3).map((issue) => {
+                  const reportComment = jarvisReportCommentByIssueId.get(issue.id);
+                  return (
+                    <a
+                      key={issue.id}
+                      href={reportComment ? `/issues/${issue.id}#comment-${reportComment.id}` : `/issues/${issue.id}`}
+                      className="flex items-center justify-between gap-2 border-t pt-2 first:border-t-0 first:pt-0 hover:bg-muted/40 rounded p-1 -mx-1 transition-colors"
+                      data-testid={`desktop-completed-item-${issue.id}`}
+                    >
+                      <span className="truncate font-medium">
+                        {issue.identifier ? `${issue.identifier}: ` : ""}{issue.title}
+                      </span>
+                      <span className="shrink-0 text-xs text-primary">보고서/산출물 →</span>
+                    </a>
+                  );
+                })
               )}
             </CardContent>
           </Card>

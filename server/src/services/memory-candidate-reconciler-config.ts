@@ -4,12 +4,9 @@
  * `PAPERCLIP_*` environment variables, read through an injectable `env`
  * object so tests never need to mutate `process.env`.
  *
- * Fail-closed: any missing or malformed value falls back to a safe default
- * rather than throwing or silently disabling in a surprising way.
- * `ENABLED` in particular fails closed to `false` — Phase 3.0B ships
- * disabled by default during implementation/UAT (see
- * `doc/memory-candidate-extraction.md`); enabling it is a deliberate
- * operator decision, never the default.
+ * Missing configuration uses the enabled production default. Explicit
+ * configuration is fail-closed: only exact `"true"` enables the reconciler;
+ * exact `"false"` and every malformed explicit value disable it.
  */
 
 export const MEMORY_CANDIDATE_RECONCILER_ENV_VARS = {
@@ -18,7 +15,7 @@ export const MEMORY_CANDIDATE_RECONCILER_ENV_VARS = {
   BATCH_SIZE: "PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_BATCH_SIZE",
 } as const;
 
-export const MEMORY_CANDIDATE_RECONCILER_DEFAULT_ENABLED = false;
+export const MEMORY_CANDIDATE_RECONCILER_DEFAULT_ENABLED = true;
 export const MEMORY_CANDIDATE_RECONCILER_DEFAULT_INTERVAL_MS = 60_000;
 export const MEMORY_CANDIDATE_RECONCILER_MIN_INTERVAL_MS = 10_000;
 export const MEMORY_CANDIDATE_RECONCILER_DEFAULT_BATCH_SIZE = 20;
@@ -40,9 +37,12 @@ function parsePositiveInt(raw: string | undefined): number | null {
 export function resolveMemoryCandidateReconcilerConfig(
   env: Record<string, string | undefined> = process.env,
 ): MemoryCandidateReconcilerConfig {
-  // Fail closed: only the exact string "true" enables it. Anything else
-  // (unset, "1", "yes", a typo) stays disabled rather than guessing intent.
-  const enabled = env[MEMORY_CANDIDATE_RECONCILER_ENV_VARS.ENABLED] === "true";
+  const rawEnabled = env[MEMORY_CANDIDATE_RECONCILER_ENV_VARS.ENABLED];
+  // Unset uses the enabled production default. Any explicit value other than
+  // the exact string "true" disables the pipeline, so typos fail closed.
+  const enabled = rawEnabled === undefined
+    ? MEMORY_CANDIDATE_RECONCILER_DEFAULT_ENABLED
+    : rawEnabled === "true";
 
   const parsedInterval = parsePositiveInt(env[MEMORY_CANDIDATE_RECONCILER_ENV_VARS.INTERVAL_MS]);
   const intervalMs = Math.max(

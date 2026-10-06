@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MEMORY_CANDIDATE_RECONCILER_DEFAULT_BATCH_SIZE,
+  MEMORY_CANDIDATE_RECONCILER_DEFAULT_ENABLED,
   MEMORY_CANDIDATE_RECONCILER_DEFAULT_INTERVAL_MS,
   MEMORY_CANDIDATE_RECONCILER_MAX_BATCH_SIZE,
   MEMORY_CANDIDATE_RECONCILER_MIN_INTERVAL_MS,
@@ -8,17 +9,19 @@ import {
 } from "./memory-candidate-reconciler-config.js";
 
 describe("resolveMemoryCandidateReconcilerConfig", () => {
-  it("fails closed to disabled with safe defaults when nothing is set", () => {
+  it("enables reconciliation with safe interval and batch defaults when nothing is set", () => {
     const config = resolveMemoryCandidateReconcilerConfig({});
     expect(config).toEqual({
-      enabled: false,
+      enabled: MEMORY_CANDIDATE_RECONCILER_DEFAULT_ENABLED,
       intervalMs: MEMORY_CANDIDATE_RECONCILER_DEFAULT_INTERVAL_MS,
       batchSize: MEMORY_CANDIDATE_RECONCILER_DEFAULT_BATCH_SIZE,
     });
+    expect(config.enabled).toBe(true);
   });
 
-  it("enables only on the exact string \"true\"", () => {
+  it("accepts exact true/false and fails closed for every other explicit value", () => {
     expect(resolveMemoryCandidateReconcilerConfig({ PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED: "true" }).enabled).toBe(true);
+    expect(resolveMemoryCandidateReconcilerConfig({ PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED: "false" }).enabled).toBe(false);
     for (const bad of ["1", "yes", "TRUE", "True", " true", ""]) {
       expect(resolveMemoryCandidateReconcilerConfig({ PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED: bad }).enabled).toBe(false);
     }

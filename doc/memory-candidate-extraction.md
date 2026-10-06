@@ -157,12 +157,14 @@ and `cooldownMapSize`.
 
 | Env var | Default | Notes |
 | --- | --- | --- |
-| `PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED` | `false` | Only the exact string `"true"` enables it; anything else (including unset) fails closed to disabled. |
+| `PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED` | `true` | Unset enables the reconciler. Exact `"true"` enables and exact `"false"` disables it; any other explicit value fails closed to disabled. |
 | `PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_INTERVAL_MS` | `60000` (60s) | Clamped up to a 10s minimum; malformed values fall back to the default. |
 | `PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_BATCH_SIZE` | `20` | Clamped down to a 200 maximum; malformed values fall back to the default. |
 
-The reconciler is **disabled by default** during implementation and UAT. The
-default-enable decision for production is deferred until after UAT.
+The reconciler is **enabled by default**. Operators can opt out with the exact
+value `PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED=false`; malformed explicit
+values fail closed to disabled. Automatic processing stops at a RAW candidate:
+Board review and promotion are still required before verified Knowledge exists.
 
 ## Activity and actor attribution
 

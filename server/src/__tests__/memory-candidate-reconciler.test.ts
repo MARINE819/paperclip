@@ -15,6 +15,7 @@ import {
   issueDocuments,
   issues,
   issueWorkProducts,
+  knowledgeRecords,
   memoryOperations,
   principalPermissionGrants,
 } from "@paperclipai/db";
@@ -47,6 +48,7 @@ import {
 
 async function resetFixtures(db: Db) {
   await db.delete(activityLog);
+  await db.delete(knowledgeRecords);
   await db.delete(memoryOperations);
   await db.delete(issueWorkProducts);
   await db.delete(issueDocuments);
@@ -174,6 +176,11 @@ describeEmbeddedPostgres("automatic memory candidate reconciliation (Phase 3.0B)
       sourceAgentId: agentId,
       content: body,
     });
+    const promotedKnowledge = await ctx.db
+      .select()
+      .from(knowledgeRecords)
+      .where(eq(knowledgeRecords.companyId, company.companyId));
+    expect(promotedKnowledge).toHaveLength(0);
   });
 
   it("[2] does not extract until the summary is created, then succeeds on the next reconciliation", async () => {
@@ -535,12 +542,13 @@ describeEmbeddedPostgres("automatic memory candidate reconciliation (Phase 3.0B)
     expect(promote.body.knowledgeRecord.sourceMemoryOperationId).toBe(op!.id);
   });
 
-  it("starts and stops the reconciler scheduler during createApp lifecycle when enabled", async () => {
-    // 1. Stub environment variables safely
+  it("starts and stops the reconciler scheduler during createApp lifecycle by default", async () => {
+    // 1. Preserve the environment and leave ENABLED unset to exercise the
+    // production default rather than an explicit opt-in.
     const originalEnabled = process.env.PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED;
     const originalInterval = process.env.PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_INTERVAL_MS;
 
-    process.env.PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED = "true";
+    delete process.env.PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED;
     process.env.PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_INTERVAL_MS = "10000"; // 10s
 
     try {
@@ -663,8 +671,10 @@ describeEmbeddedPostgres("automatic memory candidate reconciliation (Phase 3.0B)
 });
 
 describe("Phase 3.0B scheduler wiring pattern (config -> scheduler, no app.ts boot)", () => {
-  it("[20] a disabled config never starts the scheduler", () => {
-    const config = resolveMemoryCandidateReconcilerConfig({});
+  it("[20] an explicitly disabled config never starts the scheduler", () => {
+    const config = resolveMemoryCandidateReconcilerConfig({
+      PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED: "false",
+    });
     expect(config.enabled).toBe(false);
 
     const reconcile = () => Promise.resolve({});
@@ -684,8 +694,8 @@ describe("Phase 3.0B scheduler wiring pattern (config -> scheduler, no app.ts bo
     expect(setIntervalCalls).toBe(0);
   });
 
-  it("[21,22] an enabled config starts the scheduler (startup tick + interval), and stop() cleans it up", async () => {
-    const config = resolveMemoryCandidateReconcilerConfig({ PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED: "true" });
+  it("[21,22] the default config starts the scheduler (startup tick + interval), and stop() cleans it up", async () => {
+    const config = resolveMemoryCandidateReconcilerConfig({});
     expect(config.enabled).toBe(true);
 
     let calls = 0;
@@ -711,5 +721,3 @@ describe("Phase 3.0B scheduler wiring pattern (config -> scheduler, no app.ts bo
     expect(cleared).toBe(true);
   });
 });
-
-

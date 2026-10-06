@@ -903,9 +903,9 @@ export async function createApp(
     });
   // Phase 3.0B: durable automatic Memory Operation candidate extraction.
   // Same shape as the import transfer sweep above (setInterval + `.unref()`
-  // + a startup-once run + swallow-and-log). Disabled by default
-  // (PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED) during implementation
-  // and UAT — see doc/memory-candidate-extraction.md. This never touches
+  // + a startup-once run + swallow-and-log). Enabled by default; operators
+  // can set PAPERCLIP_MEMORY_CANDIDATE_RECONCILER_ENABLED=false to opt out.
+  // See doc/memory-candidate-extraction.md. This never touches
   // issues.ts or heartbeat.ts: it only re-derives eligibility from current
   // DB state on each tick.
   const memoryCandidateReconcilerConfig = resolveMemoryCandidateReconcilerConfig();

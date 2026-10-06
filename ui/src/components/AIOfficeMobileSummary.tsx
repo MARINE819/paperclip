@@ -829,11 +829,12 @@ export function AIOfficeMobileSummary({
               const assigneeName = issue.assigneeAgentId
                 ? agentById.get(issue.assigneeAgentId)?.name ?? "AI 에이전트"
                 : "미배정";
+              const reportComment = jarvisReportComments?.get(issue.id);
 
               return (
                 <a
                   key={issue.id}
-                  href={`/issues/${issue.id}`}
+                  href={reportComment ? `/issues/${issue.id}#comment-${reportComment.id}` : `/issues/${issue.id}`}
                   data-testid={`mobile-completed-issue-item-${issue.id}`}
                   className="flex flex-col gap-1 rounded-lg border border-border/70 bg-card p-2.5 text-xs shadow-xs hover:bg-muted/40 transition-colors"
                 >

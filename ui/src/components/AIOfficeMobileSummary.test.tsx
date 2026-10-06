@@ -1001,5 +1001,51 @@ describe("AIOfficeMobileSummary", () => {
 
     act(() => root.unmount());
   });
+
+  it("renders mobile completed work item with canonical JARVIS report deep-link when present", async () => {
+    const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS" });
+    const doneParent = {
+      id: "issue-done-parent-1",
+      identifier: "NEX-100",
+      title: "Completed Parent Task",
+      assigneeAgentId: "agent-jarvis",
+      companyId: "company-1",
+      status: "done",
+      parentId: null,
+    } as any;
+    const reportComment = {
+      id: "comment-canonical-done",
+      issueId: "issue-done-parent-1",
+      metadata: {
+        authorizationReason: "canonical_jarvis_parent_report",
+      },
+    } as any;
+    const jarvisReportComments = new Map([["issue-done-parent-1", reportComment]]);
+
+    const root = render(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[jarvis]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        completedIssues={[doneParent]}
+        jarvisReportComments={jarvisReportComments}
+        errorAgents={[]}
+      />,
+    );
+
+    const completedCard = container.querySelector('[data-testid="mobile-completed-work-card"]');
+    expect(completedCard).not.toBeNull();
+    const itemLink = completedCard?.querySelector(
+      '[data-testid="mobile-completed-issue-item-issue-done-parent-1"]',
+    ) as HTMLAnchorElement;
+    expect(itemLink).not.toBeNull();
+    expect(itemLink?.getAttribute("href")).toBe(
+      "/issues/issue-done-parent-1#comment-comment-canonical-done",
+    );
+    expect(itemLink?.textContent).toContain("Completed Parent Task");
+
+    act(() => root.unmount());
+  });
 });
 

@@ -93,6 +93,21 @@ describe("evaluateEvidenceAcceptance", () => {
     expect(result.acceptedWorkProductIds).toEqual(["wp-workspace-file"]);
   });
 
+  it("accepts a canonical workspace_file resourceRef with relativePath", () => {
+    const result = evaluateEvidenceAcceptance({
+      childIssueId: CHILD_ISSUE_ID,
+      workProducts: [
+        workProduct({
+          id: "wp-workspace-rel",
+          url: null,
+          metadata: { resourceRef: { kind: "workspace_file", relativePath: "docs/report.md" } },
+        }),
+      ],
+    });
+    expect(result.accepted).toBe(true);
+    expect(result.acceptedWorkProductIds).toEqual(["wp-workspace-rel"]);
+  });
+
   it("rejects a workspace_file resourceRef with an empty path", () => {
     const result = evaluateEvidenceAcceptance({
       childIssueId: CHILD_ISSUE_ID,

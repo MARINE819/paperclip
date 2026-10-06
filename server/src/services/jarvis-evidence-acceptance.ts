@@ -40,11 +40,22 @@ const UNACCEPTABLE_STATUSES = new Set(["failed", "archived"]);
 
 function resolvesToOpenableLocation(workProduct: JarvisEvidenceCandidate): boolean {
   const metadata = workProduct.metadata as
-    | { resourceRef?: { kind?: string; path?: string }; contentPath?: string; openPath?: string }
+    | {
+        resourceRef?: { kind?: string; path?: string; relativePath?: string; displayPath?: string };
+        contentPath?: string;
+        openPath?: string;
+      }
     | null;
   const resourceRef = metadata?.resourceRef;
   if (resourceRef?.kind === "workspace_file") {
-    return typeof resourceRef.path === "string" && resourceRef.path.trim().length > 0;
+    const filePath = typeof resourceRef.relativePath === "string" && resourceRef.relativePath.trim().length > 0
+      ? resourceRef.relativePath
+      : typeof resourceRef.path === "string" && resourceRef.path.trim().length > 0
+      ? resourceRef.path
+      : typeof resourceRef.displayPath === "string" && resourceRef.displayPath.trim().length > 0
+      ? resourceRef.displayPath
+      : null;
+    return Boolean(filePath);
   }
   if (typeof workProduct.url === "string" && workProduct.url.trim().length > 0) return true;
   return Boolean(metadata?.contentPath || metadata?.openPath);

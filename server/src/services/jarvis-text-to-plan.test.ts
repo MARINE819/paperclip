@@ -52,6 +52,14 @@ describe("buildMinimalDelegationPlanFromText", () => {
     expect(result.plan!.evidenceRequirements).toEqual(["work_product"]);
   });
 
+  it("detects explicit review intent from requestText keywords, defaulting to false when absent", () => {
+    expect(buildMinimalDelegationPlanFromText("Implement authentication and request independent review").plan!.reviewRequired).toBe(true);
+    expect(buildMinimalDelegationPlanFromText("결제 모듈 개발 및 코드 리뷰 진행").plan!.reviewRequired).toBe(true);
+    expect(buildMinimalDelegationPlanFromText("Fix the login bug").plan!.reviewRequired).toBe(false);
+    expect(buildMinimalDelegationPlanFromText("Implement code review feature", { reviewRequired: false }).plan!.reviewRequired).toBe(false);
+    expect(buildMinimalDelegationPlanFromText("Fix the login bug", { reviewRequired: true }).plan!.reviewRequired).toBe(true);
+  });
+
   it("fails closed for empty or whitespace-only input, never returning a best-effort plan", () => {
     expect(buildMinimalDelegationPlanFromText("").ok).toBe(false);
     expect(buildMinimalDelegationPlanFromText("").plan).toBeNull();

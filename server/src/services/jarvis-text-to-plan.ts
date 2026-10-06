@@ -54,6 +54,32 @@ function classifyTaskClass(normalizedText: string): DelegationTaskClass {
   return "development";
 }
 
+const REVIEW_KEYWORDS: readonly string[] = [
+  "code review",
+  "code-review",
+  "peer review",
+  "peer-review",
+  "independent review",
+  "independent-review",
+  "review required",
+  "review-required",
+  "require review",
+  "needs review",
+  "qa review",
+  "코드 리뷰",
+  "코드리뷰",
+  "독립 검토",
+  "독립검토",
+  "상호 검토",
+  "상호검토",
+  "피어 리뷰",
+  "피어리뷰",
+];
+
+function detectReviewRequired(normalizedText: string): boolean {
+  return REVIEW_KEYWORDS.some((kw) => normalizedText.includes(kw));
+}
+
 const MAX_TITLE_LENGTH = 200;
 
 function deriveTaskTitle(requestText: string): string {
@@ -89,8 +115,9 @@ export function buildMinimalDelegationPlanFromText(
     return { ok: false, plan: null, errors: ["requestText is required and cannot be blank."] };
   }
 
-  const reviewRequired = options?.reviewRequired ?? false;
-  const taskClass = classifyTaskClass(trimmed.toLowerCase());
+  const normalized = trimmed.toLowerCase();
+  const reviewRequired = options?.reviewRequired ?? detectReviewRequired(normalized);
+  const taskClass = classifyTaskClass(normalized);
   const plan: SubmitToJarvisPlanInput = {
     objective: trimmed,
     acceptanceCriteria: ["The requested task is completed as described in the request text."],

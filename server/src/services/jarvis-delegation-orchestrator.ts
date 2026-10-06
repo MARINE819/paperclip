@@ -11,7 +11,6 @@ import {
 } from "./jarvis-agent-selector.js";
 import {
   JARVIS_DELEGATION_PLAN_SCHEMA_VERSION,
-  assertSingleSpecialistPlan,
   validateDelegationPlan,
   type DelegationTask,
   type DelegationTaskClass,
@@ -89,7 +88,6 @@ export type SubmitToJarvisRejectionReason =
   | "jarvis_not_invokable"
   | "invalid_plan"
   | "plan_limits_violated"
-  | "not_single_specialist"
   | "no_eligible_specialist"
   | "no_eligible_reviewer";
 
@@ -104,6 +102,16 @@ export interface SubmitToJarvisFailure {
   rejectedAgents?: JarvisAgentRejection[];
 }
 
+// M2 multi-child: one entry per task, in the same order as plan.tasks.
+// childIssueId/selectedAgentId/reviewerAgentId on SubmitToJarvisSuccess
+// itself always mirror childAssignments[0] -- preserved unchanged so every
+// existing single-task caller keeps working exactly as before.
+export interface SubmitToJarvisChildAssignment {
+  childIssueId: string;
+  selectedAgentId: string;
+  reviewerAgentId: string | null;
+}
+
 export interface SubmitToJarvisSuccess {
   ok: true;
   parentIssueId: string;
@@ -112,6 +120,7 @@ export interface SubmitToJarvisSuccess {
   parentBlockerAdded: boolean;
   selectedAgentId: string;
   reviewerAgentId?: string | null;
+  childAssignments: SubmitToJarvisChildAssignment[];
   intakeFingerprint: string;
   planFingerprint: string;
   reasonCodes: string[];
@@ -233,54 +242,67 @@ export async function submitToJarvis(
     };
   }
 
-  const singleSpecialistCheck = assertSingleSpecialistPlan(plan);
-  if (!singleSpecialistCheck.ok) {
-    return {
-      ok: false,
-      reason: "not_single_specialist",
-      detail: singleSpecialistCheck.error ?? "Milestone 1 requires exactly one task.",
-      parentIssueId: parentIssue.id,
-    };
-  }
-
   const planFingerprint = computeDelegationPlanFingerprint(plan);
-  const task = plan.tasks[0]!;
 
-  // 7. Deterministic, company-scoped, existing-agent selection.
-  const selection = selectDeterministicSpecialist({
-    companyId,
-    jarvisAgentId,
-    candidates: companyAgents,
-    task: { requiredCapabilities: task.requiredCapabilities },
-  });
-  if (selection.blocked || !selection.selectedAgentId) {
-    return {
-      ok: false,
-      reason: "no_eligible_specialist",
-      detail: "No eligible existing specialist agent was found for this task. No agent was created automatically.",
-      parentIssueId: parentIssue.id,
-      rejectedAgents: selection.rejected,
-    };
-  }
+  // 7. Deterministic, company-scoped, existing-agent selection -- one pass
+  // per task, in plan order. assignedAgentIds grows with every specialist
+  // AND reviewer already chosen, so excludeAgentIds (an existing parameter
+  // on both selector functions -- not new) guarantees each task's
+  // specialist is distinct from every other task's specialist, and no
+  // reviewer is ever the same agent as any task's own specialist. Nothing
+  // here invents a new selection rule: it is the same selectDeterministic
+  // Specialist/selectDeterministicReviewer used identically per task,
+  // called N times instead of once. Selection for ALL tasks must succeed
+  // before any child Issue is created (the loop below never calls
+  // decomposeAcceptedPlan) -- a failure on any task fails the whole
+  // submission closed, with zero children created, exactly like today's
+  // single-task failure-before-creation behavior.
+  type TaskAssignment = { task: DelegationTask; selectedAgentId: string; reviewerAgentId: string | null };
+  const assignments: TaskAssignment[] = [];
+  const assignedAgentIds: string[] = [];
 
-  let selectedReviewerId: string | null = null;
-  if (plan.reviewRequired) {
-    const reviewerSelection = selectDeterministicReviewer({
+  for (const task of plan.tasks) {
+    const selection = selectDeterministicSpecialist({
       companyId,
       jarvisAgentId,
-      executorAgentId: selection.selectedAgentId,
       candidates: companyAgents,
+      task: { requiredCapabilities: task.requiredCapabilities },
+      excludeAgentIds: assignedAgentIds,
     });
-    if (reviewerSelection.blocked || !reviewerSelection.selectedAgentId) {
+    if (selection.blocked || !selection.selectedAgentId) {
       return {
         ok: false,
-        reason: "no_eligible_reviewer",
-        detail: "No eligible independent reviewer agent was found for this task. The executor cannot self-review.",
+        reason: "no_eligible_specialist",
+        detail: `No eligible existing specialist agent was found for task "${task.title}". No agent was created automatically.`,
         parentIssueId: parentIssue.id,
-        rejectedAgents: reviewerSelection.rejected,
+        rejectedAgents: selection.rejected,
       };
     }
-    selectedReviewerId = reviewerSelection.selectedAgentId;
+    assignedAgentIds.push(selection.selectedAgentId);
+
+    let reviewerAgentId: string | null = null;
+    if (plan.reviewRequired) {
+      const reviewerSelection = selectDeterministicReviewer({
+        companyId,
+        jarvisAgentId,
+        executorAgentId: selection.selectedAgentId,
+        candidates: companyAgents,
+        excludeAgentIds: assignedAgentIds,
+      });
+      if (reviewerSelection.blocked || !reviewerSelection.selectedAgentId) {
+        return {
+          ok: false,
+          reason: "no_eligible_reviewer",
+          detail: `No eligible independent reviewer agent was found for task "${task.title}". The executor cannot self-review.`,
+          parentIssueId: parentIssue.id,
+          rejectedAgents: reviewerSelection.rejected,
+        };
+      }
+      reviewerAgentId = reviewerSelection.selectedAgentId;
+      assignedAgentIds.push(reviewerAgentId);
+    }
+
+    assignments.push({ task, selectedAgentId: selection.selectedAgentId, reviewerAgentId });
   }
 
   // 8/9/10. The Board-submitted plan is itself the Human approval boundary.
@@ -349,57 +371,81 @@ export async function submitToJarvis(
     );
   }
 
+  // Each child gets its OWN idempotency key (planFingerprint + its task
+  // index, stable across retries of the same validated plan) -- reusing
+  // the bare planFingerprint for every child would collide under
+  // issueService.create's (companyId, idempotencyKey) dedup guard
+  // (server/src/services/issues.ts ~line 7088), silently making every
+  // additional child resolve back to the FIRST one instead of creating a
+  // distinct Issue. This is the one correctness-critical detail required to
+  // use the existing idempotency structure correctly for N>1 children, not
+  // a new mechanism.
   const decomposition = await issueService(db).decomposeAcceptedPlan(parentIssue.id, {
     acceptedPlanRevisionId,
     actorUserId: requestedByUserId,
-    children: [{
+    children: assignments.map(({ task, selectedAgentId, reviewerAgentId }, index) => ({
       title: task.title,
       description: task.instructions,
       status: CHILD_ISSUE_STATUS,
-      assigneeAgentId: selection.selectedAgentId,
-      reviewPolicy: plan.reviewRequired ? "not_creator" : null,
+      assigneeAgentId: selectedAgentId,
+      reviewPolicy: reviewerAgentId ? "not_creator" : null,
       acceptanceCriteria: plan.acceptanceCriteria,
       blockParentUntilDone: true,
-      idempotencyKey: planFingerprint,
-    }],
+      idempotencyKey: `${planFingerprint}:${index}`,
+    })),
   });
-  const childIssue = decomposition.childIssues[0];
-  if (!childIssue) throw new Error("Accepted JARVIS delegation plan did not produce a child Issue");
+  if (decomposition.childIssues.length !== assignments.length) {
+    throw new Error("Accepted JARVIS delegation plan did not produce a child Issue for every task");
+  }
 
-  // Best-effort live wakeup. This slice does not construct or import a
-  // heartbeat service (server/src/services/heartbeat.ts is contended and
-  // untouched); a real wakeup executor must be injected by whichever future,
-  // separately-approved slice wires this command to live route/app
-  // registration. Without an injected executor, the child Issue is still
-  // correctly created and assigned — it simply is not yet woken by this call.
+  const childAssignments: SubmitToJarvisChildAssignment[] = decomposition.childIssues.map((childIssue, index) => ({
+    childIssueId: childIssue.id,
+    selectedAgentId: assignments[index]!.selectedAgentId,
+    reviewerAgentId: assignments[index]!.reviewerAgentId,
+  }));
+
+  // Best-effort live wakeup, once per created child. This slice does not
+  // construct or import a heartbeat service (server/src/services/heartbeat.ts
+  // is contended and untouched); a real wakeup executor must be injected by
+  // whichever future, separately-approved slice wires this command to live
+  // route/app registration. Without an injected executor, every child Issue
+  // is still correctly created and assigned — it simply is not yet woken by
+  // this call.
   if (deps.wakeup) {
-    await queueIssueAssignmentWakeup({
-      heartbeat: { wakeup: deps.wakeup },
-      issue: { id: childIssue.id, assigneeAgentId: selection.selectedAgentId, status: CHILD_ISSUE_STATUS },
-      reason: "jarvis_delegation_child_assigned",
-      mutation: "jarvis_delegation_child_created",
-      contextSource: "jarvis_delegation_orchestrator",
-      requestedByActorType: "agent",
-      requestedByActorId: jarvisAgentId,
-    });
+    for (const { childIssueId, selectedAgentId } of childAssignments) {
+      await queueIssueAssignmentWakeup({
+        heartbeat: { wakeup: deps.wakeup },
+        issue: { id: childIssueId, assigneeAgentId: selectedAgentId, status: CHILD_ISSUE_STATUS },
+        reason: "jarvis_delegation_child_assigned",
+        mutation: "jarvis_delegation_child_created",
+        contextSource: "jarvis_delegation_orchestrator",
+        requestedByActorType: "agent",
+        requestedByActorId: jarvisAgentId,
+      });
+    }
   }
 
   // 11. Structured result with canonical Paperclip identifiers only — never
-  // a fabricated approval, evidence, or completion state.
+  // a fabricated approval, evidence, or completion state. childIssueId/
+  // selectedAgentId/reviewerAgentId mirror the FIRST assignment so every
+  // existing single-task caller keeps reading the exact same fields it
+  // always has; childAssignments carries the full multi-child detail.
+  const first = childAssignments[0]!;
   return {
     ok: true,
     parentIssueId: parentIssue.id,
     parentIssueDeduplicated,
-    childIssueId: childIssue.id,
+    childIssueId: first.childIssueId,
     parentBlockerAdded: true,
-    selectedAgentId: selection.selectedAgentId,
-    reviewerAgentId: selectedReviewerId,
+    selectedAgentId: first.selectedAgentId,
+    reviewerAgentId: first.reviewerAgentId,
+    childAssignments,
     intakeFingerprint,
     planFingerprint,
     reasonCodes: [
       parentIssueDeduplicated ? "parent_issue_reused" : "parent_issue_created",
-      ...selection.reasonCodes,
-      ...(selectedReviewerId ? ["independent_reviewer_selected"] : []),
+      ...(childAssignments.length > 1 ? ["multi_child_distinct_specialists_assigned"] : []),
+      ...(childAssignments.some((a) => a.reviewerAgentId) ? ["independent_reviewer_selected"] : []),
       "child_issue_created",
       "accepted_plan_recorded",
       "parent_blocked_until_child_done",

@@ -36,12 +36,13 @@ export const delegationTaskSchema = z.object({
 export type DelegationTask = z.infer<typeof delegationTaskSchema>;
 
 /**
- * The general shape allows up to 5 tasks (matching the MVP's bounded
- * children-per-decision limit in jarvis-delegation-limits.ts) so the same
- * contract can later carry a Milestone 2 multi-child plan without a breaking
- * shape change. Milestone 1 additionally requires exactly one task; that
- * narrower rule is enforced separately by assertSingleSpecialistPlan below,
- * not baked into the shape itself.
+ * The shape allows up to 5 tasks, matching the bounded
+ * children-per-decision limit already enforced by
+ * evaluateDelegationLimits/JARVIS_DELEGATION_MAX_CHILDREN_PER_DECISION in
+ * jarvis-delegation-limits.ts (submitToJarvis's sole child-count governor —
+ * see jarvis-delegation-orchestrator.ts, which assigns each task to a
+ * distinct specialist via selectDeterministicSpecialist before creating any
+ * child Issue).
  */
 export const delegationPlanSchema = z.object({
   version: z.literal(JARVIS_DELEGATION_PLAN_SCHEMA_VERSION),
@@ -76,25 +77,3 @@ export function validateDelegationPlan(input: unknown): DelegationPlanValidation
   };
 }
 
-export interface SingleSpecialistPlanCheck {
-  ok: boolean;
-  error: string | null;
-}
-
-/**
- * Milestone 1 (Paperclip-native, single-specialist vertical slice) is
- * explicitly limited to one task per plan
- * (docs/architecture/jarvis-delegation-loop-mvp-plan.md §8). This is kept as
- * a separate check from delegationPlanSchema so multi-task plans remain
- * structurally valid (for Milestone 2) while still being rejected by the
- * Milestone 1 orchestration path.
- */
-export function assertSingleSpecialistPlan(plan: DelegationPlan): SingleSpecialistPlanCheck {
-  if (plan.tasks.length !== 1) {
-    return {
-      ok: false,
-      error: `Milestone 1 requires exactly one task per delegation plan; received ${plan.tasks.length}.`,
-    };
-  }
-  return { ok: true, error: null };
-}

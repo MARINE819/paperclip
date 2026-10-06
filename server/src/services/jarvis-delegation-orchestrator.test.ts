@@ -275,18 +275,113 @@ describe("submitToJarvis — invalid delegation depth and child-count rejection"
     expect(result.ok).toBe(true);
   });
 
-  it("rejects a plan with more than one task under the Milestone 1 single-specialist rule", async () => {
-    const twoTaskPlan = validPlan({
-      tasks: [
-        { title: "A", instructions: "do a", requiredCapabilities: [], dependencies: [], riskHints: [] },
-        { title: "B", instructions: "do b", requiredCapabilities: [], dependencies: [], riskHints: [] },
-      ],
+  it("rejects a plan with more tasks than delegationPlanSchema's own max(5) cap (the same JARVIS_DELEGATION_MAX_CHILDREN_PER_DECISION limit, enforced earlier by the schema itself)", async () => {
+    const tooManyTasksPlan = validPlan({
+      tasks: Array.from({ length: 6 }, (_, i) => ({
+        title: `Task ${i}`, instructions: `do ${i}`, requiredCapabilities: [], dependencies: [], riskHints: [],
+      })),
     });
-    const result = await submitToJarvis(FAKE_DB, baseInput({ plan: twoTaskPlan }));
+    const result = await submitToJarvis(FAKE_DB, baseInput({ plan: tooManyTasksPlan }));
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected failure");
-    expect(result.reason).toBe("not_single_specialist");
+    expect(result.reason).toBe("invalid_plan");
     expect(mockDecomposeAcceptedPlan).not.toHaveBeenCalled();
+  });
+});
+
+describe("submitToJarvis — multi-child delegation (distinct specialist per task)", () => {
+  const SPECIALIST_B_ID = "agent-specialist-b";
+
+  beforeEach(() => {
+    mockListCompanyAgentsForDelegation.mockResolvedValue([
+      agent({ id: JARVIS_ID }),
+      agent({ id: SPECIALIST_ID }),
+      agent({ id: SPECIALIST_B_ID }),
+    ]);
+    mockDecomposeAcceptedPlan.mockImplementation(async (_parentId: string, data: Record<string, any>) => ({
+      childIssues: data.children.map((child: Record<string, unknown>, i: number) => ({ id: `child-issue-${i + 1}`, ...child })),
+      childIssueIds: data.children.map((_: unknown, i: number) => `child-issue-${i + 1}`),
+      newlyCreatedIssues: data.children.map((_: unknown, i: number) => ({ id: `child-issue-${i + 1}` })),
+    }));
+  });
+
+  const twoTaskPlan = () => validPlan({
+    tasks: [
+      { title: "A", instructions: "do a", requiredCapabilities: [], dependencies: [], riskHints: [] },
+      { title: "B", instructions: "do b", requiredCapabilities: [], dependencies: [], riskHints: [] },
+    ],
+  });
+
+  it("creates one child per task, each assigned to a distinct specialist, with a unique idempotencyKey per child", async () => {
+    const result = await submitToJarvis(FAKE_DB, baseInput({ plan: twoTaskPlan() }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected success");
+
+    expect(result.childAssignments).toHaveLength(2);
+    const specialistIds = result.childAssignments.map((a) => a.selectedAgentId);
+    expect(new Set(specialistIds).size).toBe(2); // genuinely distinct, not the same agent twice
+    expect(specialistIds.sort()).toEqual([SPECIALIST_B_ID, SPECIALIST_ID].sort());
+
+    expect(mockDecomposeAcceptedPlan).toHaveBeenCalledTimes(1);
+    const children = mockDecomposeAcceptedPlan.mock.calls[0]![1].children;
+    expect(children).toHaveLength(2);
+    expect(new Set(children.map((c: any) => c.assigneeAgentId)).size).toBe(2);
+    const keys = children.map((c: any) => c.idempotencyKey);
+    expect(new Set(keys).size).toBe(2); // no two children share an idempotencyKey
+
+    // Backward-compat singular fields mirror the first assignment.
+    expect(result.childIssueId).toBe(result.childAssignments[0]!.childIssueId);
+    expect(result.selectedAgentId).toBe(result.childAssignments[0]!.selectedAgentId);
+  });
+
+  it("respects each task's own required capabilities while still assigning distinct specialists", async () => {
+    mockListCompanyAgentsForDelegation.mockResolvedValue([
+      agent({ id: JARVIS_ID }),
+      agent({ id: SPECIALIST_ID, capabilities: "typescript" }),
+      agent({ id: SPECIALIST_B_ID, capabilities: "python" }),
+    ]);
+    const plan = validPlan({
+      tasks: [
+        { title: "TS task", instructions: "do ts", requiredCapabilities: ["typescript"], dependencies: [], riskHints: [] },
+        { title: "Py task", instructions: "do py", requiredCapabilities: ["python"], dependencies: [], riskHints: [] },
+      ],
+    });
+    const result = await submitToJarvis(FAKE_DB, baseInput({ plan }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected success");
+    expect(result.childAssignments[0]!.selectedAgentId).toBe(SPECIALIST_ID);
+    expect(result.childAssignments[1]!.selectedAgentId).toBe(SPECIALIST_B_ID);
+  });
+
+  it("fails closed with zero children created when a later task has no remaining eligible specialist", async () => {
+    // Only ONE non-JARVIS agent exists -- task A consumes it, leaving nothing for task B.
+    mockListCompanyAgentsForDelegation.mockResolvedValue([
+      agent({ id: JARVIS_ID }),
+      agent({ id: SPECIALIST_ID }),
+    ]);
+    const result = await submitToJarvis(FAKE_DB, baseInput({ plan: twoTaskPlan() }));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(result.reason).toBe("no_eligible_specialist");
+    expect(result.detail).toContain("B"); // names the task that actually failed
+    expect(mockDecomposeAcceptedPlan).not.toHaveBeenCalled();
+  });
+
+  it("stays within the existing 5-child-per-decision limit without inventing a new one", async () => {
+    mockListCompanyAgentsForDelegation.mockResolvedValue([
+      agent({ id: JARVIS_ID }),
+      ...Array.from({ length: 5 }, (_, i) => agent({ id: `agent-${i}` })),
+    ]);
+    const fiveTaskPlan = validPlan({
+      tasks: Array.from({ length: 5 }, (_, i) => ({
+        title: `Task ${i}`, instructions: `do ${i}`, requiredCapabilities: [], dependencies: [], riskHints: [],
+      })),
+    });
+    const result = await submitToJarvis(FAKE_DB, baseInput({ plan: fiveTaskPlan }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected success");
+    expect(result.childAssignments).toHaveLength(5);
+    expect(new Set(result.childAssignments.map((a) => a.selectedAgentId)).size).toBe(5);
   });
 });
 

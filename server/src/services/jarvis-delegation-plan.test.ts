@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   JARVIS_DELEGATION_PLAN_SCHEMA_VERSION,
-  assertSingleSpecialistPlan,
   validateDelegationPlan,
   type DelegationPlan,
 } from "./jarvis-delegation-plan.js";
@@ -105,23 +104,3 @@ describe("validateDelegationPlan", () => {
   });
 });
 
-describe("assertSingleSpecialistPlan", () => {
-  it("passes for exactly one task", () => {
-    const { plan } = validateDelegationPlan(validPlan());
-    expect(assertSingleSpecialistPlan(plan!)).toEqual({ ok: true, error: null });
-  });
-
-  it("fails for zero or multiple tasks", () => {
-    const { plan } = validateDelegationPlan(
-      validPlan({
-        tasks: [
-          { title: "A", instructions: "do a", requiredCapabilities: [], dependencies: [], riskHints: [] },
-          { title: "B", instructions: "do b", requiredCapabilities: [], dependencies: [], riskHints: [] },
-        ],
-      }),
-    );
-    const check = assertSingleSpecialistPlan(plan!);
-    expect(check.ok).toBe(false);
-    expect(check.error).toContain("exactly one task");
-  });
-});

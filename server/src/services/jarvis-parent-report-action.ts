@@ -9,6 +9,7 @@ import {
 import {
   projectJarvisParentReport,
   type JarvisParentReportCanonicalInput,
+  type JarvisParentReportChildInput,
 } from "./jarvis-parent-report-projector.js";
 import { writeJarvisParentReport, type JarvisParentReportWriteResult } from "./jarvis-parent-report-writer.js";
 import { workProductService } from "./work-products.js";
@@ -68,44 +69,100 @@ export async function runJarvisParentReportAction(
     return { reconciliation, report: { outcome: "not_written" } };
   }
 
-  const [freshParent, freshChild, decompositions, products, approvals] = await Promise.all([
-    issueSvc.getById(parent.id),
-    issueSvc.getById(child.id),
-    issueSvc.listAcceptedPlanDecompositions(parent.id),
-    workProductService(db).listForIssue(child.id),
-    issueApprovalService(db).listApprovalsForIssue(child.id),
-  ]);
-  if (!freshParent || !freshChild) throw new Error("issue_not_found");
-  if (freshParent.companyId !== input.companyId || freshChild.companyId !== input.companyId) throw new Error("company_mismatch");
-  if (freshChild.parentId !== freshParent.id) throw new Error("parent_mismatch");
-  if (freshParent.assigneeAgentId !== actor.agentId) throw new Error("jarvis_assignment_mismatch");
-  const acceptedPlan = decompositions.find((entry) => entry.childIssueIds.includes(freshChild.id));
-  if (!acceptedPlan) throw new Error("child_not_in_accepted_plan");
+  const decompositions = await issueSvc.listAcceptedPlanDecompositions(parent.id);
+  const matchedDecomposition = decompositions.find((entry) => entry.childIssueIds.includes(child.id));
+  if (!matchedDecomposition) throw new Error("child_not_in_accepted_plan");
 
-  const evidence: JarvisParentReportCanonicalInput["evidence"] = products.map((product) => {
-    const normalizedRef = resourceRef(product.metadata);
-    return {
-      id: product.id,
-      type: product.type,
-      status: product.status,
-      healthStatus: product.healthStatus,
-      url: product.url,
-      resourceRef: normalizedRef,
-      fingerprint: fingerprint({
-        id: product.id,
-        type: product.type,
-        status: product.status,
-        reviewState: product.reviewState,
-        healthStatus: product.healthStatus,
-        url: product.url,
-        resourceRef: normalizedRef,
-        updatedAt: product.updatedAt,
-      }),
-    };
-  });
-  const approvalState = approvals
-    .map((approval) => ({ id: approval.id, status: approval.status, updatedAt: approval.updatedAt }))
-    .sort((left, right) => left.id.localeCompare(right.id));
+  // Entry-point independence: resolve the *entire* decomposition's children
+  // (not just the one that triggered this call) so JARVIS gets the same
+  // single aggregated report no matter which ready child it reports on.
+  // Every other child is reconciled through the exact same, unmodified
+  // reconcileDelegatedChildCompletion (jarvis-completion-reconciler.ts) --
+  // never a second, divergent readiness rule.
+  const childIssueIds = matchedDecomposition.childIssueIds;
+  const perChildReconciliation = await Promise.all(
+    childIssueIds.map((id) =>
+      id === child.id
+        ? Promise.resolve(reconciliation)
+        : reconcileDelegatedChildCompletion(db, {
+            companyId: input.companyId,
+            parentIssueId: parent.id,
+            resolvedChildIssueId: id,
+          }),
+    ),
+  );
+  if (perChildReconciliation.some((result) => result.outcome !== "ready_for_jarvis_review")) {
+    return { reconciliation, report: { outcome: "not_written" } };
+  }
+
+  const [freshParent, ...childDetails] = await Promise.all([
+    issueSvc.getById(parent.id),
+    ...childIssueIds.map(async (id, index): Promise<JarvisParentReportChildInput> => {
+      const [freshChild, products] = await Promise.all([
+        issueSvc.getById(id),
+        workProductService(db).listForIssue(id),
+      ]);
+      if (!freshChild) throw new Error("issue_not_found");
+      if (freshChild.companyId !== input.companyId) throw new Error("company_mismatch");
+      if (freshChild.parentId !== parent.id) throw new Error("parent_mismatch");
+      const evidence = products.map((product) => {
+        const normalizedRef = resourceRef(product.metadata);
+        return {
+          id: product.id,
+          type: product.type,
+          status: product.status,
+          healthStatus: product.healthStatus,
+          url: product.url,
+          resourceRef: normalizedRef,
+          fingerprint: fingerprint({
+            id: product.id,
+            type: product.type,
+            status: product.status,
+            reviewState: product.reviewState,
+            healthStatus: product.healthStatus,
+            url: product.url,
+            resourceRef: normalizedRef,
+            updatedAt: product.updatedAt,
+          }),
+        };
+      });
+      return {
+        id: freshChild.id,
+        identifier: freshChild.identifier ?? null,
+        parentId: freshChild.parentId,
+        assigneeAgentId: freshChild.assigneeAgentId,
+        reconciliation: perChildReconciliation[index],
+        evidence,
+      };
+    }),
+  ]);
+  if (!freshParent) throw new Error("issue_not_found");
+  if (freshParent.companyId !== input.companyId) throw new Error("company_mismatch");
+  if (freshParent.assigneeAgentId !== actor.agentId) throw new Error("jarvis_assignment_mismatch");
+
+  const approvalFingerprints = await Promise.all(
+    childIssueIds.map(async (id) => {
+      const approvals = await issueApprovalService(db).listApprovalsForIssue(id);
+      return {
+        childId: id,
+        approvals: approvals
+          .map((approval) => ({ id: approval.id, status: approval.status, updatedAt: approval.updatedAt }))
+          .sort((left, right) => left.id.localeCompare(right.id)),
+      };
+    }),
+  );
+  const approvalStateFingerprint = fingerprint(
+    [...approvalFingerprints].sort((left, right) => left.childId.localeCompare(right.childId)),
+  );
+  const executionStateFingerprint = fingerprint(
+    [...childDetails]
+      .map((entry) => ({
+        childId: entry.id,
+        executionState: entry.reconciliation.outcome === "ready_for_jarvis_review" ? entry.reconciliation.executionState : null,
+      }))
+      .sort((left, right) => left.childId.localeCompare(right.childId)),
+  );
+
   const canonical: JarvisParentReportCanonicalInput = {
     companyId: input.companyId,
     jarvisAgentId: actor.agentId,
@@ -114,21 +171,14 @@ export async function runJarvisParentReportAction(
       identifier: freshParent.identifier ?? null,
       assigneeAgentId: freshParent.assigneeAgentId,
     },
-    child: {
-      id: freshChild.id,
-      identifier: freshChild.identifier ?? null,
-      parentId: freshChild.parentId,
-      assigneeAgentId: freshChild.assigneeAgentId,
-    },
     acceptedPlan: {
-      decompositionId: acceptedPlan.id,
-      fingerprint: acceptedPlan.requestFingerprint,
-      childIssueIds: acceptedPlan.childIssueIds,
+      decompositionId: matchedDecomposition.id,
+      fingerprint: matchedDecomposition.requestFingerprint,
+      childIssueIds: matchedDecomposition.childIssueIds,
     },
-    reconciliation,
-    evidence,
-    approvalStateFingerprint: fingerprint(approvalState),
-    executionStateFingerprint: fingerprint(reconciliation.executionState),
+    children: childDetails,
+    approvalStateFingerprint,
+    executionStateFingerprint,
   };
   const projection = projectJarvisParentReport(canonical);
   if (!projection) throw new Error("parent_report_projection_failed");

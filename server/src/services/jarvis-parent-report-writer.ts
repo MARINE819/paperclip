@@ -22,18 +22,27 @@ export async function writeJarvisParentReport(
     const lockKey = `jarvis-parent-report:${canonical.companyId}:${canonical.parent.id}:${projection.fingerprint}`;
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
 
-    const [parent, child] = await Promise.all([
+    const [parent, ...children] = await Promise.all([
       tx.select({ id: issues.id, companyId: issues.companyId, assigneeAgentId: issues.assigneeAgentId })
         .from(issues).where(eq(issues.id, canonical.parent.id)).then((rows) => rows[0] ?? null),
-      tx.select({ id: issues.id, companyId: issues.companyId, parentId: issues.parentId, assigneeAgentId: issues.assigneeAgentId })
-        .from(issues).where(eq(issues.id, canonical.child.id)).then((rows) => rows[0] ?? null),
+      ...canonical.children.map((child) =>
+        tx.select({ id: issues.id, companyId: issues.companyId, parentId: issues.parentId, assigneeAgentId: issues.assigneeAgentId })
+          .from(issues).where(eq(issues.id, child.id)).then((rows) => rows[0] ?? null),
+      ),
     ]);
-    if (!parent || !child) throw new Error("issue_not_found");
-    if (parent.companyId !== canonical.companyId || child.companyId !== canonical.companyId) throw new Error("company_mismatch");
+    if (!parent) throw new Error("issue_not_found");
+    if (parent.companyId !== canonical.companyId) throw new Error("company_mismatch");
     if (parent.assigneeAgentId !== canonical.jarvisAgentId || parent.assigneeAgentId !== canonical.parent.assigneeAgentId) throw new Error("jarvis_assignment_mismatch");
-    if (child.parentId !== parent.id || child.parentId !== canonical.child.parentId) throw new Error("parent_mismatch");
-    if (child.assigneeAgentId !== canonical.child.assigneeAgentId) throw new Error("child_assignment_mismatch");
-    if (!canonical.acceptedPlan.childIssueIds.includes(child.id)) throw new Error("child_not_in_accepted_plan");
+
+    for (let index = 0; index < canonical.children.length; index += 1) {
+      const expectedChild = canonical.children[index];
+      const actualChild = children[index];
+      if (!actualChild) throw new Error("issue_not_found");
+      if (actualChild.companyId !== canonical.companyId) throw new Error("company_mismatch");
+      if (actualChild.parentId !== parent.id || actualChild.parentId !== expectedChild.parentId) throw new Error("parent_mismatch");
+      if (actualChild.assigneeAgentId !== expectedChild.assigneeAgentId) throw new Error("child_assignment_mismatch");
+      if (!canonical.acceptedPlan.childIssueIds.includes(actualChild.id)) throw new Error("child_not_in_accepted_plan");
+    }
 
     const existing = await tx.select({ id: issueComments.id })
       .from(issueComments)

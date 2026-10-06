@@ -1,8 +1,19 @@
 import type { CSSProperties } from "react";
-import { Clock, TriangleAlert } from "lucide-react";
+import {
+  Clock,
+  ExternalLink,
+  FileText,
+  GitBranch,
+  GitCommit,
+  Globe,
+  Package,
+  Server,
+  TriangleAlert,
+} from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import type { Agent } from "@paperclipai/shared";
+import type { Agent, IssueWorkProduct } from "@paperclipai/shared";
 import type { LiveRunForIssue } from "@/api/heartbeats";
+import { issuesApi } from "@/api/issues";
 import {
   Sheet,
   SheetContent,
@@ -14,7 +25,7 @@ import { buttonVariants } from "@/components/ui/button";
 import { deriveAgentCondition } from "@/components/AIOfficeControlTower";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { evalsApi, type EvalRunStatus } from "@/api/evals";
-import { cn } from "@/lib/utils";
+import { cn, formatCents } from "@/lib/utils";
 
 /**
  * Presentational layer for the AI Office 2D floor — every visual state here
@@ -250,6 +261,24 @@ export interface AgentDetailInfo {
    * than rendered as an empty dash. A one-line summary is as much task detail
    * as AI Office shows; the full picture lives on the Dashboard-owned page. */
   taskSummary: string | null;
+  /** Configured / selected adapter/executor from agent definition (e.g. "codex_local", "claude_local") */
+  selectedExecutor?: string | null;
+  /** Actual runtime executor from live run or neural routing telemetry */
+  actualExecutor?: string | null;
+  /** AI Provider (e.g. "openai", "anthropic") */
+  provider?: string | null;
+  /** Model name (e.g. "gpt-5.6-sol", "claude-3-7-sonnet") */
+  model?: string | null;
+  /** Active tool name if currently executing a tool */
+  currentToolName?: string | null;
+  /** Active run ID */
+  activeRunId?: string | null;
+  /** Aggregate / monthly cost in cents if available */
+  aggregateCostCents?: number | null;
+  /** Current run cost in cents if truthful live data exists (null if not available) */
+  currentRunCostCents?: number | null;
+  /** Associated active or recent issue ID for work product discovery */
+  currentIssueId?: string | null;
 }
 
 function AgentEvalBadge({ status }: { status: EvalRunStatus }) {
@@ -411,6 +440,169 @@ function AgentEvalSection({ agentId }: { agentId: string }) {
   return <AgentEvalSectionContent agentId={agentId} />;
 }
 
+function workProductTypeIcon(type: string): LucideIcon {
+  switch (type) {
+    case "document":
+      return FileText;
+    case "pull_request":
+    case "branch":
+      return GitBranch;
+    case "commit":
+      return GitCommit;
+    case "preview_url":
+      return Globe;
+    case "runtime_service":
+      return Server;
+    default:
+      return Package;
+  }
+}
+
+function workProductStatusBadge(wp: IssueWorkProduct) {
+  const isApproved = wp.status === "approved" || wp.reviewState === "approved";
+  const isNeedsReview = wp.status === "ready_for_review" || wp.reviewState === "needs_board_review";
+  const isFailed = wp.status === "failed";
+  const isChangesRequested = wp.status === "changes_requested" || wp.reviewState === "changes_requested";
+
+  let label = wp.status;
+  let colorClass = "border-border bg-muted text-muted-foreground";
+
+  if (isApproved) {
+    label = "승인됨";
+    colorClass = "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
+  } else if (isNeedsReview) {
+    label = "검토 대기";
+    colorClass = "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400";
+  } else if (isFailed) {
+    label = "실패";
+    colorClass = "border-destructive/30 bg-destructive/10 text-destructive";
+  } else if (isChangesRequested) {
+    label = "수정 요청";
+    colorClass = "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400";
+  } else if (wp.status === "active") {
+    label = "작업 중";
+    colorClass = "border-blue-500/30 bg-blue-500/10 text-blue-600 dark:text-blue-400";
+  }
+
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded-full border px-1.5 py-0.5 text-xs font-medium whitespace-nowrap",
+        colorClass,
+      )}
+    >
+      {label}
+    </span>
+  );
+}
+
+function AgentWorkProductsSectionContent({ issueId }: { issueId: string }) {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ["work-products", issueId],
+    queryFn: () => issuesApi.listWorkProducts(issueId),
+  });
+
+  if (isLoading) {
+    return (
+      <div className="space-y-2 rounded-md border p-3">
+        <div className="text-xs font-semibold text-muted-foreground">산출물 (Work Products)</div>
+        <div className="text-xs text-muted-foreground">산출물 데이터 로딩 중...</div>
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="space-y-2 rounded-md border p-3">
+        <div className="text-xs font-semibold text-muted-foreground">산출물 (Work Products)</div>
+        <div className="rounded-md border border-dashed p-2 text-center text-xs text-muted-foreground">
+          산출물 데이터 조회 실패
+        </div>
+      </div>
+    );
+  }
+
+  const workProducts = data ?? [];
+
+  if (workProducts.length === 0) {
+    return (
+      <div className="space-y-2 rounded-md border p-3">
+        <div className="text-xs font-semibold text-muted-foreground">산출물 (Work Products)</div>
+        <div className="rounded-md border border-dashed p-2 text-center text-xs text-muted-foreground">
+          등록된 산출물 없음
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2 rounded-md border p-3">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold text-muted-foreground">산출물 (Work Products)</span>
+        <span className="text-xs text-muted-foreground">{workProducts.length}건</span>
+      </div>
+
+      <div className="space-y-1.5">
+        {workProducts.map((wp) => {
+          const Icon = workProductTypeIcon(wp.type);
+          const targetUrl = wp.url || (wp.issueId ? `/issues/${wp.issueId}` : null);
+
+          return (
+            <div
+              key={wp.id}
+              className="flex items-center justify-between gap-2 rounded border border-border/50 bg-muted/20 p-2 text-xs"
+            >
+              <div className="flex min-w-0 items-center gap-1.5">
+                <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                <span className="truncate font-medium">{wp.title}</span>
+              </div>
+
+              <div className="flex shrink-0 items-center gap-1.5">
+                {workProductStatusBadge(wp)}
+                {targetUrl ? (
+                  <a
+                    href={targetUrl}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className="text-muted-foreground hover:text-foreground"
+                    title="산출물 열기"
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span className="sr-only">열기</span>
+                  </a>
+                ) : null}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function AgentWorkProductsSection({ issueId }: { issueId?: string | null }) {
+  if (!issueId) {
+    return (
+      <div className="space-y-2 rounded-md border p-3">
+        <div className="text-xs font-semibold text-muted-foreground">산출물 (Work Products)</div>
+        <div className="rounded-md border border-dashed p-2 text-center text-xs text-muted-foreground">
+          등록된 산출물 없음 (진행 중인 이슈 없음)
+        </div>
+      </div>
+    );
+  }
+
+  let hasClient = false;
+  try {
+    useQueryClient();
+    hasClient = true;
+  } catch {
+    hasClient = false;
+  }
+  if (!hasClient) return null;
+  return <AgentWorkProductsSectionContent issueId={issueId} />;
+}
+
 /**
  * Workstation click detail — AI Office shows identity/role/seat state
  * and server-computed F-04 Agent Eval quality metrics, linking out to
@@ -443,6 +635,76 @@ export function AgentDetailSheet({
                   <span className="truncate">{agent.taskSummary}</span>
                 </div>
               ) : null}
+
+              {/* M2-06-B01: 실행 두뇌 및 모델 관측 (Agent Execution & Model Observability) */}
+              <div className="space-y-2 rounded-md border p-3">
+                <div className="text-xs font-semibold text-muted-foreground">
+                  실행 두뇌 및 모델 (Execution & Model)
+                </div>
+
+                {/* 설정된 실행자 */}
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-muted-foreground">설정된 실행자</span>
+                  <span className="font-mono font-medium">{agent.selectedExecutor || "정보 없음"}</span>
+                </div>
+
+                {/* 실제 실행자 */}
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-muted-foreground">실제 실행자</span>
+                  <span className="font-mono font-medium">{agent.actualExecutor || "정보 없음"}</span>
+                </div>
+
+                {/* 제공자 */}
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-muted-foreground">제공자 (Provider)</span>
+                  <span className="font-medium">{agent.provider || "정보 없음"}</span>
+                </div>
+
+                {/* 모델 */}
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-muted-foreground">실행 모델 (Model)</span>
+                  <span className="font-mono font-medium">{agent.model || "정보 없음"}</span>
+                </div>
+
+                {/* 실행 중 도구 (있는 경우) */}
+                {agent.currentToolName ? (
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-muted-foreground">실행 중 도구</span>
+                    <span className="font-mono font-medium">{agent.currentToolName}</span>
+                  </div>
+                ) : null}
+
+                {/* Run ID (있는 경우) */}
+                {agent.activeRunId ? (
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-muted-foreground">Run ID</span>
+                    <span className="font-mono text-muted-foreground">{agent.activeRunId}</span>
+                  </div>
+                ) : null}
+
+                {/* 비용 정보: 현재 실행 비용 vs 누적 비용 엄격 구분 */}
+                <div className="flex flex-col gap-1 border-t pt-1.5 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted-foreground">현재 실행 비용</span>
+                    <span className="font-medium">
+                      {agent.currentRunCostCents != null
+                        ? formatCents(agent.currentRunCostCents)
+                        : "정보 없음 (실시간 미집계)"}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted-foreground">누적 비용 (월간)</span>
+                    <span className="font-medium">
+                      {agent.aggregateCostCents != null
+                        ? formatCents(agent.aggregateCostCents)
+                        : "정보 없음"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* M2-06-B03: 산출물 관측성 (Work Products Observability) */}
+              <AgentWorkProductsSection issueId={agent.currentIssueId} />
 
               {/* F-04 Agent Eval Quality Section */}
               <AgentEvalSection agentId={agent.agentId} />

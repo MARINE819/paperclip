@@ -10,8 +10,16 @@ const mockEvalsApi = vi.hoisted(() => ({
   getAgentSummary: vi.fn(),
 }));
 
+const mockIssuesApi = vi.hoisted(() => ({
+  listWorkProducts: vi.fn(),
+}));
+
 vi.mock("../api/evals", () => ({
   evalsApi: mockEvalsApi,
+}));
+
+vi.mock("../api/issues", () => ({
+  issuesApi: mockIssuesApi,
 }));
 import {
   AgentDetailSheet,
@@ -465,4 +473,279 @@ describe("AIOfficeFloor", () => {
 
     act(() => root.unmount());
   });
+
+  // ── M2-06-B01: Agent Execution & Model Observability ──
+
+  it("AgentDetailSheet renders truthful execution and model observability fields when provided", async () => {
+    const root = render(
+      <AgentDetailSheet
+        agent={{
+          agentId: "agent-gamma",
+          name: "Gamma",
+          role: "Architecture Specialist",
+          state: "working",
+          taskSummary: "Optimizing neural routing graph",
+          selectedExecutor: "claude_local",
+          actualExecutor: "claude_local",
+          provider: "anthropic",
+          model: "claude-3-7-sonnet",
+          currentToolName: "view_file",
+          activeRunId: "run-xyz-789",
+          aggregateCostCents: 450,
+          currentRunCostCents: 12,
+        }}
+        onOpenChange={vi.fn()}
+      />,
+    );
+    await flushReact();
+
+    expect(document.body.textContent).toContain("실행 두뇌 및 모델 (Execution & Model)");
+    expect(document.body.textContent).toContain("설정된 실행자");
+    expect(document.body.textContent).toContain("claude_local");
+    expect(document.body.textContent).toContain("실제 실행자");
+    expect(document.body.textContent).toContain("제공자 (Provider)");
+    expect(document.body.textContent).toContain("anthropic");
+    expect(document.body.textContent).toContain("실행 모델 (Model)");
+    expect(document.body.textContent).toContain("claude-3-7-sonnet");
+    expect(document.body.textContent).toContain("실행 중 도구");
+    expect(document.body.textContent).toContain("view_file");
+    expect(document.body.textContent).toContain("Run ID");
+    expect(document.body.textContent).toContain("run-xyz-789");
+    expect(document.body.textContent).toContain("현재 실행 비용");
+    expect(document.body.textContent).toContain("$0.12");
+    expect(document.body.textContent).toContain("누적 비용 (월간)");
+    expect(document.body.textContent).toContain("$4.50");
+
+    act(() => root.unmount());
+  });
+
+  it('AgentDetailSheet renders "정보 없음" truthfully without placeholder fabrication when fields are missing', async () => {
+    const root = render(
+      <AgentDetailSheet
+        agent={{
+          agentId: "agent-delta",
+          name: "Delta",
+          role: "Junior Developer",
+          state: "idle",
+          taskSummary: null,
+          selectedExecutor: null,
+          actualExecutor: null,
+          provider: null,
+          model: null,
+          aggregateCostCents: null,
+          currentRunCostCents: null,
+        }}
+        onOpenChange={vi.fn()}
+      />,
+    );
+    await flushReact();
+
+    expect(document.body.textContent).toContain("실행 두뇌 및 모델 (Execution & Model)");
+    expect(document.body.textContent).toContain("정보 없음");
+    expect(document.body.textContent).toContain("정보 없음 (실시간 미집계)");
+    // Must NEVER fabricate "Active Execution" or use role as placeholder
+    expect(document.body.textContent).not.toContain("Active Execution");
+
+    act(() => root.unmount());
+  });
+
+  it("AgentDetailSheet distinguishes selectedExecutor vs actualExecutor when redirection occurs", async () => {
+    const root = render(
+      <AgentDetailSheet
+        agent={{
+          agentId: "agent-epsilon",
+          name: "Epsilon",
+          role: "Fullstack",
+          state: "working",
+          taskSummary: "Executing complex fallback task",
+          selectedExecutor: "claude_local",
+          actualExecutor: "codex_local",
+          provider: "openai",
+          model: "gpt-5.6-sol",
+        }}
+        onOpenChange={vi.fn()}
+      />,
+    );
+    await flushReact();
+
+    expect(document.body.textContent).toContain("claude_local");
+    expect(document.body.textContent).toContain("codex_local");
+    expect(document.body.textContent).toContain("openai");
+    expect(document.body.textContent).toContain("gpt-5.6-sol");
+
+    act(() => root.unmount());
+  });
+
+  // ── M2-06-B03: Work Products / Deliverables Observability ──
+
+  it("AgentDetailSheet renders Work Products list with titles, types, status, and links when data is present", async () => {
+    mockIssuesApi.listWorkProducts.mockResolvedValue([
+      {
+        id: "wp-1",
+        companyId: "company-1",
+        projectId: "proj-1",
+        issueId: "issue-100",
+        executionWorkspaceId: null,
+        runtimeServiceId: null,
+        type: "pull_request",
+        provider: "github",
+        externalId: "pr-42",
+        title: "PR #42: Feature Alpha Core",
+        url: "https://github.com/org/repo/pull/42",
+        status: "approved",
+        reviewState: "approved",
+        isPrimary: true,
+        healthStatus: "healthy",
+        summary: "Implemented core feature",
+        metadata: null,
+        sourceTrust: null,
+        createdByRunId: "run-1",
+        createdAt: new Date("2026-10-01"),
+        updatedAt: new Date("2026-10-01"),
+      },
+      {
+        id: "wp-2",
+        companyId: "company-1",
+        projectId: "proj-1",
+        issueId: "issue-100",
+        executionWorkspaceId: null,
+        runtimeServiceId: null,
+        type: "artifact",
+        provider: "paperclip",
+        externalId: null,
+        title: "E2E Walkthrough Video",
+        url: "https://storage.paperclip.internal/artifacts/walkthrough.webm",
+        status: "ready_for_review",
+        reviewState: "needs_board_review",
+        isPrimary: false,
+        healthStatus: "healthy",
+        summary: null,
+        metadata: null,
+        sourceTrust: null,
+        createdByRunId: "run-1",
+        createdAt: new Date("2026-10-01"),
+        updatedAt: new Date("2026-10-01"),
+      },
+    ]);
+
+    const testQueryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const root = createRoot(container);
+    act(() => {
+      root.render(
+        <QueryClientProvider client={testQueryClient}>
+          <AgentDetailSheet
+            agent={{
+              agentId: "agent-zeta",
+              name: "Zeta",
+              role: "Senior Engineer",
+              state: "working",
+              taskSummary: "Building PR #42",
+              currentIssueId: "issue-100",
+            }}
+            onOpenChange={vi.fn()}
+          />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(document.body.textContent).toContain("산출물 (Work Products)");
+    expect(document.body.textContent).toContain("2건");
+    expect(document.body.textContent).toContain("PR #42: Feature Alpha Core");
+    expect(document.body.textContent).toContain("승인됨");
+    expect(document.body.textContent).toContain("E2E Walkthrough Video");
+    expect(document.body.textContent).toContain("검토 대기");
+
+    const links = document.body.querySelectorAll('a[href*="pull/42"], a[href*="walkthrough.webm"]');
+    expect(links.length).toBe(2);
+
+    act(() => root.unmount());
+  });
+
+  it("AgentDetailSheet renders empty state gracefully when issue has no work products", async () => {
+    mockIssuesApi.listWorkProducts.mockResolvedValue([]);
+
+    const testQueryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const root = createRoot(container);
+    act(() => {
+      root.render(
+        <QueryClientProvider client={testQueryClient}>
+          <AgentDetailSheet
+            agent={{
+              agentId: "agent-zeta",
+              name: "Zeta",
+              role: "Senior Engineer",
+              state: "working",
+              taskSummary: "Starting new task",
+              currentIssueId: "issue-200",
+            }}
+            onOpenChange={vi.fn()}
+          />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(document.body.textContent).toContain("산출물 (Work Products)");
+    expect(document.body.textContent).toContain("등록된 산출물 없음");
+
+    act(() => root.unmount());
+  });
+
+  it("AgentDetailSheet indicates no work products when currentIssueId is null/absent", async () => {
+    const root = render(
+      <AgentDetailSheet
+        agent={{
+          agentId: "agent-zeta",
+          name: "Zeta",
+          role: "Senior Engineer",
+          state: "idle",
+          taskSummary: null,
+          currentIssueId: null,
+        }}
+        onOpenChange={vi.fn()}
+      />,
+    );
+    await flushReact();
+
+    expect(document.body.textContent).toContain("산출물 (Work Products)");
+    expect(document.body.textContent).toContain("등록된 산출물 없음 (진행 중인 이슈 없음)");
+
+    act(() => root.unmount());
+  });
+
+  it("AgentDetailSheet renders error state gracefully when work products query fails", async () => {
+    mockIssuesApi.listWorkProducts.mockRejectedValue(new Error("API network failure"));
+
+    const testQueryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const root = createRoot(container);
+    act(() => {
+      root.render(
+        <QueryClientProvider client={testQueryClient}>
+          <AgentDetailSheet
+            agent={{
+              agentId: "agent-zeta",
+              name: "Zeta",
+              role: "Senior Engineer",
+              state: "working",
+              taskSummary: "Building PR #42",
+              currentIssueId: "issue-err",
+            }}
+            onOpenChange={vi.fn()}
+          />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(document.body.textContent).toContain("산출물 (Work Products)");
+    expect(document.body.textContent).toContain("산출물 데이터 조회 실패");
+
+    act(() => root.unmount());
+  });
 });
+
+

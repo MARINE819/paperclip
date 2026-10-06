@@ -37,6 +37,7 @@ import { AIOfficeSecretsLab } from "@/components/AIOfficeSecretsLab";
 import { AIOfficeKnowledgeLab } from "@/components/AIOfficeKnowledgeLab";
 import { ControlCenterTabs, useControlCenterTab } from "@/components/ControlCenterTabs";
 import { deriveAgentCondition } from "@/components/AIOfficeControlTower";
+import { AIOfficeMobileSummary } from "@/components/AIOfficeMobileSummary";
 import {
   AgentDetailSheet,
   AmenityTile,
@@ -117,7 +118,7 @@ function StateNotice({ state, loadingText, emptyText, errorPrefix }: {
   return <span className="text-muted-foreground">{emptyText}</span>;
 }
 
-export type AIOfficeViewMode = "floor" | "neural";
+export type AIOfficeViewMode = "floor" | "summary" | "neural";
 
 export function useAIOfficeViewMode(
   defaultMode: AIOfficeViewMode = "floor",
@@ -125,7 +126,10 @@ export function useAIOfficeViewMode(
   const [mode, setModeState] = useState<AIOfficeViewMode>(() => {
     if (typeof window !== "undefined" && window.location) {
       const sp = new URLSearchParams(window.location.search);
-      return sp.get("view") === "neural" ? "neural" : defaultMode;
+      const view = sp.get("view");
+      if (view === "neural") return "neural";
+      if (view === "summary") return "summary";
+      return defaultMode;
     }
     return defaultMode;
   });
@@ -134,7 +138,14 @@ export function useAIOfficeViewMode(
     if (typeof window === "undefined") return;
     const handlePopState = () => {
       const sp = new URLSearchParams(window.location.search);
-      setModeState(sp.get("view") === "neural" ? "neural" : "floor");
+      const view = sp.get("view");
+      if (view === "neural") {
+        setModeState("neural");
+      } else if (view === "summary") {
+        setModeState("summary");
+      } else {
+        setModeState("floor");
+      }
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
@@ -146,6 +157,8 @@ export function useAIOfficeViewMode(
       const url = new URL(window.location.href);
       if (newMode === "neural") {
         url.searchParams.set("view", "neural");
+      } else if (newMode === "summary") {
+        url.searchParams.set("view", "summary");
       } else {
         url.searchParams.delete("view");
       }
@@ -310,6 +323,16 @@ export function AIOffice() {
     const liveRun = liveRunByAgentId.get(agent.id);
     const hasPendingApproval = pendingApprovalAgentIds.has(agent.id);
     const state = computeSeatState(agent, !!liveRun, hasPendingApproval, now);
+    const agentUsage = usageByAgent.get(agent.id);
+    const costModelRow = (costByAgentModelQuery.data ?? []).find((r) => r.agentId === agent.id);
+    const adapterConfig = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+    const configuredModel = typeof adapterConfig.model === "string" && adapterConfig.model.trim() ? adapterConfig.model : null;
+
+    const selectedExecutor = agent.adapterType ?? null;
+    const actualExecutor = liveRun?.adapterType ?? null;
+    const provider = costModelRow?.provider ?? null;
+    const model = configuredModel ?? costModelRow?.model ?? null;
+
     return {
       agentId: agent.id,
       name: agent.name,
@@ -318,6 +341,15 @@ export function AIOffice() {
       taskSummary: liveRun
         ? (liveRun.currentStatusMessage ?? liveRun.triggerDetail ?? liveRun.lastAssistantSnippet ?? null)
         : null,
+      selectedExecutor,
+      actualExecutor,
+      provider,
+      model,
+      currentToolName: liveRun?.currentToolName ?? null,
+      activeRunId: liveRun?.id ?? null,
+      aggregateCostCents: agentUsage?.costCents ?? (agent.spentMonthlyCents > 0 ? agent.spentMonthlyCents : null),
+      currentRunCostCents: null,
+      currentIssueId: liveRun?.issueId ?? null,
     };
   }
 
@@ -396,7 +428,7 @@ export function AIOffice() {
         </Card>
       </div>
 
-      {/* 뷰 모드 전환 셀렉터 (2D 오피스 | JARVIS 뉴럴 맵) */}
+      {/* 뷰 모드 전환 셀렉터 (2D 오피스 | 모바일 요약 | JARVIS 뉴럴 맵) */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-3">
         <div className="flex items-center gap-1 rounded-lg border border-border bg-muted/40 p-1 text-xs">
           <Button
@@ -409,6 +441,17 @@ export function AIOffice() {
             aria-pressed={viewMode === "floor"}
           >
             2D 오피스
+          </Button>
+          <Button
+            type="button"
+            variant={viewMode === "summary" ? "default" : "ghost"}
+            size="sm"
+            className="h-8 text-xs font-semibold"
+            onClick={() => setViewMode("summary")}
+            data-testid="view-mode-summary-btn"
+            aria-pressed={viewMode === "summary"}
+          >
+            모바일 요약
           </Button>
           <Button
             type="button"
@@ -425,7 +468,9 @@ export function AIOffice() {
         <span className="text-xs text-muted-foreground">
           {viewMode === "floor"
             ? "실제 좌석 및 부서 배치 평면도"
-            : "JARVIS 지휘 신경망 및 지능형 라우팅 관측"}
+            : viewMode === "summary"
+              ? "경영진 모바일 종합 관제 및 핵심 현황"
+              : "JARVIS 지휘 신경망 및 지능형 라우팅 관측"}
         </span>
       </div>
 
@@ -450,6 +495,16 @@ export function AIOffice() {
           isLoading={agentsQuery.isLoading || orgUnitsQuery.isLoading}
           error={agentsQuery.error || orgUnitsQuery.error}
           companyId={selectedCompanyId}
+        />
+      ) : viewMode === "summary" ? (
+        <AIOfficeMobileSummary
+          agents={agents}
+          liveRuns={liveRunsQuery.data ?? []}
+          pendingApprovals={pendingApprovalsQuery.data ?? []}
+          errorAgents={errorAgents.map((e) => e.agent)}
+          dashboardData={dashboardQuery.data ?? null}
+          costByAgentModel={costByAgentModelQuery.data ?? []}
+          onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
         />
       ) : (
         /* 중앙 2D 사무실 + 우측 운영 패널 */

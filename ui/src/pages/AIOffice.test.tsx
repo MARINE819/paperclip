@@ -927,4 +927,42 @@ describe("AIOffice", () => {
     act(() => root.unmount());
     window.history.replaceState({}, "", originalHref);
   });
+
+  it("switching to Mobile Summary renders AIOfficeMobileSummary and updates view switcher", async () => {
+    const originalHref = window.location.href;
+    window.history.replaceState({}, "", "/PAP/ai-office");
+
+    const root = await renderPage();
+
+    const summaryBtn = container.querySelector("[data-testid='view-mode-summary-btn']") as HTMLButtonElement;
+    expect(summaryBtn).not.toBeNull();
+    expect(summaryBtn.getAttribute("aria-pressed")).toBe("false");
+
+    act(() => {
+      summaryBtn.click();
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(summaryBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(container.querySelector("[data-testid='ai-office-mobile-summary']")).not.toBeNull();
+
+    act(() => root.unmount());
+    window.history.replaceState({}, "", originalHref);
+  });
+
+  it("renders Mobile Summary directly when ?view=summary is in URL", async () => {
+    const originalHref = window.location.href;
+    window.history.replaceState({}, "", "/PAP/ai-office?view=summary");
+
+    const root = await renderPage();
+
+    const summaryBtn = container.querySelector("[data-testid='view-mode-summary-btn']") as HTMLButtonElement;
+    expect(summaryBtn).not.toBeNull();
+    expect(summaryBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(container.querySelector("[data-testid='ai-office-mobile-summary']")).not.toBeNull();
+
+    act(() => root.unmount());
+    window.history.replaceState({}, "", originalHref);
+  });
 });

@@ -1130,4 +1130,71 @@ describe("AIOffice", () => {
 
     act(() => root.unmount());
   });
+
+  it("renders JARVIS text command interface and in-review metric on Desktop floor view", async () => {
+    const now = new Date();
+    const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+    const engineer = makeAgent({ id: "agent-eng", name: "Engineer1", status: "idle", orgUnitId: "org-dev", lastHeartbeatAt: now });
+    const devOrg = makeOrgUnitStatus({ orgUnitId: "org-dev", name: "개발팀" });
+    mockAgentsApi.list.mockResolvedValue([jarvis, engineer]);
+    mockAgentsApi.orgUnitsStatus.mockResolvedValue([devOrg]);
+
+    mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string }) => {
+      if (filter?.status === "in_review") {
+        return Promise.resolve([
+          { id: "issue-rev-1", identifier: "NEX-1", title: "In Review Task", status: "in_review" },
+          { id: "issue-rev-2", identifier: "NEX-2", title: "Second Review Task", status: "in_review" },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+
+    const root = await renderPage();
+
+    // 1. Desktop JARVIS text instruction is rendered
+    const jarvisInstruction = container.querySelector('[data-testid="mobile-jarvis-task-instruction-card"]');
+    expect(jarvisInstruction).not.toBeNull();
+    expect(jarvisInstruction?.textContent).toContain("자비스(JARVIS) 업무 지시");
+    const input = container.querySelector('[data-testid="mobile-jarvis-instruction-input"]');
+    expect(input).not.toBeNull();
+
+    // 2. Desktop In-Review metric in top briefing bar
+    const inReviewMetric = container.querySelector('[data-testid="desktop-in-review-metric"]');
+    expect(inReviewMetric).not.toBeNull();
+    expect(inReviewMetric?.textContent).toContain("검토 대기");
+    expect(inReviewMetric?.textContent).toContain("2");
+
+    act(() => root.unmount());
+  });
+
+  it("displays agent errorReason in AgentDetailSheet when opening an error/blocked agent", async () => {
+    const now = new Date();
+    const errorAgent = makeAgent({
+      id: "agent-err",
+      name: "BugHunter",
+      status: "error",
+      lastHeartbeatAt: now,
+      errorReason: "Process crashed with out-of-memory error (OOM)",
+    });
+    mockAgentsApi.list.mockResolvedValue([errorAgent]);
+    mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+    const root = await renderPage();
+
+    // Open detail for BugHunter from blocker list or workstation
+    const blockerItem = container.querySelector('[data-testid="desktop-blocker-item-agent-err"]') as HTMLButtonElement;
+    expect(blockerItem).not.toBeNull();
+
+    act(() => {
+      blockerItem.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const errorCard = document.body.querySelector('[data-testid="agent-detail-error-card"]');
+    expect(errorCard).not.toBeNull();
+    expect(errorCard?.textContent).toContain("오류 및 차단 사유");
+    expect(errorCard?.textContent).toContain("Process crashed with out-of-memory error (OOM)");
+
+    act(() => root.unmount());
+  });
 });

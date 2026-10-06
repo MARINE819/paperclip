@@ -847,5 +847,42 @@ describe("AIOfficeMobileSummary", () => {
 
     act(() => root.unmount());
   });
+
+  it("renders mobile completed work card with completed issues and direct links", async () => {
+    const agent = makeAgent({ id: "agent-1", name: "Alpha" });
+    const doneIssue = {
+      id: "issue-done-99",
+      identifier: "NEX-99",
+      title: "Completed Milestone Delivery",
+      assigneeAgentId: "agent-1",
+      companyId: "company-1",
+      status: "done",
+    } as any;
+
+    const root = render(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[agent]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        completedIssues={[doneIssue]}
+        errorAgents={[]}
+      />,
+    );
+
+    const completedCard = container.querySelector('[data-testid="mobile-completed-work-card"]');
+    expect(completedCard).not.toBeNull();
+    expect(completedCard?.textContent).toContain("최근 완료 업무 & 최종 보고서 (1건)");
+
+    const itemLink = completedCard?.querySelector('[data-testid="mobile-completed-issue-item-issue-done-99"]') as HTMLAnchorElement;
+    expect(itemLink).not.toBeNull();
+    expect(itemLink?.getAttribute("href")).toBe("/issues/issue-done-99");
+    expect(itemLink?.textContent).toContain("NEX-99");
+    expect(itemLink?.textContent).toContain("Completed Milestone Delivery");
+    expect(itemLink?.textContent).toContain("담당: Alpha");
+    expect(itemLink?.textContent).toContain("보고서/산출물 확인 →");
+
+    act(() => root.unmount());
+  });
 });
 

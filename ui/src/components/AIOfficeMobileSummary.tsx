@@ -247,6 +247,7 @@ export interface AIOfficeMobileSummaryProps {
   liveRuns: LiveRunForIssue[];
   pendingApprovals: Approval[];
   inReviewIssues?: Issue[];
+  completedIssues?: Issue[];
   errorAgents: Agent[];
   dashboardData?: DashboardSummary | null;
   costByAgentModel?: CostByAgentModel[];
@@ -259,6 +260,7 @@ export function AIOfficeMobileSummary({
   liveRuns,
   pendingApprovals,
   inReviewIssues = [],
+  completedIssues = [],
   errorAgents,
   dashboardData,
   costByAgentModel = [],
@@ -777,6 +779,59 @@ export function AIOfficeMobileSummary({
         distinctIssueIds={distinctIssueIds}
         agentNameByIssueId={agentNameByIssueId}
       />
+
+      {/* 5.5 최근 완료 업무 & JARVIS 최종 보고서 (Completed Issues & Final Reports) */}
+      <Card data-testid="mobile-completed-work-card">
+        <CardHeader className="p-4 pb-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <CheckCircle2 className="h-4 w-4 text-emerald-500" aria-hidden="true" />
+              <CardTitle className="text-sm font-semibold">
+                최근 완료 업무 & 최종 보고서 ({completedIssues.length}건)
+              </CardTitle>
+            </div>
+            <a
+              href="/issues?status=done"
+              className="text-xs font-normal text-primary hover:underline"
+            >
+              전체 →
+            </a>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-2 p-4 pt-2">
+          {completedIssues.length === 0 ? (
+            <div className="rounded border border-dashed p-4 text-center text-xs text-muted-foreground">
+              최근 완료된 업무가 없습니다
+            </div>
+          ) : (
+            completedIssues.slice(0, 5).map((issue) => {
+              const assigneeName = issue.assigneeAgentId
+                ? agentById.get(issue.assigneeAgentId)?.name ?? "AI 에이전트"
+                : "미배정";
+
+              return (
+                <a
+                  key={issue.id}
+                  href={`/issues/${issue.id}`}
+                  data-testid={`mobile-completed-issue-item-${issue.id}`}
+                  className="flex flex-col gap-1 rounded-lg border border-border/70 bg-card p-2.5 text-xs shadow-xs hover:bg-muted/40 transition-colors"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-foreground truncate">
+                      {issue.identifier ? `${issue.identifier} · ` : ""}{issue.title}
+                    </span>
+                    <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                  </div>
+                  <div className="flex items-center justify-between text-muted-foreground">
+                    <span>담당: {assigneeName}</span>
+                    <span className="text-primary hover:underline">보고서/산출물 확인 →</span>
+                  </div>
+                </a>
+              );
+            })
+          )}
+        </CardContent>
+      </Card>
 
       {/* 6. 회사 헬스체크 및 빠른 이동 네비게이션 */}
       <Card>

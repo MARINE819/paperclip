@@ -291,6 +291,10 @@ export interface AgentDetailInfo {
   currentIssueIdentifier?: string | null;
   /** Associated issue title */
   currentIssueTitle?: string | null;
+  /** Agent error reason if in error condition */
+  errorReason?: string | null;
+  /** Agent pause reason if paused */
+  pauseReason?: string | null;
 }
 
 function AgentEvalBadge({ status }: { status: EvalRunStatus }) {
@@ -645,6 +649,21 @@ export function AgentDetailSheet({
                 <div className="flex items-center gap-2">
                   <span className="text-muted-foreground">현재 업무</span>
                   <span className="truncate">{agent.taskSummary}</span>
+                </div>
+              ) : null}
+
+              {agent.state === "blocked-error" || agent.errorReason || agent.pauseReason ? (
+                <div
+                  className="flex flex-col gap-1 rounded-lg border border-destructive/30 bg-destructive/5 p-2.5 text-xs text-destructive"
+                  data-testid="agent-detail-error-card"
+                >
+                  <div className="flex items-center gap-1.5 font-semibold">
+                    <TriangleAlert className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span>오류 및 차단 사유</span>
+                  </div>
+                  <div className="text-foreground/90 pl-5 leading-relaxed">
+                    {agent.errorReason || agent.pauseReason || "실행 중단 또는 오류 상태입니다. 로그 점검이 필요합니다."}
+                  </div>
                 </div>
               ) : null}
 

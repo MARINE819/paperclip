@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Bot, Building2, Coffee, DoorOpen, ShieldAlert, Sofa, Sprout, Users } from "lucide-react";
 import { JarvisNeuralCommandInterface } from "@/components/neural/JarvisNeuralCommandInterface";
@@ -39,6 +39,7 @@ import { AIOfficeKnowledgeLab } from "@/components/AIOfficeKnowledgeLab";
 import { ControlCenterTabs, useControlCenterTab } from "@/components/ControlCenterTabs";
 import { deriveAgentCondition } from "@/components/AIOfficeControlTower";
 import { AIOfficeMobileSummary } from "@/components/AIOfficeMobileSummary";
+import { AIOfficeJarvisTaskInstruction } from "@/components/AIOfficeJarvisTaskInstruction";
 import {
   AgentDetailSheet,
   AmenityTile,
@@ -323,6 +324,7 @@ export function AIOffice() {
   );
   const orgUnitIdByName = new Map((orgUnitsQuery.data ?? []).map((unit) => [unit.name, unit.orgUnitId]));
   const agentNameById = new Map(agents.map((agent) => [agent.id, agent.name]));
+  const agentById = useMemo(() => new Map(agents.map((agent) => [agent.id, agent])), [agents]);
   const now = Date.now();
 
   // Exact-name lookups only — never a fuzzy/partial match on leadership seats.
@@ -403,6 +405,8 @@ export function AIOffice() {
       currentIssueId,
       currentIssueIdentifier,
       currentIssueTitle,
+      errorReason: agent.errorReason ?? null,
+      pauseReason: agent.pauseReason ?? null,
     };
   }
 
@@ -454,7 +458,7 @@ export function AIOffice() {
       </div>
 
       {/* 상단 요약 바 — 회사 전체 현황 요약 */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <Card>
           <CardContent className="flex flex-col gap-1 p-3 text-sm">
             <span className="text-xs text-muted-foreground">전체 인원</span>
@@ -465,6 +469,12 @@ export function AIOffice() {
           <CardContent className="flex flex-col gap-1 p-3 text-sm">
             <span className="text-xs text-muted-foreground">업무 중</span>
             <StatValue state={liveRunsState} value={liveRunByAgentId.size} />
+          </CardContent>
+        </Card>
+        <Card data-testid="desktop-in-review-metric">
+          <CardContent className="flex flex-col gap-1 p-3 text-sm">
+            <span className="text-xs text-muted-foreground">검토 대기</span>
+            <StatValue state={inReviewIssuesState} value={(inReviewIssuesQuery.data ?? []).length} />
           </CardContent>
         </Card>
         <Card>
@@ -568,11 +578,19 @@ export function AIOffice() {
           costByAgentModel={costByAgentModelQuery.data ?? []}
           onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
           inReviewIssues={inReviewIssuesQuery.data ?? []}
+          completedIssues={completedIssuesQuery.data ?? []}
         />
       ) : (
         /* 중앙 2D 사무실 + 우측 운영 패널 */
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
         <div className="space-y-4 lg:col-span-3">
+          {/* Desktop JARVIS Text Instruction */}
+          <AIOfficeJarvisTaskInstruction
+            companyId={selectedCompanyId}
+            jarvisAgent={jarvis ?? null}
+            agentById={agentById}
+          />
+
           {officeSectionState === "loading" ? (
             <div className="rounded-lg border p-6 text-sm text-muted-foreground">조직 데이터 로딩 중...</div>
           ) : officeSectionState === "error" ? (

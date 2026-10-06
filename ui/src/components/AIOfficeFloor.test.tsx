@@ -746,6 +746,50 @@ describe("AIOfficeFloor", () => {
 
     act(() => root.unmount());
   });
+
+  // ── Status Consistency & 6-Tier Priority Hierarchy ──
+
+  it("computeSeatState correctly computes 'in-review' and enforces the 6-tier hierarchy", () => {
+    const now = Date.now();
+    const healthyAgent = { status: "idle" as const, lastHeartbeatAt: new Date(now) };
+    const offlineAgent = { status: "idle" as const, lastHeartbeatAt: null };
+    const errorAgent = { status: "error" as const, lastHeartbeatAt: null };
+
+    // 1. in-review returns "in-review" when agent has an issue in review
+    expect(computeSeatState(healthyAgent, false, false, now, true)).toBe("in-review");
+    expect(computeSeatState(offlineAgent, false, false, now, true)).toBe("in-review");
+
+    // 2. Priority: blocked-error > approval-waiting > working > in-review > offline > idle
+    // blocked-error beats all
+    expect(computeSeatState(errorAgent, true, true, now, true)).toBe("blocked-error");
+    // approval-waiting beats working and in-review
+    expect(computeSeatState(healthyAgent, true, true, now, true)).toBe("approval-waiting");
+    // working beats in-review
+    expect(computeSeatState(healthyAgent, true, false, now, true)).toBe("working");
+    // in-review beats offline
+    expect(computeSeatState(offlineAgent, false, false, now, true)).toBe("in-review");
+    // offline when no in-review
+    expect(computeSeatState(offlineAgent, false, false, now, false)).toBe("offline");
+    // idle when healthy with no active states
+    expect(computeSeatState(healthyAgent, false, false, now, false)).toBe("idle");
+  });
+
+  it("SeatBadge renders '검토 대기' with --status-task-in_review for in-review state", () => {
+    const root = render(<SeatBadge state="in-review" />);
+    expect(container.textContent).toBe("검토 대기");
+    const chip = container.querySelector(".status-chip") as HTMLElement;
+    expect(chip.style.getPropertyValue("--sc")).toBe("var(--status-task-in_review)");
+    act(() => root.unmount());
+  });
+
+  it("MiniAgentFigure renders with --status-task-in_review background in in-review state", () => {
+    const root = render(<MiniAgentFigure state="in-review" />);
+    const figure = container.querySelector('[data-seat-state="in-review"]');
+    expect(figure).not.toBeNull();
+    const head = figure?.querySelector(".rounded-full") as HTMLElement;
+    expect(head.style.backgroundColor).toBe("var(--status-task-in_review)");
+    act(() => root.unmount());
+  });
 });
 
 

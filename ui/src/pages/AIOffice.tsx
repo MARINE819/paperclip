@@ -9,6 +9,7 @@ import { costsApi } from "@/api/costs";
 import { aiOfficeApi } from "@/api/aiOffice";
 import { companiesApi } from "@/api/companies";
 import { dashboardApi } from "@/api/dashboard";
+import { issuesApi } from "@/api/issues";
 import { knowledgeApi } from "@/api/knowledge";
 import { describeApiError } from "@/api/client";
 import { useCompany } from "@/context/CompanyContext";
@@ -203,6 +204,20 @@ export function AIOffice() {
     refetchInterval: 15_000,
   });
 
+  const revisionRequestedApprovalsQuery = useQuery({
+    queryKey: ["ai-office-2d-approvals-revision-requested", selectedCompanyId],
+    queryFn: () => approvalsApi.list(selectedCompanyId!, "revision_requested"),
+    enabled: !!selectedCompanyId,
+    refetchInterval: 15_000,
+  });
+
+  const inReviewIssuesQuery = useQuery({
+    queryKey: ["ai-office-2d-issues-in-review", selectedCompanyId],
+    queryFn: () => issuesApi.list(selectedCompanyId!, { status: "in_review" }),
+    enabled: !!selectedCompanyId,
+    refetchInterval: 15_000,
+  });
+
   const orgUnitsQuery = useQuery({
     queryKey: ["ai-office-2d-org-units", selectedCompanyId],
     queryFn: () => agentsApi.orgUnitsStatus(selectedCompanyId!),
@@ -259,7 +274,20 @@ export function AIOffice() {
   const agentsState = describeQueryState(agentsQuery);
   const orgUnitsState = describeQueryState(orgUnitsQuery);
   const liveRunsState = describeQueryState(liveRunsQuery);
-  const pendingApprovalsState = describeQueryState(pendingApprovalsQuery);
+
+  const agents = agentsQuery.data ?? [];
+  const liveRunByAgentId = new Map((liveRunsQuery.data ?? []).map((run) => [run.agentId, run]));
+  const allPendingApprovals = [
+    ...(pendingApprovalsQuery.data ?? []),
+    ...(revisionRequestedApprovalsQuery.data ?? []),
+  ];
+  const pendingApprovalsCombined = {
+    isLoading: pendingApprovalsQuery.isLoading || revisionRequestedApprovalsQuery.isLoading,
+    isError: pendingApprovalsQuery.isError || revisionRequestedApprovalsQuery.isError,
+    error: pendingApprovalsQuery.error ?? revisionRequestedApprovalsQuery.error,
+    data: allPendingApprovals,
+  };
+  const pendingApprovalsState = describeQueryState(pendingApprovalsCombined);
 
   // The office floor (leadership + department rooms + 기타/미배정) needs both
   // agents and org units to be genuinely resolved before it can tell "no
@@ -274,12 +302,15 @@ export function AIOffice() {
           ? "empty"
           : "ready";
 
-  const agents = agentsQuery.data ?? [];
-  const liveRunByAgentId = new Map((liveRunsQuery.data ?? []).map((run) => [run.agentId, run]));
   const pendingApprovalAgentIds = new Set(
-    (pendingApprovalsQuery.data ?? [])
+    allPendingApprovals
       .filter((approval) => !!approval.requestedByAgentId)
       .map((approval) => approval.requestedByAgentId as string),
+  );
+  const inReviewAgentIds = new Set(
+    (inReviewIssuesQuery.data ?? [])
+      .filter((issue) => !!issue.assigneeAgentId)
+      .map((issue) => issue.assigneeAgentId as string),
   );
   const orgUnitIdByName = new Map((orgUnitsQuery.data ?? []).map((unit) => [unit.name, unit.orgUnitId]));
   const agentNameById = new Map(agents.map((agent) => [agent.id, agent.name]));
@@ -322,7 +353,8 @@ export function AIOffice() {
   function agentDetailFor(agent: (typeof agents)[number]): AgentDetailInfo {
     const liveRun = liveRunByAgentId.get(agent.id);
     const hasPendingApproval = pendingApprovalAgentIds.has(agent.id);
-    const state = computeSeatState(agent, !!liveRun, hasPendingApproval, now);
+    const hasInReview = inReviewAgentIds.has(agent.id);
+    const state = computeSeatState(agent, !!liveRun, hasPendingApproval, now, hasInReview);
     const agentUsage = usageByAgent.get(agent.id);
     const costModelRow = (costByAgentModelQuery.data ?? []).find((r) => r.agentId === agent.id);
     const adapterConfig = (agent.adapterConfig ?? {}) as Record<string, unknown>;
@@ -374,7 +406,13 @@ export function AIOffice() {
               name={agent.name}
               role={agent.title ?? agent.role}
               liveRun={liveRunByAgentId.get(agent.id)}
-              state={computeSeatState(agent, liveRunByAgentId.has(agent.id), pendingApprovalAgentIds.has(agent.id), now)}
+              state={computeSeatState(
+                agent,
+                liveRunByAgentId.has(agent.id),
+                pendingApprovalAgentIds.has(agent.id),
+                now,
+                inReviewAgentIds.has(agent.id),
+              )}
               onClick={() => setSelectedAgentId(agent.id)}
             />
           ))
@@ -479,15 +517,18 @@ export function AIOffice() {
           agents={agents}
           orgUnits={orgUnitsQuery.data ?? []}
           liveRuns={liveRunsQuery.data ?? []}
-          pendingApprovals={pendingApprovalsQuery.data ?? []}
+          pendingApprovals={allPendingApprovals}
           completedCount={dashboardQuery.isLoading ? null : (dashboardQuery.data?.tasks.done ?? null)}
           blockedCount={dashboardQuery.isLoading ? null : (dashboardQuery.data?.tasks.blocked ?? null)}
           pendingApprovalCount={
-            pendingApprovalsQuery.isLoading
+            pendingApprovalsQuery.isLoading || revisionRequestedApprovalsQuery.isLoading
               ? null
-              : (pendingApprovalsQuery.data?.filter(
-                  (a) => (a as { effectiveStatus?: string }).effectiveStatus === "pending",
-                ).length ?? null)
+              : allPendingApprovals.filter(
+                  (a) =>
+                    (a as { effectiveStatus?: string }).effectiveStatus === "pending" ||
+                    a.status === "pending" ||
+                    a.status === "revision_requested",
+                ).length
           }
           knowledgeRecords={knowledgeQuery.data ?? []}
           voiceState={voiceState}
@@ -500,7 +541,7 @@ export function AIOffice() {
         <AIOfficeMobileSummary
           agents={agents}
           liveRuns={liveRunsQuery.data ?? []}
-          pendingApprovals={pendingApprovalsQuery.data ?? []}
+          pendingApprovals={allPendingApprovals}
           errorAgents={errorAgents.map((e) => e.agent)}
           dashboardData={dashboardQuery.data ?? null}
           costByAgentModel={costByAgentModelQuery.data ?? []}
@@ -545,6 +586,7 @@ export function AIOffice() {
                     liveRunByAgentId.has(jarvis.id),
                     pendingApprovalAgentIds.has(jarvis.id),
                     now,
+                    inReviewAgentIds.has(jarvis.id),
                   )}
                   onClick={() => setSelectedAgentId(jarvis.id)}
                 />
@@ -564,6 +606,7 @@ export function AIOffice() {
                     liveRunByAgentId.has(atlas.id),
                     pendingApprovalAgentIds.has(atlas.id),
                     now,
+                    inReviewAgentIds.has(atlas.id),
                   )}
                   onClick={() => setSelectedAgentId(atlas.id)}
                 />
@@ -614,6 +657,7 @@ export function AIOffice() {
                               liveRunByAgentId.has(agent.id),
                               pendingApprovalAgentIds.has(agent.id),
                               now,
+                              inReviewAgentIds.has(agent.id),
                             )}
                             onClick={() => setSelectedAgentId(agent.id)}
                           />
@@ -644,9 +688,12 @@ export function AIOffice() {
                   errorPrefix="승인 데이터 조회 실패"
                 />
               ) : (
-                (pendingApprovalsQuery.data ?? []).map((approval) => (
+                allPendingApprovals.map((approval) => (
                   <div key={approval.id} className="flex flex-col gap-0.5 border-t pt-2 first:border-t-0 first:pt-0">
-                    <span className="font-medium">{approval.type}</span>
+                    <span className="font-medium">
+                      {approval.type}
+                      {approval.status === "revision_requested" ? " (수정 요청)" : ""}
+                    </span>
                     <span className="text-muted-foreground">
                       {approval.requestedByAgentId
                         ? agents.find((a) => a.id === approval.requestedByAgentId)?.name ?? approval.requestedByAgentId

@@ -22,6 +22,11 @@ const mockApprovalsApi = vi.hoisted(() => ({
   list: vi.fn(),
 }));
 
+const mockIssuesApi = vi.hoisted(() => ({
+  list: vi.fn(),
+  listWorkProducts: vi.fn(),
+}));
+
 const mockCostsApi = vi.hoisted(() => ({
   byAgentModel: vi.fn(),
   byProvider: vi.fn(),
@@ -93,6 +98,10 @@ vi.mock("../api/heartbeats", () => ({
 
 vi.mock("../api/approvals", () => ({
   approvalsApi: mockApprovalsApi,
+}));
+
+vi.mock("../api/issues", () => ({
+  issuesApi: mockIssuesApi,
 }));
 
 vi.mock("../api/costs", () => ({
@@ -267,6 +276,7 @@ describe("AIOffice", () => {
   let queryClient: QueryClient;
 
   beforeEach(() => {
+    window.history.replaceState({}, "", "/PAP/ai-office");
     container = document.createElement("div");
     document.body.appendChild(container);
     queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -275,6 +285,8 @@ describe("AIOffice", () => {
     mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
     mockHeartbeatsApi.neuralRoutes.mockResolvedValue([]);
     mockApprovalsApi.list.mockResolvedValue([]);
+    mockIssuesApi.list.mockResolvedValue([]);
+    mockIssuesApi.listWorkProducts.mockResolvedValue([]);
     mockCostsApi.byAgentModel.mockResolvedValue([]);
     mockCostsApi.byProvider.mockResolvedValue([]);
     mockCostsApi.quotaWindows.mockResolvedValue([]);
@@ -961,6 +973,97 @@ describe("AIOffice", () => {
     expect(summaryBtn).not.toBeNull();
     expect(summaryBtn.getAttribute("aria-pressed")).toBe("true");
     expect(container.querySelector("[data-testid='ai-office-mobile-summary']")).not.toBeNull();
+
+    act(() => root.unmount());
+    window.history.replaceState({}, "", originalHref);
+  });
+
+  it("merges revision_requested approvals and displays approval-waiting state on agent workstation and right panel", async () => {
+    const now = new Date();
+    const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+    const engineer = makeAgent({ id: "agent-eng", name: "Engineer1", status: "idle", orgUnitId: "org-dev", lastHeartbeatAt: now });
+    const devOrg = makeOrgUnitStatus({ orgUnitId: "org-dev", name: "개발팀" });
+    mockAgentsApi.list.mockResolvedValue([jarvis, engineer]);
+    mockAgentsApi.orgUnitsStatus.mockResolvedValue([devOrg]);
+
+    mockApprovalsApi.list.mockImplementation((_companyId: string, status?: string) => {
+      if (status === "revision_requested") {
+        return Promise.resolve([
+          makeApproval({
+            id: "app-rev-1",
+            type: "request_board_approval",
+            status: "revision_requested",
+            requestedByAgentId: "agent-eng",
+          }),
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+
+    const root = await renderPage();
+
+    expect(container.textContent).toContain("승인 대기");
+    expect(container.textContent).toContain("(수정 요청)");
+
+    act(() => root.unmount());
+  });
+
+  it("displays in-review (검토 대기) state on agent workstation when assigned to an in_review issue", async () => {
+    const now = new Date();
+    const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+    const engineer = makeAgent({ id: "agent-eng", name: "Engineer1", status: "idle", orgUnitId: "org-dev", lastHeartbeatAt: now });
+    const devOrg = makeOrgUnitStatus({ orgUnitId: "org-dev", name: "개발팀" });
+    mockAgentsApi.list.mockResolvedValue([jarvis, engineer]);
+    mockAgentsApi.orgUnitsStatus.mockResolvedValue([devOrg]);
+
+    mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string }) => {
+      if (filter?.status === "in_review") {
+        return Promise.resolve([
+          {
+            id: "issue-rev-1",
+            title: "Task in Review",
+            status: "in_review",
+            assigneeAgentId: "agent-eng",
+          },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+
+    const root = await renderPage();
+
+    expect(container.textContent).toContain("검토 대기");
+
+    act(() => root.unmount());
+  });
+
+  it("mobile summary includes revision_requested approvals in count and list", async () => {
+    const originalHref = window.location.href;
+    window.history.replaceState({}, "", "/PAP/ai-office?view=summary");
+
+    const now = new Date();
+    const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+    mockAgentsApi.list.mockResolvedValue([jarvis]);
+    mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+    mockApprovalsApi.list.mockImplementation((_companyId: string, status?: string) => {
+      if (status === "revision_requested") {
+        return Promise.resolve([
+          makeApproval({
+            id: "app-rev-2",
+            type: "request_board_approval",
+            status: "revision_requested",
+            requestedByAgentId: "agent-jarvis",
+          }),
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+
+    const root = await renderPage();
+
+    expect(container.textContent).toContain("CEO 승인 대기 안건 (1건)");
+    expect(container.textContent).toContain("수정 요청");
 
     act(() => root.unmount());
     window.history.replaceState({}, "", originalHref);

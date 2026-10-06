@@ -34,10 +34,11 @@ import { cn, formatCents } from "@/lib/utils";
  * network call or invents a status that isn't backed by real data.
  */
 
-export type SeatState = "working" | "idle" | "approval-waiting" | "blocked-error" | "offline" | "unlinked";
+export type SeatState = "working" | "in-review" | "idle" | "approval-waiting" | "blocked-error" | "offline" | "unlinked";
 
 const SEAT_STATE_LABEL: Record<SeatState, string> = {
   working: "업무 중",
+  "in-review": "검토 대기",
   idle: "대기",
   "approval-waiting": "승인 대기",
   "blocked-error": "오류/차단",
@@ -50,6 +51,7 @@ const SEAT_STATE_LABEL: Record<SeatState, string> = {
 // the rest of Paperclip instead of inventing a new palette.
 const SEAT_STATE_VAR: Record<SeatState, string> = {
   working: "--status-agent-running",
+  "in-review": "--status-task-in_review",
   idle: "--status-agent-idle",
   "approval-waiting": "--status-agent-paused",
   "blocked-error": "--status-agent-error",
@@ -62,11 +64,13 @@ export function computeSeatState(
   hasLiveRun: boolean,
   hasPendingApproval: boolean,
   now: number,
+  hasInReview?: boolean,
 ): SeatState {
   const condition = deriveAgentCondition(agent, hasLiveRun, now);
   if (condition === "error") return "blocked-error";
   if (hasPendingApproval) return "approval-waiting";
   if (hasLiveRun) return "working";
+  if (hasInReview) return "in-review";
   if (condition === "offline") return "offline";
   return "idle";
 }
@@ -103,7 +107,11 @@ export function MiniAgentFigure({ state }: { state: SeatState }) {
         aria-hidden="true"
         className={cn("relative h-6 w-6 rounded-full border border-border", isBlocked && "hb-blink")}
         style={{
-          backgroundColor: isBlocked ? "var(--status-agent-error)" : "var(--status-agent-idle)",
+          backgroundColor: isBlocked
+            ? "var(--status-agent-error)"
+            : state === "in-review"
+              ? "var(--status-task-in_review)"
+              : "var(--status-agent-idle)",
         }}
       >
         {state === "approval-waiting" ? (

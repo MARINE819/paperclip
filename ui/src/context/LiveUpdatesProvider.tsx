@@ -923,6 +923,9 @@ function invalidateHeartbeatQueries(
   queryClient.invalidateQueries({ queryKey: queryKeys.dashboard(companyId) });
   queryClient.invalidateQueries({ queryKey: queryKeys.costs(companyId) });
   queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges(companyId) });
+  queryClient.invalidateQueries({ queryKey: ["ai-office-2d-live-runs", companyId] });
+  queryClient.invalidateQueries({ queryKey: ["ai-office-2d-agents", companyId] });
+  queryClient.invalidateQueries({ queryKey: ["ai-office-dashboard-summary", companyId] });
 
   const agentId = readString(payload.agentId);
   if (agentId) {
@@ -979,6 +982,11 @@ function invalidateActivityQueries(
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.listMineByMe(companyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.listTouchedByMe(companyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.listUnreadTouchedByMe(companyId) });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-issues-in-review", companyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-issues-completed", companyId] });
+    queryClient.invalidateQueries({ queryKey: ["mobile-work-products"] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-jarvis-report-comments"] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-dashboard-summary", companyId] });
     if (entityId) {
       const selfCommentActivity =
         ((action === "issue.comment_added") ||
@@ -1046,6 +1054,9 @@ function invalidateActivityQueries(
   if (entityType === "agent") {
     queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(companyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.org(companyId) });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-agents", companyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-org-units", companyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-dashboard-summary", companyId] });
     if (entityId) {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(entityId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(companyId, entityId) });
@@ -1067,6 +1078,9 @@ function invalidateActivityQueries(
 
   if (entityType === "approval") {
     queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(companyId) });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-approvals-pending", companyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-approvals-revision-requested", companyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-dashboard-summary", companyId] });
     return;
   }
 
@@ -1079,6 +1093,10 @@ function invalidateActivityQueries(
     queryClient.invalidateQueries({ queryKey: queryKeys.costs(companyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.usageByProvider(companyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.usageWindowSpend(companyId) });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-cost-by-agent", companyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-cost-by-provider", companyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-quota", companyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-dashboard-summary", companyId] });
     // usageQuotaWindows is intentionally excluded: quota windows come from external provider
     // apis on a 5-minute poll and do not change in response to cost events logged by agents
     return;
@@ -1132,6 +1150,14 @@ function invalidateActivityQueries(
       });
     }
     return;
+  }
+
+  if (entityType === "work_product" || (action && action.includes("work_product"))) {
+    queryClient.invalidateQueries({ queryKey: ["mobile-work-products"] });
+  }
+
+  if (entityType === "knowledge" || entityType === "knowledge_record") {
+    queryClient.invalidateQueries({ queryKey: ["ai-office-knowledge-records", companyId] });
   }
 
   if (entityType === "company") {
@@ -1232,6 +1258,9 @@ function handleLiveEvent(
     queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(expectedCompanyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.dashboard(expectedCompanyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.org(expectedCompanyId) });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-agents", expectedCompanyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-2d-org-units", expectedCompanyId] });
+    queryClient.invalidateQueries({ queryKey: ["ai-office-dashboard-summary", expectedCompanyId] });
     const agentId = readString(payload.agentId);
     if (agentId) queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agentId) });
     const toast = buildAgentStatusToast(payload, nameOf, queryClient, expectedCompanyId);

@@ -1347,3 +1347,179 @@ describe("dispatchLiveEventToSubscribers", () => {
     expect(received).toEqual(["still-called"]);
   });
 });
+
+describe("LiveUpdatesProvider AI Office query invalidations", () => {
+  it("invalidates AI Office live-runs, agents, and dashboard summary on heartbeat events", () => {
+    const invalidations: unknown[] = [];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: () => undefined,
+    };
+
+    __liveUpdatesTestUtils.invalidateHeartbeatQueries(
+      queryClient as never,
+      "company-1",
+      { runId: "run-1", agentId: "agent-1" },
+    );
+
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-live-runs", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-agents", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-dashboard-summary", "company-1"],
+    });
+  });
+
+  it("invalidates AI Office issue review, completed, work products, and report comments on issue activity", () => {
+    const invalidations: unknown[] = [];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: () => undefined,
+    };
+
+    __liveUpdatesTestUtils.invalidateActivityQueries(
+      queryClient as never,
+      "company-1",
+      { entityType: "issue", entityId: "issue-1", action: "issue.updated", details: null },
+      { userId: null, agentId: null },
+    );
+
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-issues-in-review", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-issues-completed", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["mobile-work-products"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-jarvis-report-comments"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-dashboard-summary", "company-1"],
+    });
+  });
+
+  it("invalidates AI Office agent and org-units queries on agent activity", () => {
+    const invalidations: unknown[] = [];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: () => undefined,
+    };
+
+    __liveUpdatesTestUtils.invalidateActivityQueries(
+      queryClient as never,
+      "company-1",
+      { entityType: "agent", entityId: "agent-1", action: "agent.updated", details: null },
+      { userId: null, agentId: null },
+    );
+
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-agents", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-org-units", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-dashboard-summary", "company-1"],
+    });
+  });
+
+  it("invalidates AI Office approvals queries on approval activity", () => {
+    const invalidations: unknown[] = [];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: () => undefined,
+    };
+
+    __liveUpdatesTestUtils.invalidateActivityQueries(
+      queryClient as never,
+      "company-1",
+      { entityType: "approval", entityId: "appr-1", action: "approval.created", details: null },
+      { userId: null, agentId: null },
+    );
+
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-approvals-pending", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-approvals-revision-requested", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-dashboard-summary", "company-1"],
+    });
+  });
+
+  it("invalidates AI Office costs and quota queries on cost_event activity", () => {
+    const invalidations: unknown[] = [];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: () => undefined,
+    };
+
+    __liveUpdatesTestUtils.invalidateActivityQueries(
+      queryClient as never,
+      "company-1",
+      { entityType: "cost_event", entityId: "cost-1", action: "cost.logged", details: null },
+      { userId: null, agentId: null },
+    );
+
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-cost-by-agent", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-cost-by-provider", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-2d-quota", "company-1"],
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-dashboard-summary", "company-1"],
+    });
+  });
+
+  it("invalidates work products and knowledge queries on dedicated events", () => {
+    const invalidations: unknown[] = [];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: () => undefined,
+    };
+
+    __liveUpdatesTestUtils.invalidateActivityQueries(
+      queryClient as never,
+      "company-1",
+      { entityType: "work_product", entityId: "wp-1", action: "work_product.created", details: null },
+      { userId: null, agentId: null },
+    );
+    expect(invalidations).toContainEqual({
+      queryKey: ["mobile-work-products"],
+    });
+
+    invalidations.length = 0;
+    __liveUpdatesTestUtils.invalidateActivityQueries(
+      queryClient as never,
+      "company-1",
+      { entityType: "knowledge", entityId: "kn-1", action: "knowledge.saved", details: null },
+      { userId: null, agentId: null },
+    );
+    expect(invalidations).toContainEqual({
+      queryKey: ["ai-office-knowledge-records", "company-1"],
+    });
+  });
+});

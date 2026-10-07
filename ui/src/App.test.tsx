@@ -262,3 +262,10 @@ describe("Decisions routes", () => {
     expect(appSource).not.toContain('path="training/:id"');
   });
 });
+
+describe("AI Office routes", () => {
+  it("registers unprefixed ai-office routes to UnprefixedBoardRedirect", () => {
+    expect(appSource).toContain('<Route path="ai-office" element={<UnprefixedBoardRedirect />} />');
+    expect(appSource).toContain('<Route path="ai-office/*" element={<UnprefixedBoardRedirect />} />');
+  });
+});

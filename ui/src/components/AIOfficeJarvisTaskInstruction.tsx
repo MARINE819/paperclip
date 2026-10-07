@@ -5,9 +5,15 @@ import { jarvisApi, type SubmitToJarvisResult } from "@/api/jarvis";
 import { ApiError } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { AlertTriangle, Bot, CheckCircle2, ExternalLink, Loader2, Send } from "lucide-react";
+import { AlertTriangle, Bot, CheckCircle2, ExternalLink, Loader2, Send, Square, Volume2 } from "lucide-react";
 import { AIOfficeVoiceMicButton } from "@/components/AIOfficeVoiceMicButton";
-import { defaultVoiceSttAdapter, type VoiceSttAdapter } from "@/lib/voice-adapter";
+import { AIOfficeVoiceSpeakerButton } from "@/components/AIOfficeVoiceSpeakerButton";
+import {
+  defaultVoiceSttAdapter,
+  defaultVoiceTtsAdapter,
+  type VoiceSttAdapter,
+  type VoiceTtsAdapter,
+} from "@/lib/voice-adapter";
 
 export interface AIOfficeJarvisTaskInstructionProps {
   companyId: string | null;
@@ -15,6 +21,7 @@ export interface AIOfficeJarvisTaskInstructionProps {
   agentById?: Map<string, Agent>;
   onSuccess?: (result: SubmitToJarvisResult) => void;
   voiceAdapter?: VoiceSttAdapter;
+  ttsAdapter?: VoiceTtsAdapter;
 }
 
 export function AIOfficeJarvisTaskInstruction({
@@ -23,17 +30,55 @@ export function AIOfficeJarvisTaskInstruction({
   agentById,
   onSuccess,
   voiceAdapter,
+  ttsAdapter,
 }: AIOfficeJarvisTaskInstructionProps) {
   const queryClient = useQueryClient();
   const [requestText, setRequestText] = useState("");
   const [lastResult, setLastResult] = useState<SubmitToJarvisResult | null>(null);
 
   const adapter = voiceAdapter ?? defaultVoiceSttAdapter;
+  const tts = ttsAdapter ?? defaultVoiceTtsAdapter;
+
   const [isListening, setIsListening] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const stopListeningRef = useRef<(() => void) | null>(null);
 
+  const [ttsEnabled, setTtsEnabled] = useState(true);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [lastSpokenText, setLastSpokenText] = useState<string | null>(null);
+
+  const handleStopTts = useCallback(() => {
+    tts.stop();
+    setIsSpeaking(false);
+  }, [tts]);
+
+  const speakResponse = useCallback(
+    (text: string) => {
+      setLastSpokenText(text);
+      if (!ttsEnabled || !tts.isSupported()) return;
+
+      // Collision prevention: stop any active STT listening when TTS starts speaking
+      if (isListening) {
+        stopListeningRef.current?.();
+        stopListeningRef.current = null;
+        setIsListening(false);
+      }
+
+      setIsSpeaking(true);
+      tts.speak(text, {
+        onStart: () => setIsSpeaking(true),
+        onEnd: () => setIsSpeaking(false),
+        onError: () => setIsSpeaking(false),
+      });
+    },
+    [isListening, tts, ttsEnabled],
+  );
+
   const handleToggleVoice = useCallback(() => {
+    // Collision prevention: stop any playing TTS when starting STT
+    tts.stop();
+    setIsSpeaking(false);
+
     if (isListening) {
       stopListeningRef.current?.();
       stopListeningRef.current = null;
@@ -62,13 +107,14 @@ export function AIOfficeJarvisTaskInstruction({
     });
 
     stopListeningRef.current = cleanup;
-  }, [adapter, isListening]);
+  }, [adapter, isListening, tts]);
 
   useEffect(() => {
     return () => {
       stopListeningRef.current?.();
+      tts.stop();
     };
-  }, []);
+  }, [tts]);
 
   const submitMutation = useMutation({
     mutationFn: async () => {
@@ -95,6 +141,15 @@ export function AIOfficeJarvisTaskInstruction({
       queryClient.invalidateQueries({ queryKey: ["ai-office-dashboard-summary"] });
       queryClient.invalidateQueries({ queryKey: ["issues"] });
       onSuccess?.(result);
+
+      const assignedAgent = result.selectedAgentId
+        ? agentById?.get(result.selectedAgentId)?.name ?? result.selectedAgentId
+        : "에이전트";
+      let speech = `업무가 접수되었습니다. 담당 전문가 ${assignedAgent}에게 배정되었습니다.`;
+      if (result.parentIssueDeduplicated) {
+        speech += " 기존 동일 업무와 연계되었습니다.";
+      }
+      speakResponse(speech);
     },
   });
 
@@ -181,6 +236,14 @@ export function AIOfficeJarvisTaskInstruction({
                   disabled={!jarvisAgent || submitMutation.isPending}
                   onToggle={handleToggleVoice}
                 />
+                <AIOfficeVoiceSpeakerButton
+                  enabled={ttsEnabled}
+                  isSpeaking={isSpeaking}
+                  isSupported={tts.isSupported()}
+                  disabled={!jarvisAgent || submitMutation.isPending}
+                  onToggle={() => setTtsEnabled((prev) => !prev)}
+                  onStop={handleStopTts}
+                />
                 {voiceError ? (
                   <span
                     data-testid="mobile-jarvis-voice-error"
@@ -192,6 +255,10 @@ export function AIOfficeJarvisTaskInstruction({
                 ) : isListening ? (
                   <span className="text-xs text-muted-foreground animate-pulse">
                     말씀하시면 텍스트로 입력됩니다...
+                  </span>
+                ) : isSpeaking ? (
+                  <span className="text-xs text-primary animate-pulse">
+                    답변을 읽고 있습니다...
                   </span>
                 ) : null}
               </div>
@@ -261,6 +328,37 @@ export function AIOfficeJarvisTaskInstruction({
               {lastResult.parentIssueDeduplicated ? (
                 <div className="text-amber-600 dark:text-amber-400">
                   (기존 동일 업무 연계됨)
+                </div>
+              ) : null}
+              {lastSpokenText ? (
+                <div className="flex w-full items-center justify-between border-t border-emerald-500/20 pt-1.5 mt-1">
+                  <span className="text-xs text-muted-foreground">음성 안내</span>
+                  {isSpeaking ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="destructive"
+                      onClick={handleStopTts}
+                      data-testid="jarvis-receipt-tts-stop-btn"
+                      className="h-6 px-2 text-xs"
+                    >
+                      <Square className="h-3 w-3 fill-current mr-1" aria-hidden="true" />
+                      <span>말하기 중지</span>
+                    </Button>
+                  ) : (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={!tts.isSupported()}
+                      onClick={() => speakResponse(lastSpokenText)}
+                      data-testid="jarvis-receipt-tts-replay-btn"
+                      className="h-6 px-2 text-xs font-medium"
+                    >
+                      <Volume2 className="h-3 w-3 text-primary mr-1" aria-hidden="true" />
+                      <span>다시 듣기</span>
+                    </Button>
+                  )}
                 </div>
               ) : null}
             </div>

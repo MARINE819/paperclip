@@ -6,7 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Agent } from "@paperclipai/shared";
 import { ApiError } from "@/api/client";
-import { formatSpeechRecognitionError, type VoiceSttAdapter } from "@/lib/voice-adapter";
+import {
+  formatSpeechRecognitionError,
+  isSpeechSynthesisSupported,
+  createBrowserVoiceTtsAdapter,
+  type VoiceSttAdapter,
+  type VoiceTtsAdapter,
+} from "@/lib/voice-adapter";
 import { AIOfficeJarvisTaskInstruction } from "./AIOfficeJarvisTaskInstruction";
 
 const mockJarvisApi = vi.hoisted(() => ({
@@ -591,6 +597,560 @@ describe("AIOfficeJarvisTaskInstruction", () => {
       expect(micBtn.className).toContain("shrink-0");
 
       act(() => root.unmount());
+    });
+  });
+
+  describe("Voice TTS Integration", () => {
+    function makeMockTts(overrides: Partial<VoiceTtsAdapter> = {}) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let capturedCallbacks: any = null;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const speakMock = vi.fn((_text: string, callbacks?: any) => {
+        capturedCallbacks = callbacks;
+        act(() => {
+          callbacks?.onStart?.();
+        });
+      });
+      const stopMock = vi.fn(() => {
+        act(() => {
+          capturedCallbacks?.onEnd?.();
+        });
+      });
+      const adapter: VoiceTtsAdapter = {
+        isSupported: () => true,
+        speak: speakMock,
+        stop: stopMock,
+        isSpeaking: () => false,
+        ...overrides,
+      };
+      return {
+        adapter,
+        speakMock,
+        stopMock,
+        getCallbacks: () => capturedCallbacks,
+      };
+    }
+
+    it("speaks Korean response via TTS when submit succeeds and TTS is enabled", async () => {
+      const jarvis = makeAgent({ id: "jarvis-100" });
+      const specialist = makeAgent({ id: "specialist-200", name: "CodeSpecialist" });
+      const agentById = new Map([
+        ["jarvis-100", jarvis],
+        ["specialist-200", specialist],
+      ]);
+      const { adapter: mockTts, speakMock } = makeMockTts();
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-tts-1",
+        childIssueId: "child-tts-1",
+        selectedAgentId: "specialist-200",
+        parentIssueDeduplicated: false,
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          agentById={agentById}
+          ttsAdapter={mockTts}
+        />,
+      );
+
+      const textarea = container.querySelector(
+        '[data-testid="mobile-jarvis-instruction-input"]',
+      ) as HTMLTextAreaElement;
+      setInputValue(textarea, "TTS 안내 음성 검증");
+
+      const submitBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-submit-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(speakMock).toHaveBeenCalledTimes(1);
+      expect(speakMock).toHaveBeenCalledWith(
+        "업무가 접수되었습니다. 담당 전문가 CodeSpecialist에게 배정되었습니다.",
+        expect.any(Object),
+      );
+
+      act(() => root.unmount());
+    });
+
+    it("includes deduplication guidance in Korean speech when task is deduplicated", async () => {
+      const jarvis = makeAgent({ id: "jarvis-100" });
+      const { adapter: mockTts, speakMock } = makeMockTts();
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-dedup",
+        childIssueId: "child-dedup",
+        selectedAgentId: "jarvis-100",
+        parentIssueDeduplicated: true,
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          ttsAdapter={mockTts}
+        />,
+      );
+
+      const textarea = container.querySelector(
+        '[data-testid="mobile-jarvis-instruction-input"]',
+      ) as HTMLTextAreaElement;
+      setInputValue(textarea, "중복 업무 지시");
+
+      const submitBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-submit-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(speakMock).toHaveBeenCalledWith(
+        "업무가 접수되었습니다. 담당 전문가 jarvis-100에게 배정되었습니다. 기존 동일 업무와 연계되었습니다.",
+        expect.any(Object),
+      );
+
+      act(() => root.unmount());
+    });
+
+    it("does not speak when TTS toggle is turned OFF", async () => {
+      const jarvis = makeAgent();
+      const { adapter: mockTts, speakMock } = makeMockTts();
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-silent",
+        childIssueId: "child-silent",
+        selectedAgentId: "agent-jarvis",
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          ttsAdapter={mockTts}
+        />,
+      );
+
+      const speakerBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-voice-speaker-btn"]',
+      ) as HTMLButtonElement;
+      expect(speakerBtn).not.toBeNull();
+      expect(speakerBtn.getAttribute("aria-pressed")).toBe("true");
+
+      // Toggle TTS OFF
+      act(() => {
+        speakerBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      expect(speakerBtn.getAttribute("aria-pressed")).toBe("false");
+
+      const textarea = container.querySelector(
+        '[data-testid="mobile-jarvis-instruction-input"]',
+      ) as HTMLTextAreaElement;
+      setInputValue(textarea, "무음 제출 테스트");
+
+      const submitBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-submit-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(speakMock).not.toHaveBeenCalled();
+
+      act(() => root.unmount());
+    });
+
+    it("stops speech immediately when stop button is clicked during TTS playback", async () => {
+      const jarvis = makeAgent();
+      const { adapter: mockTts, stopMock } = makeMockTts();
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-stop",
+        childIssueId: "child-stop",
+        selectedAgentId: "agent-jarvis",
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          ttsAdapter={mockTts}
+        />,
+      );
+
+      const textarea = container.querySelector(
+        '[data-testid="mobile-jarvis-instruction-input"]',
+      ) as HTMLTextAreaElement;
+      setInputValue(textarea, "말하기 중지 테스트");
+
+      const submitBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-submit-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      // In speaking state, stop button is displayed in receipt card
+      const stopBtn = container.querySelector(
+        '[data-testid="jarvis-receipt-tts-stop-btn"]',
+      ) as HTMLButtonElement;
+      expect(stopBtn).not.toBeNull();
+      expect(stopBtn.textContent).toContain("말하기 중지");
+
+      act(() => {
+        stopBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      expect(stopMock).toHaveBeenCalled();
+
+      act(() => root.unmount());
+    });
+
+    it("stops active TTS playback immediately when mic button is clicked (STT collision guard)", async () => {
+      const jarvis = makeAgent();
+      const { adapter: mockTts, stopMock } = makeMockTts();
+      const mockStt: VoiceSttAdapter = {
+        isSupported: () => true,
+        startListening: () => () => {},
+      };
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-col-1",
+        childIssueId: "child-col-1",
+        selectedAgentId: "agent-jarvis",
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          voiceAdapter={mockStt}
+          ttsAdapter={mockTts}
+        />,
+      );
+
+      const textarea = container.querySelector(
+        '[data-testid="mobile-jarvis-instruction-input"]',
+      ) as HTMLTextAreaElement;
+      setInputValue(textarea, "충돌 방지 테스트");
+
+      const submitBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-submit-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      // Click mic button while TTS is active
+      const micBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-voice-mic-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        micBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      expect(stopMock).toHaveBeenCalled();
+
+      act(() => root.unmount());
+    });
+
+    it("stops active STT listening immediately when TTS starts speaking (TTS collision guard)", async () => {
+      const jarvis = makeAgent();
+      let sttCleanupCalled = false;
+      const mockStt: VoiceSttAdapter = {
+        isSupported: () => true,
+        startListening: () => {
+          return () => {
+            sttCleanupCalled = true;
+          };
+        },
+      };
+      const { adapter: mockTts } = makeMockTts();
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-col-2",
+        childIssueId: "child-col-2",
+        selectedAgentId: "agent-jarvis",
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          voiceAdapter={mockStt}
+          ttsAdapter={mockTts}
+        />,
+      );
+
+      // Start listening
+      const micBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-voice-mic-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        micBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(micBtn.getAttribute("aria-pressed")).toBe("true");
+
+      // While STT listening, submit task
+      const textarea = container.querySelector(
+        '[data-testid="mobile-jarvis-instruction-input"]',
+      ) as HTMLTextAreaElement;
+      setInputValue(textarea, "STT 수신 중 TTS 실행");
+
+      const submitBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-submit-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      // STT cleanup was called to prevent loop
+      expect(sttCleanupCalled).toBe(true);
+
+      act(() => root.unmount());
+    });
+
+    it("provides manual replay button in receipt card for mobile Safari/Chrome autoplay fallback", async () => {
+      const jarvis = makeAgent();
+      const { adapter: mockTts, speakMock, getCallbacks } = makeMockTts();
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-replay",
+        childIssueId: "child-replay",
+        selectedAgentId: "agent-jarvis",
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          ttsAdapter={mockTts}
+        />,
+      );
+
+      const textarea = container.querySelector(
+        '[data-testid="mobile-jarvis-instruction-input"]',
+      ) as HTMLTextAreaElement;
+      setInputValue(textarea, "모바일 수동 다시 듣기 테스트");
+
+      const submitBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-submit-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      // Simulate speech finishing
+      act(() => {
+        getCallbacks()?.onEnd?.();
+      });
+      await flushReact();
+
+      // Replay button should be present
+      const replayBtn = container.querySelector(
+        '[data-testid="jarvis-receipt-tts-replay-btn"]',
+      ) as HTMLButtonElement;
+      expect(replayBtn).not.toBeNull();
+      expect(replayBtn.textContent).toContain("다시 듣기");
+      expect(replayBtn.disabled).toBe(false);
+
+      // User taps "다시 듣기"
+      act(() => {
+        replayBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      expect(speakMock).toHaveBeenCalledTimes(2);
+
+      act(() => root.unmount());
+    });
+
+    it("gracefully disables speaker and replay button when browser does not support TTS", async () => {
+      const jarvis = makeAgent();
+      const unsupportedTts: VoiceTtsAdapter = {
+        isSupported: () => false,
+        speak: vi.fn(),
+        stop: vi.fn(),
+        isSpeaking: () => false,
+      };
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-no-tts",
+        childIssueId: "child-no-tts",
+        selectedAgentId: "agent-jarvis",
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          ttsAdapter={unsupportedTts}
+        />,
+      );
+
+      const speakerBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-voice-speaker-btn"]',
+      ) as HTMLButtonElement;
+      expect(speakerBtn).not.toBeNull();
+      expect(speakerBtn.disabled).toBe(true);
+      expect(speakerBtn.getAttribute("aria-label")).toBe("음성 출력 미지원");
+
+      const textarea = container.querySelector(
+        '[data-testid="mobile-jarvis-instruction-input"]',
+      ) as HTMLTextAreaElement;
+      setInputValue(textarea, "TTS 미지원 환경 제출");
+
+      const submitBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-submit-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      // speak should not have been called
+      expect(unsupportedTts.speak).not.toHaveBeenCalled();
+
+      // Receipt is still displayed normally
+      const receipt = container.querySelector('[data-testid="mobile-jarvis-success-receipt"]');
+      expect(receipt).not.toBeNull();
+
+      // Replay button is disabled
+      const replayBtn = container.querySelector(
+        '[data-testid="jarvis-receipt-tts-replay-btn"]',
+      ) as HTMLButtonElement;
+      expect(replayBtn).not.toBeNull();
+      expect(replayBtn.disabled).toBe(true);
+
+      act(() => root.unmount());
+    });
+
+    describe("Browser Voice TTS Adapter", () => {
+      it("correctly identifies speech synthesis support based on window objects", () => {
+        const origSpeechSynthesis = window.speechSynthesis;
+        const origUtterance = window.SpeechSynthesisUtterance;
+
+        // Missing window.speechSynthesis
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        delete (window as any).speechSynthesis;
+        expect(isSpeechSynthesisSupported()).toBe(false);
+
+        // Define mock window.speechSynthesis and SpeechSynthesisUtterance
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).speechSynthesis = {
+          speak: vi.fn(),
+          cancel: vi.fn(),
+        };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).SpeechSynthesisUtterance = class {
+          text = "";
+          lang = "";
+          rate = 1;
+        };
+
+        expect(isSpeechSynthesisSupported()).toBe(true);
+
+        // Restore
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).speechSynthesis = origSpeechSynthesis;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).SpeechSynthesisUtterance = origUtterance;
+      });
+
+      it("configures utterance with ko-KR and attaches lifecycle callbacks", () => {
+        const origSpeechSynthesis = window.speechSynthesis;
+        const origUtterance = window.SpeechSynthesisUtterance;
+
+        const speakMock = vi.fn();
+        const cancelMock = vi.fn();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).speechSynthesis = {
+          speak: speakMock,
+          cancel: cancelMock,
+        };
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let createdUtterance: any = null;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).SpeechSynthesisUtterance = class MockUtterance {
+          text: string;
+          lang = "";
+          rate = 1;
+          onstart: (() => void) | null = null;
+          onend: (() => void) | null = null;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          onerror: ((event: any) => void) | null = null;
+          constructor(text: string) {
+            this.text = text;
+            createdUtterance = this;
+          }
+        };
+
+        const adapter = createBrowserVoiceTtsAdapter();
+        expect(adapter.isSupported()).toBe(true);
+
+        const onStart = vi.fn();
+        const onEnd = vi.fn();
+        const onError = vi.fn();
+
+        adapter.speak("테스트 음성입니다", { onStart, onEnd, onError });
+
+        expect(cancelMock).toHaveBeenCalled();
+        expect(createdUtterance).not.toBeNull();
+        expect(createdUtterance.text).toBe("테스트 음성입니다");
+        expect(createdUtterance.lang).toBe("ko-KR");
+        expect(speakMock).toHaveBeenCalledWith(createdUtterance);
+
+        // Trigger utterance events
+        createdUtterance.onstart?.();
+        expect(onStart).toHaveBeenCalled();
+
+        createdUtterance.onend?.();
+        expect(onEnd).toHaveBeenCalled();
+
+        createdUtterance.onerror?.({ error: "canceled" });
+        expect(onError).toHaveBeenCalledWith("음성 출력 중 오류가 발생했습니다.");
+
+        adapter.stop();
+        expect(cancelMock).toHaveBeenCalledTimes(2);
+
+        // Restore
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).speechSynthesis = origSpeechSynthesis;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).SpeechSynthesisUtterance = origUtterance;
+      });
     });
   });
 });

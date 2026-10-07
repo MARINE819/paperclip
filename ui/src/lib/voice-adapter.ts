@@ -121,3 +121,79 @@ export function createBrowserVoiceSttAdapter(
 }
 
 export const defaultVoiceSttAdapter = createBrowserVoiceSttAdapter();
+
+export interface VoiceTtsCallbacks {
+  onStart?: () => void;
+  onEnd?: () => void;
+  onError?: (error: string) => void;
+}
+
+export interface VoiceTtsAdapter {
+  isSupported: () => boolean;
+  speak: (text: string, callbacks?: VoiceTtsCallbacks) => void;
+  stop: () => void;
+  isSpeaking?: () => boolean;
+}
+
+export function isSpeechSynthesisSupported(): boolean {
+  if (typeof window === "undefined") return false;
+  return "speechSynthesis" in window && typeof SpeechSynthesisUtterance !== "undefined";
+}
+
+export function createBrowserVoiceTtsAdapter(
+  getSynthesis: () => SpeechSynthesis | null = () =>
+    typeof window !== "undefined" && window.speechSynthesis ? window.speechSynthesis : null,
+): VoiceTtsAdapter {
+  return {
+    isSupported: () => {
+      if (typeof window === "undefined") return false;
+      return getSynthesis() !== null && typeof SpeechSynthesisUtterance !== "undefined";
+    },
+    speak: (text: string, callbacks?: VoiceTtsCallbacks) => {
+      const synth = getSynthesis();
+      if (!synth || typeof SpeechSynthesisUtterance === "undefined") {
+        callbacks?.onError?.("음성 출력을 지원하지 않는 브라우저입니다.");
+        return;
+      }
+
+      try {
+        synth.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = "ko-KR";
+        utterance.onstart = () => {
+          callbacks?.onStart?.();
+        };
+        utterance.onend = () => {
+          callbacks?.onEnd?.();
+        };
+        utterance.onerror = () => {
+          callbacks?.onError?.("음성 출력 중 오류가 발생했습니다.");
+        };
+        synth.speak(utterance);
+      } catch {
+        callbacks?.onError?.("음성 출력 중 오류가 발생했습니다.");
+      }
+    },
+    stop: () => {
+      try {
+        const synth = getSynthesis();
+        if (synth) {
+          synth.cancel();
+        }
+      } catch {
+        // ignore cleanup error
+      }
+    },
+    isSpeaking: () => {
+      try {
+        const synth = getSynthesis();
+        return synth ? synth.speaking : false;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+export const defaultVoiceTtsAdapter = createBrowserVoiceTtsAdapter();
+

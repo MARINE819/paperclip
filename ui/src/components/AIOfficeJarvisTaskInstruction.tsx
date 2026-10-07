@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Agent } from "@paperclipai/shared";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { jarvisApi, type SubmitToJarvisResult } from "@/api/jarvis";
@@ -6,12 +6,15 @@ import { ApiError } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { AlertTriangle, Bot, CheckCircle2, ExternalLink, Loader2, Send } from "lucide-react";
+import { AIOfficeVoiceMicButton } from "@/components/AIOfficeVoiceMicButton";
+import { defaultVoiceSttAdapter, type VoiceSttAdapter } from "@/lib/voice-adapter";
 
 export interface AIOfficeJarvisTaskInstructionProps {
   companyId: string | null;
   jarvisAgent: Agent | null;
   agentById?: Map<string, Agent>;
   onSuccess?: (result: SubmitToJarvisResult) => void;
+  voiceAdapter?: VoiceSttAdapter;
 }
 
 export function AIOfficeJarvisTaskInstruction({
@@ -19,13 +22,61 @@ export function AIOfficeJarvisTaskInstruction({
   jarvisAgent,
   agentById,
   onSuccess,
+  voiceAdapter,
 }: AIOfficeJarvisTaskInstructionProps) {
   const queryClient = useQueryClient();
   const [requestText, setRequestText] = useState("");
   const [lastResult, setLastResult] = useState<SubmitToJarvisResult | null>(null);
 
+  const adapter = voiceAdapter ?? defaultVoiceSttAdapter;
+  const [isListening, setIsListening] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const stopListeningRef = useRef<(() => void) | null>(null);
+
+  const handleToggleVoice = useCallback(() => {
+    if (isListening) {
+      stopListeningRef.current?.();
+      stopListeningRef.current = null;
+      setIsListening(false);
+      return;
+    }
+
+    setVoiceError(null);
+    setIsListening(true);
+
+    const cleanup = adapter.startListening({
+      onResult: (transcript) => {
+        setRequestText((prev) => {
+          const trimmed = prev.trim();
+          return trimmed ? `${trimmed} ${transcript}` : transcript;
+        });
+        setIsListening(false);
+      },
+      onError: (err) => {
+        setVoiceError(err);
+        setIsListening(false);
+      },
+      onEnd: () => {
+        setIsListening(false);
+      },
+    });
+
+    stopListeningRef.current = cleanup;
+  }, [adapter, isListening]);
+
+  useEffect(() => {
+    return () => {
+      stopListeningRef.current?.();
+    };
+  }, []);
+
   const submitMutation = useMutation({
     mutationFn: async () => {
+      if (isListening) {
+        stopListeningRef.current?.();
+        stopListeningRef.current = null;
+        setIsListening(false);
+      }
       if (!companyId) throw new Error("회사 ID가 필요합니다.");
       if (!jarvisAgent) throw new Error("JARVIS 에이전트를 찾을 수 없습니다.");
       const trimmed = requestText.trim();
@@ -122,7 +173,29 @@ export function AIOfficeJarvisTaskInstruction({
               className="w-full resize-none rounded-md border border-border bg-background p-2.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-ring disabled:opacity-50"
             />
 
-            <div className="flex justify-end">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <AIOfficeVoiceMicButton
+                  isListening={isListening}
+                  isSupported={adapter.isSupported()}
+                  disabled={!jarvisAgent || submitMutation.isPending}
+                  onToggle={handleToggleVoice}
+                />
+                {voiceError ? (
+                  <span
+                    data-testid="mobile-jarvis-voice-error"
+                    className="text-xs text-destructive truncate max-w-48"
+                    title={voiceError}
+                  >
+                    {voiceError}
+                  </span>
+                ) : isListening ? (
+                  <span className="text-xs text-muted-foreground animate-pulse">
+                    말씀하시면 텍스트로 입력됩니다...
+                  </span>
+                ) : null}
+              </div>
+
               <Button
                 type="button"
                 size="sm"
@@ -130,7 +203,7 @@ export function AIOfficeJarvisTaskInstruction({
                 disabled={isSubmitDisabled}
                 onClick={() => submitMutation.mutate()}
                 data-testid="mobile-jarvis-submit-btn"
-                className="h-8 px-3 text-xs font-semibold"
+                className="h-8 px-3 text-xs font-semibold shrink-0"
               >
                 {submitMutation.isPending ? (
                   <>

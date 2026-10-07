@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Agent } from "@paperclipai/shared";
 import { ApiError } from "@/api/client";
+import { formatSpeechRecognitionError, type VoiceSttAdapter } from "@/lib/voice-adapter";
 import { AIOfficeJarvisTaskInstruction } from "./AIOfficeJarvisTaskInstruction";
 
 const mockJarvisApi = vi.hoisted(() => ({
@@ -300,5 +301,296 @@ describe("AIOfficeJarvisTaskInstruction", () => {
     expect(errorAlert?.textContent).toContain("업무 계획 수립 불가 (422): no_eligible_specialist");
 
     act(() => root.unmount());
+  });
+
+  describe("Voice STT Integration", () => {
+    it("renders mic button and injects speech transcript into requestText when speaking", async () => {
+      const jarvis = makeAgent();
+      let capturedCallbacks: any = null;
+      const mockAdapter: VoiceSttAdapter = {
+        isSupported: () => true,
+        startListening: (callbacks) => {
+          capturedCallbacks = callbacks;
+          return () => {};
+        },
+      };
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          voiceAdapter={mockAdapter}
+        />,
+      );
+
+      const micBtn = container.querySelector('[data-testid="mobile-jarvis-voice-mic-btn"]') as HTMLButtonElement;
+      expect(micBtn).not.toBeNull();
+      expect(micBtn.disabled).toBe(false);
+
+      // Start listening
+      act(() => {
+        micBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      expect(micBtn.getAttribute("aria-pressed")).toBe("true");
+      expect(micBtn.textContent).toContain("듣는 중...");
+
+      // Simulate SpeechRecognition result
+      act(() => {
+        capturedCallbacks.onResult("모바일 결재 화면 E2E 테스트 검증해줘");
+      });
+      await flushReact();
+
+      const textarea = container.querySelector('[data-testid="mobile-jarvis-instruction-input"]') as HTMLTextAreaElement;
+      expect(textarea.value).toBe("모바일 결재 화면 E2E 테스트 검증해줘");
+
+      // Verify submit button is now enabled
+      const submitBtn = container.querySelector('[data-testid="mobile-jarvis-submit-btn"]') as HTMLButtonElement;
+      expect(submitBtn.disabled).toBe(false);
+
+      act(() => root.unmount());
+    });
+
+    it("appends subsequent speech transcript to existing text with a space", async () => {
+      const jarvis = makeAgent();
+      let capturedCallbacks: any = null;
+      const mockAdapter: VoiceSttAdapter = {
+        isSupported: () => true,
+        startListening: (callbacks) => {
+          capturedCallbacks = callbacks;
+          return () => {};
+        },
+      };
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          voiceAdapter={mockAdapter}
+        />,
+      );
+
+      const textarea = container.querySelector('[data-testid="mobile-jarvis-instruction-input"]') as HTMLTextAreaElement;
+      setInputValue(textarea, "기존 입력 내용");
+
+      const micBtn = container.querySelector('[data-testid="mobile-jarvis-voice-mic-btn"]') as HTMLButtonElement;
+      act(() => {
+        micBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      act(() => {
+        capturedCallbacks.onResult("추가 음성 지시");
+      });
+      await flushReact();
+
+      expect(textarea.value).toBe("기존 입력 내용 추가 음성 지시");
+
+      act(() => root.unmount());
+    });
+
+    it("renders disabled mic button when browser does not support SpeechRecognition", async () => {
+      const jarvis = makeAgent();
+      const mockAdapter: VoiceSttAdapter = {
+        isSupported: () => false,
+        startListening: () => () => {},
+      };
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          voiceAdapter={mockAdapter}
+        />,
+      );
+
+      const micBtn = container.querySelector('[data-testid="mobile-jarvis-voice-mic-btn"]') as HTMLButtonElement;
+      expect(micBtn).not.toBeNull();
+      expect(micBtn.disabled).toBe(true);
+      expect(micBtn.getAttribute("aria-label")).toBe("음성 인식 미지원");
+
+      // Manual text input remains fully usable
+      const textarea = container.querySelector('[data-testid="mobile-jarvis-instruction-input"]') as HTMLTextAreaElement;
+      expect(textarea.disabled).toBe(false);
+      setInputValue(textarea, "수동 입력");
+      expect(textarea.value).toBe("수동 입력");
+
+      act(() => root.unmount());
+    });
+
+    it("displays voice error gracefully without breaking manual text submission", async () => {
+      const jarvis = makeAgent();
+      let capturedCallbacks: any = null;
+      const mockAdapter: VoiceSttAdapter = {
+        isSupported: () => true,
+        startListening: (callbacks) => {
+          capturedCallbacks = callbacks;
+          return () => {};
+        },
+      };
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-v-1",
+        childIssueId: "child-v-1",
+        selectedAgentId: "agent-qa",
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          voiceAdapter={mockAdapter}
+        />,
+      );
+
+      const micBtn = container.querySelector('[data-testid="mobile-jarvis-voice-mic-btn"]') as HTMLButtonElement;
+      act(() => {
+        micBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      // Trigger error
+      act(() => {
+        capturedCallbacks.onError("마이크 접근 권한이 거부되었습니다.");
+      });
+      await flushReact();
+
+      const errorNotice = container.querySelector('[data-testid="mobile-jarvis-voice-error"]');
+      expect(errorNotice).not.toBeNull();
+      expect(errorNotice?.textContent).toContain("마이크 접근 권한이 거부되었습니다.");
+
+      // Manual text typing and submission still work 100% normally
+      const textarea = container.querySelector('[data-testid="mobile-jarvis-instruction-input"]') as HTMLTextAreaElement;
+      setInputValue(textarea, "권한 오류 후 수동 입력");
+
+      const submitBtn = container.querySelector('[data-testid="mobile-jarvis-submit-btn"]') as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(mockJarvisApi.submit).toHaveBeenCalledWith("company-1", {
+        jarvisAgentId: "agent-jarvis",
+        requestText: "권한 오류 후 수동 입력",
+      });
+
+      act(() => root.unmount());
+    });
+
+    it("humanizes standard Web Speech error codes without leaking raw technical strings", () => {
+      expect(formatSpeechRecognitionError("no-speech")).toBe(
+        "음성이 감지되지 않았습니다. 다시 말씀해주세요.",
+      );
+      expect(formatSpeechRecognitionError("not-allowed")).toBe(
+        "마이크 사용 권한이 거부되었습니다.",
+      );
+      expect(formatSpeechRecognitionError("audio-capture")).toBe(
+        "마이크 장치를 찾을 수 없습니다.",
+      );
+      expect(formatSpeechRecognitionError("network")).toBe(
+        "음성 인식 네트워크 연결에 실패했습니다.",
+      );
+      expect(formatSpeechRecognitionError("aborted")).toBe(
+        "음성 인식이 취소되었습니다.",
+      );
+      expect(formatSpeechRecognitionError("service-not-allowed")).toBe(
+        "음성 인식 서비스를 사용할 수 없습니다.",
+      );
+      // Strictly verify raw technical strings are never leaked to user
+      expect(formatSpeechRecognitionError("some-unknown-vendor-error-code")).toBe(
+        "음성 인식 중 오류가 발생했습니다.",
+      );
+      expect(formatSpeechRecognitionError(undefined)).toBe(
+        "음성 인식 중 오류가 발생했습니다.",
+      );
+    });
+
+    it("cleans up active voice session when user submits task while listening", async () => {
+      const jarvis = makeAgent();
+      let stopCalled = false;
+      const mockAdapter: VoiceSttAdapter = {
+        isSupported: () => true,
+        startListening: () => {
+          return () => {
+            stopCalled = true;
+          };
+        },
+      };
+
+      mockJarvisApi.submit.mockResolvedValue({
+        ok: true,
+        parentIssueId: "parent-v-submit",
+        childIssueId: "child-v-submit",
+        selectedAgentId: "agent-qa",
+      });
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          voiceAdapter={mockAdapter}
+        />,
+      );
+
+      const textarea = container.querySelector(
+        '[data-testid="mobile-jarvis-instruction-input"]',
+      ) as HTMLTextAreaElement;
+      setInputValue(textarea, "음성 수신 중 제출 테스트");
+
+      const micBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-voice-mic-btn"]',
+      ) as HTMLButtonElement;
+      // Start listening
+      act(() => {
+        micBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(micBtn.getAttribute("aria-pressed")).toBe("true");
+
+      // While listening, click submit
+      const submitBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-submit-btn"]',
+      ) as HTMLButtonElement;
+      act(() => {
+        submitBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      // Listening cleanup should have been invoked
+      expect(stopCalled).toBe(true);
+      expect(mockJarvisApi.submit).toHaveBeenCalledWith("company-1", {
+        jarvisAgentId: "agent-jarvis",
+        requestText: "음성 수신 중 제출 테스트",
+      });
+
+      act(() => root.unmount());
+    });
+
+    it("ensures mic button has shrink-0 to prevent layout collapse on small mobile screens", () => {
+      const jarvis = makeAgent();
+      const mockAdapter: VoiceSttAdapter = {
+        isSupported: () => true,
+        startListening: () => () => {},
+      };
+
+      const root = render(
+        <AIOfficeJarvisTaskInstruction
+          companyId="company-1"
+          jarvisAgent={jarvis}
+          voiceAdapter={mockAdapter}
+        />,
+      );
+
+      const micBtn = container.querySelector(
+        '[data-testid="mobile-jarvis-voice-mic-btn"]',
+      ) as HTMLButtonElement;
+      expect(micBtn.className).toContain("shrink-0");
+
+      act(() => root.unmount());
+    });
   });
 });

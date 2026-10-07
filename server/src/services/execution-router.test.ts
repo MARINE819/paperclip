@@ -183,11 +183,27 @@ describe("scoreExecutionCandidate — deterministic scoring", () => {
     expect(scoreExecutionCandidate(t4, profile)).toBeGreaterThan(scoreExecutionCandidate(t1, profile));
   });
 
-  it("cheapest cost preference favors a lower tier among equally-difficulty-distant candidates", async () => {
+  it("cheapest cost preference favors the cheaper registered costClass at the same tier", async () => {
     const profile = { difficultyTier: "T2", costPreference: "cheapest" } as any;
-    const t1: ExecutionCandidate = { executorType: "a", provider: "x", model: "m1", tier: "T1", reason: "tier_routing" };
-    const t3: ExecutionCandidate = { executorType: "b", provider: "x", model: "m3", tier: "T3", reason: "tier_routing" };
-    expect(scoreExecutionCandidate(t1, profile)).toBeGreaterThan(scoreExecutionCandidate(t3, profile));
+    const lowCost: ExecutionCandidate = { executorType: "a", provider: "openai", model: "gpt-5-mini", tier: "T2", reason: "tier_routing" };
+    const highCost: ExecutionCandidate = { executorType: "b", provider: "anthropic", model: "claude-opus-5", tier: "T2", reason: "tier_routing" };
+    expect(scoreExecutionCandidate(lowCost, profile)).toBeGreaterThan(scoreExecutionCandidate(highCost, profile));
+  });
+
+  it("does not mistake a lower tier for cheapest when its registered costClass is more expensive", async () => {
+    const profile = { difficultyTier: "T2", costPreference: "cheapest" } as any;
+    const lowerTierButExpensive: ExecutionCandidate = { executorType: "a", provider: "anthropic", model: "claude-opus-5", tier: "T1", reason: "tier_routing" };
+    const higherTierButCheaper: ExecutionCandidate = { executorType: "b", provider: "openai", model: "gpt-5-mini", tier: "T3", reason: "tier_routing" };
+    expect(scoreExecutionCandidate(higherTierButCheaper, profile)).toBeGreaterThan(
+      scoreExecutionCandidate(lowerTierButExpensive, profile),
+    );
+  });
+
+  it("balanced cost preference preserves the existing score regardless of costClass", async () => {
+    const profile = { difficultyTier: "T2", costPreference: "balanced" } as any;
+    const lowCost: ExecutionCandidate = { executorType: "a", provider: "openai", model: "gpt-5-mini", tier: "T2", reason: "tier_routing" };
+    const highCost: ExecutionCandidate = { executorType: "b", provider: "anthropic", model: "claude-opus-5", tier: "T2", reason: "tier_routing" };
+    expect(scoreExecutionCandidate(lowCost, profile)).toBe(scoreExecutionCandidate(highCost, profile));
   });
 
   it("2026-10-03 revision: incumbency is ONLY a final tie-break — it must NOT override a real tier/cost difference (reversed from the earlier dominant-bonus design, per explicit CEO instruction)", async () => {

@@ -42,7 +42,7 @@ import {
 } from "./executor-registry.js";
 import { resolveRoutedModel, type RoutingReason } from "./model-router.js";
 import { findModelByModelString } from "./model-registry.js";
-import type { ModelTier } from "./model-registry.js";
+import type { ModelCostClass, ModelTier } from "./model-registry.js";
 import { discoverRuntimeModels, RUNTIME_DISCOVERY_SOURCES } from "./runtime-model-discovery.js";
 
 // Extends model-router.ts's own RoutingReason with one new value for
@@ -154,6 +154,13 @@ export function nextFallbackCandidate(
 }
 
 const TIER_RANK: Readonly<Record<ModelTier, number>> = { T1: 1, T2: 2, T3: 3, T4: 4 };
+const COST_CLASS_RANK: Readonly<Record<ModelCostClass, number>> = {
+  free: 0,
+  low: 1,
+  mid: 2,
+  high: 3,
+  highest: 4,
+};
 
 // Generic, category-level task-suitability affinity — NEVER a vendor/
 // executor name. Grounded in the category definitions themselves
@@ -188,11 +195,22 @@ function tierFitScore(difficultyTier: TaskProfile["difficultyTier"], candidateTi
   return -Math.abs(difficultyRank - candidateRank); // 0 (perfect fit) to -3 (max mismatch)
 }
 
-function costPreferenceScore(costPreference: TaskProfile["costPreference"], candidateTier: ModelTier | null): number {
-  const candidateRank = candidateTier ? TIER_RANK[candidateTier] : TIER_RANK.T2;
-  if (costPreference === "cheapest") return -candidateRank; // lower tier (cheaper) scores higher
-  if (costPreference === "quality_first") return candidateRank; // higher tier scores higher
-  return 0; // "balanced" — no cost-driven preference
+function costPreferenceScore(
+  costPreference: TaskProfile["costPreference"],
+  candidateModel: string | null,
+): number {
+  if (costPreference === "balanced") return 0;
+
+  const costClass = candidateModel
+    ? findModelByModelString(candidateModel)?.costClass ?? null
+    : null;
+  if (costPreference === "cheapest") {
+    // Unknown pricing must not be mistaken for cheap.
+    return -(costClass ? COST_CLASS_RANK[costClass] : COST_CLASS_RANK.highest + 1);
+  }
+
+  // Unknown pricing receives no quality-first premium.
+  return costClass ? COST_CLASS_RANK[costClass] : 0;
 }
 
 function latencyPreferenceScore(latencyPreference: TaskProfile["latencyPreference"], speedClass: ExecutorRecord["speedClass"]): number {
@@ -209,7 +227,7 @@ function latencyPreferenceScore(latencyPreference: TaskProfile["latencyPreferenc
 //   5. task suitability   (weight 10,000 — dominates everything below)
 //   6. quality/reliability (weight 1,000)
 //   7. difficulty/tier fit (weight 100, max magnitude 300 — strictly below #6's min step)
-//   8. cost               (weight 10, max magnitude 40 — strictly below #7's min step)
+//   8. cost               (weight 10, max magnitude 50 — strictly below #7's min step)
 //   9. latency             (weight 4, max magnitude 8 — strictly below #8's min step)
 //   10. incumbency          (weight 1 — the smallest possible, pure tie-break)
 // Each weight is chosen so a nonzero difference at any priority level always
@@ -237,7 +255,7 @@ export function scoreExecutionCandidate(
   const reliability = executor ? reliabilityScore(executor.healthStatus) : 0;
   const targetTier = effectiveTargetTier ?? taskProfile.difficultyTier;
   const tierFit = tierFitScore(targetTier, candidate.tier);
-  const cost = costPreferenceScore(taskProfile.costPreference, candidate.tier);
+  const cost = costPreferenceScore(taskProfile.costPreference, candidate.model);
   const latency = executor ? latencyPreferenceScore(taskProfile.latencyPreference, executor.speedClass) : 0;
   const incumbency = agentAdapterType && candidate.executorType === agentAdapterType ? 1 : 0;
   return (

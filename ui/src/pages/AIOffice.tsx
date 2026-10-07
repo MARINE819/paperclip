@@ -27,8 +27,6 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { DecisionQueueRail } from "@/components/DecisionQueueRail";
-import { ActivityFeed } from "@/components/ActivityFeed";
 import { VoiceCommandBar, type VoiceBarState } from "@/components/VoiceCommandBar";
 import { AIOfficeEvalLab } from "@/components/AIOfficeEvalLab";
 import { AIOfficeIncidentLab } from "@/components/AIOfficeIncidentLab";
@@ -41,6 +39,7 @@ import { ControlCenterTabs, useControlCenterTab } from "@/components/ControlCent
 import { deriveAgentCondition } from "@/components/AIOfficeControlTower";
 import { AIOfficeMobileSummary } from "@/components/AIOfficeMobileSummary";
 import { AIOfficeJarvisTaskInstruction } from "@/components/AIOfficeJarvisTaskInstruction";
+import { AIOfficeCeoControlRail } from "@/components/AIOfficeCeoControlRail";
 import {
   AgentDetailSheet,
   AmenityTile,
@@ -100,25 +99,6 @@ function StatValue({ state, value }: { state: QueryState; value: number }) {
   if (state.kind === "loading") return <span className="text-lg font-semibold text-muted-foreground">…</span>;
   if (state.kind === "error") return <span className="text-lg font-semibold text-destructive">오류</span>;
   return <span className="text-lg font-semibold">{value}</span>;
-}
-
-function StateNotice({ state, loadingText, emptyText, errorPrefix }: {
-  state: QueryState;
-  loadingText: string;
-  emptyText: string;
-  errorPrefix: string;
-}) {
-  if (state.kind === "loading") {
-    return <span className="text-muted-foreground">{loadingText}</span>;
-  }
-  if (state.kind === "error") {
-    return (
-      <span className="text-destructive">
-        {errorPrefix}: {state.message}
-      </span>
-    );
-  }
-  return <span className="text-muted-foreground">{emptyText}</span>;
 }
 
 export type AIOfficeViewMode = "floor" | "summary" | "neural";
@@ -386,7 +366,7 @@ export function AIOffice() {
       agent,
       condition: deriveAgentCondition(agent, liveRunByAgentId.has(agent.id), now),
     }))
-    .filter((entry) => entry.condition !== null);
+    .filter((entry): entry is { agent: (typeof agents)[number]; condition: "error" | "offline" } => entry.condition !== null);
 
   const errorAgents = blockedOrOfflineAgents.filter((entry) => entry.condition === "error");
   const offlineAgents = blockedOrOfflineAgents.filter((entry) => entry.condition === "offline");
@@ -759,206 +739,25 @@ export function AIOffice() {
           )}
         </div>
 
-        {/* 우측 운영 패널 */}
-        <aside className="space-y-4 lg:col-span-1">
-          {/* 검토 대기 (In-Review) 큐 */}
-          <Card data-testid="desktop-in-review-card">
-            <CardHeader>
-              <CardTitle className="flex items-center justify-between text-sm">
-                <span>검토 대기 (In-Review) ({(inReviewIssuesQuery.data ?? []).length}건)</span>
-                <a
-                  href="/issues?status=in_review"
-                  className="text-xs font-normal text-primary hover:underline"
-                >
-                  전체 →
-                </a>
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-2 text-xs">
-              {inReviewIssuesState.kind !== "data" ? (
-                <StateNotice
-                  state={inReviewIssuesState}
-                  loadingText="검토 데이터 로딩 중"
-                  emptyText="검토 대기 중인 업무 없음"
-                  errorPrefix="검토 데이터 조회 실패"
-                />
-              ) : (
-                (inReviewIssuesQuery.data ?? []).map((issue) => {
-                  const assignee = issue.assigneeAgentId
-                    ? agents.find((a) => a.id === issue.assigneeAgentId)?.name ?? issue.assigneeAgentId
-                    : "미배정";
-                  const reportComment = jarvisReportCommentByIssueId.get(issue.id);
-                  const isJarvisReport = Boolean(reportComment);
-                  return (
-                    <a
-                      key={issue.id}
-                      href={isJarvisReport && reportComment ? `/issues/${issue.id}#comment-${reportComment.id}` : `/issues/${issue.id}`}
-                      className={`flex flex-col gap-1 rounded-md border p-2 transition-colors ${
-                        isJarvisReport
-                          ? "border-primary/40 bg-primary/5 hover:bg-primary/10"
-                          : "border-amber-500/30 bg-amber-500/5 hover:bg-amber-500/10"
-                      }`}
-                      data-testid={`desktop-in-review-item-${issue.id}`}
-                    >
-                      <div className="flex items-center justify-between gap-1">
-                        <span className="font-semibold text-foreground truncate">
-                          {issue.identifier ? `${issue.identifier} ` : ""}{issue.title}
-                        </span>
-                        {isJarvisReport ? (
-                          <span
-                            className="shrink-0 rounded bg-primary/20 px-1.5 py-0.5 text-xs font-medium text-primary"
-                            data-testid={`desktop-jarvis-report-badge-${issue.id}`}
-                          >
-                            JARVIS 최종 보고
-                          </span>
-                        ) : (
-                          <span className="shrink-0 rounded bg-amber-500/20 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-300">
-                            검토 대기
-                          </span>
-                        )}
-                      </div>
-                      <div className="flex items-center justify-between text-xs text-muted-foreground">
-                        <span>담당: {assignee}</span>
-                        <span className="text-primary hover:underline">
-                          {isJarvisReport ? "최종 보고서 확인 →" : "이슈 열기 →"}
-                        </span>
-                      </div>
-                    </a>
-                  );
-                })
-              )}
-            </CardContent>
-          </Card>
-
-          <Card data-testid="desktop-pending-approvals-card">
-            <CardHeader>
-              <CardTitle className="flex items-center justify-between text-sm">
-                <span>승인 대기 ({allPendingApprovals.length}건)</span>
-                <a
-                  href="/mobile/approvals"
-                  className="text-xs font-normal text-primary hover:underline"
-                >
-                  결재 콘솔 →
-                </a>
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-2 text-xs">
-              {pendingApprovalsState.kind !== "data" ? (
-                <StateNotice
-                  state={pendingApprovalsState}
-                  loadingText="승인 데이터 로딩 중"
-                  emptyText="대기 중인 승인 없음"
-                  errorPrefix="승인 데이터 조회 실패"
-                />
-              ) : (
-                allPendingApprovals.map((approval) => (
-                  <a
-                    key={approval.id}
-                    href="/mobile/approvals"
-                    className="flex flex-col gap-0.5 border-t pt-2 first:border-t-0 first:pt-0 hover:bg-muted/40 rounded p-1 -mx-1 transition-colors"
-                    data-testid={`desktop-approval-item-${approval.id}`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium text-foreground">
-                        {approval.type}
-                        {approval.status === "revision_requested" ? " (수정 요청)" : ""}
-                      </span>
-                      <span className="text-xs text-primary">결재 →</span>
-                    </div>
-                    <span className="text-muted-foreground">
-                      {approval.requestedByAgentId
-                        ? agents.find((a) => a.id === approval.requestedByAgentId)?.name ?? approval.requestedByAgentId
-                        : "—"}
-                    </span>
-                  </a>
-                ))
-              )}
-            </CardContent>
-          </Card>
-
-          <Card data-testid="desktop-blocker-card">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-1.5 text-sm">
-                <ShieldAlert className="h-4 w-4" /> 블로커 센터
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-2 text-xs">
-              {agentsState.kind === "loading" || liveRunsState.kind === "loading" ? (
-                <span className="text-muted-foreground">에이전트 상태 로딩 중</span>
-              ) : agentsState.kind === "error" ? (
-                <span className="text-destructive">에이전트 데이터 조회 실패: {agentsState.message}</span>
-              ) : blockedOrOfflineAgents.length === 0 ? (
-                <span className="text-muted-foreground">차단/오프라인 에이전트 없음</span>
-              ) : (
-                blockedOrOfflineAgents.map(({ agent, condition }) => (
-                  <button
-                    key={agent.id}
-                    type="button"
-                    onClick={() => setSelectedAgentId(agent.id)}
-                    className="flex w-full items-center justify-between gap-2 border-t pt-2 first:border-t-0 first:pt-0 text-left hover:bg-muted/40 rounded p-1 -mx-1 transition-colors"
-                    data-testid={`desktop-blocker-item-${agent.id}`}
-                  >
-                    <span className="truncate font-medium">{agent.name}</span>
-                    <SeatBadge state={condition === "error" ? "blocked-error" : "offline"} />
-                  </button>
-                ))
-              )}
-            </CardContent>
-          </Card>
-
-          {/* 최근 완료 업무 & 보고서 */}
-          <Card data-testid="desktop-completed-card">
-            <CardHeader>
-              <CardTitle className="flex items-center justify-between text-sm">
-                <span>최근 완료 업무 ({(completedIssuesQuery.data ?? []).length}건)</span>
-                <a
-                  href="/issues?status=done"
-                  className="text-xs font-normal text-primary hover:underline"
-                >
-                  전체 →
-                </a>
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-2 text-xs">
-              {completedIssuesState.kind !== "data" ? (
-                <StateNotice
-                  state={completedIssuesState}
-                  loadingText="완료 데이터 로딩 중"
-                  emptyText="완료된 업무 없음"
-                  errorPrefix="완료 데이터 조회 실패"
-                />
-              ) : (
-                (completedIssuesQuery.data ?? []).slice(0, 3).map((issue) => {
-                  const reportComment = jarvisReportCommentByIssueId.get(issue.id);
-                  return (
-                    <a
-                      key={issue.id}
-                      href={reportComment ? `/issues/${issue.id}#comment-${reportComment.id}` : `/issues/${issue.id}`}
-                      className="flex items-center justify-between gap-2 border-t pt-2 first:border-t-0 first:pt-0 hover:bg-muted/40 rounded p-1 -mx-1 transition-colors"
-                      data-testid={`desktop-completed-item-${issue.id}`}
-                    >
-                      <span className="truncate font-medium">
-                        {issue.identifier ? `${issue.identifier}: ` : ""}{issue.title}
-                      </span>
-                      <span className="shrink-0 text-xs text-primary">보고서/산출물 →</span>
-                    </a>
-                  );
-                })
-              )}
-            </CardContent>
-          </Card>
-
-          {selectedCompanyId ? <DecisionQueueRail companyId={selectedCompanyId} /> : null}
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-sm">최근 활동</CardTitle>
-            </CardHeader>
-            <CardContent className="p-0">
-              <ActivityFeed className="max-h-80 overflow-auto p-3" />
-            </CardContent>
-          </Card>
-        </aside>
+        {/* 우측 CEO Control Rail */}
+        <AIOfficeCeoControlRail
+          companyId={selectedCompanyId ?? ""}
+          allPendingApprovals={allPendingApprovals}
+          isApprovalsLoading={pendingApprovalsCombined.isLoading}
+          approvalsErrorMessage={pendingApprovalsState.kind === "error" ? pendingApprovalsState.message : null}
+          inReviewIssues={inReviewIssuesQuery.data ?? []}
+          isInReviewLoading={inReviewIssuesQuery.isLoading}
+          inReviewErrorMessage={inReviewIssuesState.kind === "error" ? inReviewIssuesState.message : null}
+          completedIssues={completedIssuesQuery.data ?? []}
+          isCompletedLoading={completedIssuesQuery.isLoading}
+          completedErrorMessage={completedIssuesState.kind === "error" ? completedIssuesState.message : null}
+          blockedOrOfflineAgents={blockedOrOfflineAgents}
+          isAgentsLoading={agentsState.kind === "loading" || liveRunsState.kind === "loading"}
+          agentsErrorMessage={agentsState.kind === "error" ? agentsState.message : null}
+          agents={agents}
+          jarvisReportCommentByIssueId={jarvisReportCommentByIssueId}
+          onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
+        />
       </div>
       )}
 

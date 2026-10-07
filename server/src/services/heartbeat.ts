@@ -16628,6 +16628,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(approvals.companyId, agent.companyId),
               eq(approvals.type, "request_board_approval"),
               eq(approvals.status, "approved"),
+              sql`${approvals.payload} ->> 'source' = 'risk_guard'`,
+              eq(approvals.taskFingerprint, canonicalFingerprint),
+              isNull(approvals.supersededByApprovalId),
               or(
                 isNull(approvals.consumedAt),
                 eq(approvals.consumedByRunId, rootRunId),
@@ -16651,6 +16654,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(approvals.status, "approved"),
               sql`${approvals.payload} ->> 'source' = 'risk_guard'`,
               eq(approvals.taskFingerprint, canonicalFingerprint),
+              isNull(approvals.supersededByApprovalId),
               or(
                 isNull(approvals.consumedAt),
                 eq(approvals.consumedByRunId, rootRunId),
@@ -18952,6 +18956,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
 
+        if (opts.idempotencyKey) {
+          const existingWake = await tx
+            .select({ runId: agentWakeupRequests.runId })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+                ne(agentWakeupRequests.status, "skipped"),
+              ),
+            )
+            .orderBy(asc(agentWakeupRequests.requestedAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existingWake) {
+            const existingRun = existingWake.runId
+              ? await tx
+                .select()
+                .from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, existingWake.runId))
+                .then((rows) => rows[0] ?? null)
+              : null;
+            return { kind: "deduplicated" as const, run: existingRun };
+          }
+        }
+
         const issue = await tx
           .select({
             id: issues.id,
@@ -19717,6 +19748,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
+      if (outcome.kind === "deduplicated") return outcome.run;
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
@@ -19806,6 +19838,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );
 
+      if (opts.idempotencyKey) {
+        const existingWake = await tx
+          .select({ runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+              ne(agentWakeupRequests.status, "skipped"),
+            ),
+          )
+          .orderBy(asc(agentWakeupRequests.requestedAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingWake) {
+          const existingRun = existingWake.runId
+            ? await tx
+              .select()
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, existingWake.runId))
+              .then((rows) => rows[0] ?? null)
+            : null;
+          return { kind: "deduplicated" as const, run: existingRun };
+        }
+      }
+
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {
         const now = new Date();
@@ -19887,6 +19946,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (queueOutcome.kind === "skipped") return null;
+    if (queueOutcome.kind === "deduplicated") return queueOutcome.run;
     const newRun = queueOutcome.run;
 
     publishLiveEvent({

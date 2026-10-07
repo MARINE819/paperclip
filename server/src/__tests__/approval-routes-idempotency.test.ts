@@ -31,6 +31,7 @@ const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
+const mockCheckApprovalIdempotency = vi.hoisted(() => vi.fn());
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
@@ -40,6 +41,10 @@ function registerModuleMocks() {
     issueApprovalService: () => mockIssueApprovalService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
+  }));
+  vi.doMock("../services/approval-lifecycle.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../services/approval-lifecycle.js")>()),
+    checkApprovalIdempotency: mockCheckApprovalIdempotency,
   }));
 }
 
@@ -76,11 +81,13 @@ function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "r
   return {
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          then: async (resolve: (rows: unknown[]) => unknown) => resolve(
-            Object.keys(selection).includes("contextSnapshot") ? runRows : [],
-          ),
-        })),
+        where: vi.fn(() => {
+          const rows = Object.keys(selection).includes("contextSnapshot") ? runRows : [];
+          return {
+            limit: vi.fn(async () => rows.slice(0, 1)),
+            then: async (resolve: (value: unknown[]) => unknown) => resolve(rows),
+          };
+        }),
       })),
     })),
   } as any;
@@ -133,6 +140,8 @@ describe("approval routes idempotent retries", () => {
     mockSecretService.normalizeHireApprovalPayloadForPersistence.mockReset();
     mockLogActivity.mockReset();
     mockAccessService.decide.mockReset();
+    mockCheckApprovalIdempotency.mockReset();
+    mockCheckApprovalIdempotency.mockResolvedValue({ kind: "proceed" });
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
       action: "company_scope:read",
@@ -207,13 +216,89 @@ describe("approval routes idempotent retries", () => {
       }),
     );
 
-    // Duplicate approve on an already-resolved approval must not emit a second wake.
+    // Duplicate approve performs a recovery attempt, but the deterministic
+    // key lets the real heartbeat service reuse the already-queued wake.
     mockApprovalService.approve.mockResolvedValueOnce({ approval: approved, applied: false });
     const res2 = await request(await createApp())
       .post(`/api/approvals/${approvalId}/approve`)
       .send({});
     expect(res2.status).toBe(200);
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(2);
+    expect(mockHeartbeatService.wakeup.mock.calls[0]?.[1]?.idempotencyKey).toBe(
+      `approval-resume:${approvalId}:${requestedByAgentId}`,
+    );
+    expect(mockHeartbeatService.wakeup.mock.calls[1]?.[1]?.idempotencyKey).toBe(
+      `approval-resume:${approvalId}:${requestedByAgentId}`,
+    );
+  });
+
+  it("recovers a failed Risk Guard resume through already_applied without reapplying approval", async () => {
+    const approvalId = "approval-recovery-1";
+    const requestedByAgentId = "agent-recovery-1";
+    const issueId = "issue-recovery-1";
+    const pending = {
+      id: approvalId,
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: { source: "risk_guard", issueId },
+      requestedByAgentId,
+    };
+    const approved = { ...pending, status: "approved" };
+
+    mockApprovalService.getById.mockResolvedValue(pending);
+    mockApprovalService.approve
+      .mockResolvedValueOnce({ approval: approved, applied: true, outcome: "applied" })
+      .mockResolvedValueOnce({ approval: approved, applied: false, outcome: "already_applied" });
+    mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: issueId }]);
+    mockHeartbeatService.wakeup
+      .mockRejectedValueOnce(new Error("temporary queue failure"))
+      .mockResolvedValueOnce({ id: "recovered-wake" });
+
+    const app = await createApp();
+    const first = await request(app).post(`/api/approvals/${approvalId}/approve`).send({});
+    expect(first.status).toBe(503);
+    expect(first.body.reason).toBe("approval_resume_failed");
+
+    const recovered = await request(app).post(`/api/approvals/${approvalId}/approve`).send({});
+    expect(recovered.status).toBe(200);
+    expect(mockApprovalService.approve).toHaveBeenCalledTimes(2);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(2);
+    expect(mockHeartbeatService.wakeup.mock.calls[0]?.[1]?.idempotencyKey).toBe(
+      mockHeartbeatService.wakeup.mock.calls[1]?.[1]?.idempotencyKey,
+    );
+  });
+
+  it("recovers an approved Risk Guard resume on an idempotency replay", async () => {
+    const approvalId = "approval-replay-recovery-1";
+    const requestedByAgentId = "agent-replay-recovery-1";
+    const approved = {
+      id: approvalId,
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "approved",
+      payload: { source: "risk_guard", issueId: "issue-replay-recovery-1" },
+      requestedByAgentId,
+    };
+    mockApprovalService.getById.mockResolvedValue(approved);
+    mockCheckApprovalIdempotency.mockResolvedValueOnce({
+      kind: "replay",
+      httpStatus: 200,
+      body: { id: approvalId, status: "approved" },
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/approvals/${approvalId}/approve`)
+      .send({ idempotencyKey: "original-decision" });
+
+    expect(res.status).toBe(200);
+    expect(mockApprovalService.approve).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      requestedByAgentId,
+      expect.objectContaining({
+        idempotencyKey: `approval-resume:${approvalId}:${requestedByAgentId}`,
+      }),
+    );
   });
 
   it("does not emit duplicate rejection logs when reject is already resolved", async () => {

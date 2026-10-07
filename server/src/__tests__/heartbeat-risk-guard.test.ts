@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, desc, eq } from "drizzle-orm";
-import { agents, approvals, companies, createDb, heartbeatRuns, issueApprovals, issues } from "@paperclipai/db";
+import { agentWakeupRequests, agents, approvals, companies, createDb, heartbeatRuns, issueApprovals, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -908,6 +908,93 @@ describeEmbeddedPostgres("Heartbeat Risk Guard — Approval Lifecycle Security i
     await heartbeat.resumeQueuedRuns();
     return (await waitForRunToFinish(heartbeat, id))!;
   }
+
+  it("RESUME-IDEMPOTENCY-01: concurrent recovery wakes with one deterministic key create one execution", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue(
+      "ResumeIdempotency01",
+      "Read the current system logs.",
+    );
+    await db
+      .update(issues)
+      .set({ title: "Read system logs", updatedAt: new Date() })
+      .where(eq(issues.id, issueId));
+
+    const options = {
+      source: "automation" as const,
+      triggerDetail: "system" as const,
+      reason: "approval_approved",
+      idempotencyKey: `approval-resume:test-approval:${agentId}`,
+      payload: { approvalId: "test-approval", issueId, prompt: "Read the current system logs." },
+      contextSnapshot: { issueId, taskId: issueId, prompt: "Read the current system logs." },
+      requestedByActorType: "user" as const,
+      requestedByActorId: "responsible-user",
+    };
+
+    const [first, second] = await Promise.all([
+      heartbeat.wakeup(agentId, options),
+      heartbeat.wakeup(agentId, options),
+    ]);
+
+    expect(first?.id).toBeTruthy();
+    expect(second?.id).toBe(first?.id);
+    await heartbeat.drainActiveRunExecutions();
+
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.idempotencyKey, options.idempotencyKey),
+        ),
+    );
+    expect(wakeRows).toHaveLength(1);
+    const resumeRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.wakeupRequestId, wakeRows[0]!.id));
+    expect(resumeRuns).toHaveLength(1);
+  }, 20_000);
+
+  it("APPROVAL-SHADOW-01: a newer unrelated approval cannot hide the exact valid Risk Guard approval", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue("ApprovalShadow01");
+    const intercepted = await wakeAndAwait(heartbeat, agentId, issueId);
+    const exactApprovalId = await approveLatest(companyId, issueId);
+
+    const [unrelated] = await db
+      .insert(approvals)
+      .values({
+        companyId,
+        type: "request_board_approval",
+        requestedByAgentId: agentId,
+        status: "approved",
+        taskFingerprint: "not-the-current-task-fingerprint",
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+        payload: { source: "unrelated_approval", issueId },
+        decidedByUserId: "board-tester",
+        decidedAt: new Date(),
+      })
+      .returning();
+    await db.insert(issueApprovals).values({
+      companyId,
+      issueId,
+      approvalId: unrelated.id,
+      linkedByUserId: "board-tester",
+    });
+
+    const resumed = await insertQueuedRun(heartbeat, {
+      companyId,
+      agentId,
+      contextSnapshot: intercepted.contextSnapshot,
+    });
+
+    expect(resumed.status).toBe("succeeded");
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+    const [exactApproval] = await db.select().from(approvals).where(eq(approvals.id, exactApprovalId));
+    const [unrelatedAfter] = await db.select().from(approvals).where(eq(approvals.id, unrelated.id));
+    expect(exactApproval.consumedAt).not.toBeNull();
+    expect(unrelatedAfter.consumedAt).toBeNull();
+  }, 20_000);
 
   it("RETRY-01: first run consumes the approval and executes normally", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue("Retry01");

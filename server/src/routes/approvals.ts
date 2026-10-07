@@ -1,7 +1,7 @@
-import { Router, type Request } from "express";
+import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { activityLog, heartbeatRuns, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import {
   addApprovalCommentSchema,
@@ -74,6 +74,10 @@ function projectApprovalResponse(approval: ApprovalRecord) {
     effectiveStatus: effectiveApprovalStatus(approval),
     fingerprintStatus: fingerprintStatus(approval),
   };
+}
+
+function isRiskGuardApproval(approval: Pick<ApprovalRecord, "payload">) {
+  return parseObject(approval.payload).source === "risk_guard";
 }
 
 function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
@@ -247,12 +251,31 @@ export function approvalRoutes(
     }
 
     let primaryReviewPathWakeCovered = false;
+    let requesterWakeSucceeded = true;
     if (approval.requestedByAgentId) {
-      try {
-        const wakeRun = await heartbeat.wakeup(approval.requestedByAgentId, {
+      const priorQueuedResume = await db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, approval.companyId),
+            eq(activityLog.action, "approval.requester_wakeup_queued"),
+            eq(activityLog.entityType, "approval"),
+            eq(activityLog.entityId, approval.id),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (priorQueuedResume) {
+        primaryReviewPathWakeCovered = Boolean(primaryReviewPathContext);
+      } else {
+        try {
+          const wakeRun = await heartbeat.wakeup(approval.requestedByAgentId, {
           source: "automation",
           triggerDetail: "system",
           reason: "approval_approved",
+          idempotencyKey: `approval-resume:${approval.id}:${approval.requestedByAgentId}`,
           payload: {
             approvalId: approval.id,
             approvalStatus: approval.status,
@@ -275,43 +298,45 @@ export function approvalRoutes(
             ...(primaryReviewPathContext ?? {}),
           },
         });
-        primaryReviewPathWakeCovered = Boolean(wakeRun && primaryReviewPathContext);
+          primaryReviewPathWakeCovered = Boolean(wakeRun && primaryReviewPathContext);
 
-        await logActivity(db, {
-          companyId: approval.companyId,
-          actorType: "user",
-          actorId: req.actor.userId ?? "board",
-          action: "approval.requester_wakeup_queued",
-          entityType: "approval",
-          entityId: approval.id,
-          details: {
-            requesterAgentId: approval.requestedByAgentId,
-            wakeRunId: wakeRun?.id ?? null,
-            linkedIssueIds,
-          },
-        });
-      } catch (err) {
-        logger.warn(
-          {
-            err,
-            approvalId: approval.id,
-            requestedByAgentId: approval.requestedByAgentId,
-          },
-          "failed to queue requester wakeup after approval",
-        );
-        await logActivity(db, {
-          companyId: approval.companyId,
-          actorType: "user",
-          actorId: req.actor.userId ?? "board",
-          action: "approval.requester_wakeup_failed",
-          entityType: "approval",
-          entityId: approval.id,
-          details: {
-            requesterAgentId: approval.requestedByAgentId,
-            linkedIssueIds,
-            error: err instanceof Error ? err.message : String(err),
-          },
-        });
+          await logActivity(db, {
+            companyId: approval.companyId,
+            actorType: "user",
+            actorId: req.actor.userId ?? "board",
+            action: "approval.requester_wakeup_queued",
+            entityType: "approval",
+            entityId: approval.id,
+            details: {
+              requesterAgentId: approval.requestedByAgentId,
+              wakeRunId: wakeRun?.id ?? null,
+              linkedIssueIds,
+            },
+          });
+        } catch (err) {
+          requesterWakeSucceeded = false;
+          logger.warn(
+            {
+              err,
+              approvalId: approval.id,
+              requestedByAgentId: approval.requestedByAgentId,
+            },
+            "failed to queue requester wakeup after approval",
+          );
+          await logActivity(db, {
+            companyId: approval.companyId,
+            actorType: "user",
+            actorId: req.actor.userId ?? "board",
+            action: "approval.requester_wakeup_failed",
+            entityType: "approval",
+            entityId: approval.id,
+            details: {
+              requesterAgentId: approval.requestedByAgentId,
+              linkedIssueIds,
+              error: err instanceof Error ? err.message : String(err),
+            },
+          });
+        }
       }
     }
 
@@ -325,6 +350,20 @@ export function approvalRoutes(
         ? { agentId: approval.requestedByAgentId, issueId: primaryIssueId }
         : null,
       requestedByUserId: req.actor.userId ?? "board",
+    });
+
+    return requesterWakeSucceeded;
+  }
+
+  async function recoverRiskGuardResume(req: Request, approval: ApprovalRecord) {
+    if (approval.status !== "approved" || !isRiskGuardApproval(approval)) return true;
+    return runApproveSideEffects(req, approval);
+  }
+
+  function respondResumeFailed(res: Response) {
+    res.status(503).json({
+      error: "Approval was recorded, but execution resume could not be queued. Retry this approval request to recover.",
+      reason: "approval_resume_failed",
     });
   }
 
@@ -569,8 +608,14 @@ export function approvalRoutes(
           throw err;
         }
 
-        if (applied && approvalForSideEffects) {
-          await runApproveSideEffects(req, approvalForSideEffects);
+        if (approvalForSideEffects) {
+          const resumeSucceeded = applied
+            ? await runApproveSideEffects(req, approvalForSideEffects)
+            : await recoverRiskGuardResume(req, approvalForSideEffects);
+          if (!resumeSucceeded) {
+            respondResumeFailed(res);
+            return;
+          }
         }
 
         res.status(httpStatus).json(body);
@@ -610,7 +655,14 @@ export function approvalRoutes(
             ...boardKeySourceDetails(req),
           },
         });
-        await runApproveSideEffects(req, approval);
+      }
+
+      const resumeSucceeded = applied
+        ? await runApproveSideEffects(req, approval)
+        : await recoverRiskGuardResume(req, approval);
+      if (!resumeSucceeded) {
+        respondResumeFailed(res);
+        return;
       }
 
       res.json(projectApprovalResponse(approval));
@@ -632,6 +684,11 @@ export function approvalRoutes(
       return;
     }
     if (fastPath.kind === "replay") {
+      const resumeSucceeded = await recoverRiskGuardResume(req, existingApproval);
+      if (!resumeSucceeded) {
+        respondResumeFailed(res);
+        return;
+      }
       res.status(fastPath.httpStatus).json(fastPath.body);
       return;
     }
@@ -749,7 +806,21 @@ export function approvalRoutes(
     });
 
     if (applied && approvalForSideEffects) {
-      await runApproveSideEffects(req, approvalForSideEffects);
+      const resumeSucceeded = await runApproveSideEffects(req, approvalForSideEffects);
+      if (!resumeSucceeded) {
+        respondResumeFailed(res);
+        return;
+      }
+    } else if (httpStatus === 200) {
+      const recoveryApproval = approvalForSideEffects
+        ?? (existingApproval.status === "approved" ? existingApproval : await svc.getById(id));
+      if (recoveryApproval) {
+        const resumeSucceeded = await recoverRiskGuardResume(req, recoveryApproval);
+        if (!resumeSucceeded) {
+          respondResumeFailed(res);
+          return;
+        }
+      }
     }
 
     res.status(httpStatus).json(body);

@@ -47,7 +47,11 @@ function createRouteDb() {
   const db: any = {
     select: vi.fn(() => ({
       from: vi.fn(() => ({
-        where: vi.fn(() => Promise.resolve([])),
+        where: vi.fn(() => {
+          const result: any = Promise.resolve([]);
+          result.limit = vi.fn(() => Promise.resolve([]));
+          return result;
+        }),
       })),
     })),
     transaction: vi.fn(async (cb: (tx: any) => Promise<any>) => {

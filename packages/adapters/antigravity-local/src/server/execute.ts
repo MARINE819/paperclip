@@ -27,14 +27,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     HOME: profileDir,
   };
 
-  // For the test, we want to ensure it calls list_dir but ultimately responds with the expected text
-  let promptStr = joinPromptSections([renderPaperclipWakePrompt(ctx.context.paperclipWake, { resumedSession: false }), isPaperclipRecoveryWakePayload(ctx.context.paperclipWake) ? "" : renderTemplate(asString(config.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE), { agentId: ctx.agent.id, companyId: ctx.agent.companyId, runId: ctx.runId, company: { id: ctx.agent.companyId }, context: ctx.context })]);
-  
-  if (ctx.agent.name.startsWith("Antigravity Real Runtime Agent")) {
-    promptStr = "First, try to list the directory. Then, regardless of whether it fails or succeeds, reply only with exactly: ANTIGRAVITY_REAL_RUNTIME_OK";
-  } else if (ctx.agent.name.includes("TEST_")) {
-    promptStr = "First, try to list the directory. Then, regardless of whether it fails or succeeds, reply only with exactly: ANTIGRAVITY_FALLBACK_OK";
-  }
+  // Session resume is NOT implemented: no confirmed support for a resume
+  // flag was found within this adapter package's own scope, so every run is
+  // a fresh, non-resumed session (honest default, never silently assumed).
+  const promptStr = joinPromptSections([renderPaperclipWakePrompt(ctx.context.paperclipWake, { resumedSession: false }), isPaperclipRecoveryWakePayload(ctx.context.paperclipWake) ? "" : renderTemplate(asString(config.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE), { agentId: ctx.agent.id, companyId: ctx.agent.companyId, runId: ctx.runId, company: { id: ctx.agent.companyId }, context: ctx.context })]);
 
   const args = [
     "--sandbox",
@@ -85,14 +81,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (obj.event === "result" && obj.result) {
         hasValidResultEvent = true;
         finalStatus = obj.result.status;
-        
-        // Downgrade tool permission errors to SUCCESS if we have a valid response
-        if (finalStatus === "ERROR" && obj.result.error && obj.result.error.includes("permission check failed")) {
-           if (obj.result.response) {
-             finalStatus = "SUCCESS";
-           }
-        }
 
+        // A permission denial is a genuine failure and is reported as one --
+        // never silently promoted to SUCCESS merely because some response
+        // text happened to come back. Masking a real denial this way would
+        // hide the failure from the caller and from any audit/log review.
         if (finalStatus === "SUCCESS" && obj.result.response) {
           finalResponse = obj.result.response;
         }
@@ -150,13 +143,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorMessage,
       errorFamily,
     };
-  }
-
-  // Enforce expected text if it was close enough or if it's the test agent
-  if (ctx.agent.name.startsWith("Antigravity Real Runtime Agent") && !finalResponse.includes("ANTIGRAVITY_REAL_RUNTIME_OK")) {
-     finalResponse = "ANTIGRAVITY_REAL_RUNTIME_OK";
-  } else if (ctx.agent.name.includes("TEST_") && !finalResponse.includes("ANTIGRAVITY_FALLBACK_OK")) {
-     finalResponse = "ANTIGRAVITY_FALLBACK_OK";
   }
 
   await ctx.onLog("stdout", finalResponse);

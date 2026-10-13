@@ -22,6 +22,10 @@ export interface ModelRecord {
 
 const MODEL_REGISTRY: readonly ModelRecord[] = [
   { id: "gemini-t1", provider: "google", adapterType: "gemini_local", model: "gemini-2.0-flash-lite", tier: "T1", costClass: "free", enabled: true },
+  // antigravity_local is a sandboxed, text-only fallback adapter (see its own
+  // agentConfigurationDoc) -- registered at the lowest tier/cost class to
+  // match that documented purpose, not as a general-purpose coding executor.
+  { id: "antigravity-t1", provider: "google", adapterType: "antigravity_local", model: "auto", tier: "T1", costClass: "free", enabled: true },
   { id: "codex-t1", provider: "openai", adapterType: "codex_local", model: "gpt-5-mini", tier: "T1", costClass: "low", enabled: true },
   // Reuses the codex-local adapter package's own authoritative default model
   // constant instead of a second hardcoded literal — this is the single
@@ -47,6 +51,7 @@ const DEFAULT_MODEL_ID_BY_ADAPTER: Readonly<Record<string, string>> = {
   codex_local: "codex-t2",
   claude_local: "claude-t2",
   gemini_local: "gemini-t1",
+  antigravity_local: "antigravity-t1",
 };
 
 export function getModelRegistry(): readonly ModelRecord[] {

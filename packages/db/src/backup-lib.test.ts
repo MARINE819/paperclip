@@ -44,6 +44,84 @@ async function createSiblingDatabase(connectionString: string, databaseName: str
   return targetUrl.toString();
 }
 
+const createSpecialValuesSql = `
+  CREATE TABLE "public"."copy_special_values" (
+    "id" uuid PRIMARY KEY,
+    "note" text
+  );
+  INSERT INTO "public"."copy_special_values" ("id", "note") VALUES
+    ('11111111-1111-4111-8111-111111111111', NULL),
+    ('22222222-2222-4222-8222-222222222222', 'tab\there'),
+    ('33333333-3333-4333-8333-333333333333', 'line one\nline two'),
+    ('44444444-4444-4444-8444-444444444444', 'back\\slash'),
+    ('55555555-5555-4555-8555-555555555555', '한글 데이터');
+`;
+
+const selectSpecialValuesSql = `
+  SELECT "id", "note" FROM "public"."copy_special_values" ORDER BY "id"
+`;
+
+const expectedSpecialValueRows = [
+  { id: "11111111-1111-4111-8111-111111111111", note: null },
+  { id: "22222222-2222-4222-8222-222222222222", note: "tab\there" },
+  { id: "33333333-3333-4333-8333-333333333333", note: "line one\nline two" },
+  { id: "44444444-4444-4444-8444-444444444444", note: "back\\slash" },
+  { id: "55555555-5555-4555-8555-555555555555", note: "한글 데이터" },
+];
+
+const createCopyThenSqlSql = `
+  CREATE TABLE "public"."copy_then_sql" (
+    "id" bigserial PRIMARY KEY,
+    "note" text NOT NULL
+  );
+  INSERT INTO "public"."copy_then_sql" ("note")
+  VALUES ('first'), ('second'), ('third');
+`;
+
+const copyThenSqlCopyHeaderMarker = 'COPY "public"."copy_then_sql"';
+
+const selectCopyThenSqlSql = `
+  SELECT "note" FROM "public"."copy_then_sql" ORDER BY "id"
+`;
+
+const expectedCopyThenSqlRows = [
+  { note: "first" },
+  { note: "second" },
+  { note: "third" },
+];
+
+const insertCopyThenSqlSql = `
+  INSERT INTO "public"."copy_then_sql" ("note")
+  VALUES ('fourth')
+  RETURNING "id", "note"
+`;
+
+const malformedCopyHeaderBackupLines = [
+  "-- Paperclip database backup",
+  "-- Created: 2026-04-06T00:00:00.000Z",
+  "",
+  "BEGIN;",
+  "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+  "CREATE TABLE public.malformed_copy_test (",
+  "  id integer primary key,",
+  "  payload text not null",
+  ");",
+  "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+  'COPY "public"."malformed_copy_test (id, payload) FROM stdin;',
+  "1\tbad",
+  "\\.",
+  "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+  "COMMIT;",
+  "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+];
+
+const malformedCopyHeaderBackupText = malformedCopyHeaderBackupLines.join("\n");
+
+const selectMalformedCopyTestTableSql = `
+  SELECT table_name FROM information_schema.tables
+  WHERE table_schema = 'public' AND table_name = 'malformed_copy_test'
+`;
+
 afterEach(async () => {
   while (cleanups.length > 0) {
     const cleanup = cleanups.pop();
@@ -595,6 +673,150 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       }
     },
     60_000,
+  );
+
+  it(
+    "round-trips NULL, tab, newline, backslash, and Korean UTF-8 values through COPY",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_copy_special_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-copy-special-backup-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+
+      try {
+        await sourceSql.unsafe(createSpecialValuesSql);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-copy-special-test",
+          backupEngine: "auto",
+        });
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        const rows = await restoreSql.unsafe<{ id: string; note: string | null }[]>(
+          selectSpecialValuesSql,
+        );
+        expect(rows).toEqual(expectedSpecialValueRows);
+      } finally {
+        if (originalPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+        }
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "executes a plain SQL statement (sequence setval) right after a COPY block",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_copy_then_sql_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-copy-then-sql-backup-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+
+      try {
+        await sourceSql.unsafe(createCopyThenSqlSql);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-copy-then-sql-test",
+          backupEngine: "auto",
+        });
+
+        const backupSql = gunzipSync(
+          await fs.promises.readFile(result.backupFile),
+        ).toString("utf8");
+        const copyIdx = backupSql.indexOf(copyThenSqlCopyHeaderMarker);
+        const setvalIdx = backupSql.indexOf("SELECT setval(");
+        expect(copyIdx).toBeGreaterThan(-1);
+        expect(setvalIdx).toBeGreaterThan(copyIdx);
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        const rows = await restoreSql.unsafe<{ note: string }[]>(
+          selectCopyThenSqlSql,
+        );
+        expect(rows).toEqual(expectedCopyThenSqlRows);
+
+        const insertedRow = await restoreSql.unsafe<
+          { id: string; note: string }[]
+        >(insertCopyThenSqlSql);
+        expect(insertedRow[0]?.note).toBe("fourth");
+        expect(Number(insertedRow[0]?.id)).toBeGreaterThan(3);
+      } finally {
+        if (originalPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+        }
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "rejects a malformed COPY header fail-closed instead of misexecuting it",
+    async () => {
+      const restoreConnectionString = await createTempDatabase();
+      const restoreSql = postgres(restoreConnectionString, {
+        max: 1,
+        onnotice: () => {},
+      });
+      const backupDir = createTempDir("paperclip-db-restore-malformed-copy-");
+      const backupFile = path.join(backupDir, "malformed-copy.sql");
+
+      try {
+        await fs.promises.writeFile(
+          backupFile,
+          malformedCopyHeaderBackupText,
+          "utf8",
+        );
+
+        await expect(
+          runDatabaseRestore({
+            connectionString: restoreConnectionString,
+            backupFile,
+          }),
+        ).rejects.toThrow("Malformed backup: invalid COPY FROM stdin header");
+
+        const tables = await restoreSql.unsafe<{ table_name: string }[]>(
+          selectMalformedCopyTestTableSql,
+        );
+        expect(tables).toEqual([]);
+      } finally {
+        await restoreSql.end();
+      }
+    },
+    20_000,
   );
 
   it(

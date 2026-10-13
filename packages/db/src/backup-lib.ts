@@ -3,7 +3,8 @@ import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
-import { pipeline } from "node:stream/promises";
+import { finished, pipeline } from "node:stream/promises";
+import { once } from "node:events";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
 
@@ -476,7 +477,31 @@ async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
   }
 }
 
-async function* readRestoreStatements(backupFile: string): AsyncGenerator<string> {
+const COPY_IDENTIFIER_PATTERN = String.raw`"(?:[^"]|"")*"`;
+
+const COPY_FROM_STDIN_HEADER_RE = new RegExp(
+  [
+    "^COPY ",
+    COPY_IDENTIFIER_PATTERN,
+    String.raw`\.`,
+    COPY_IDENTIFIER_PATTERN,
+    String.raw` \(`,
+    COPY_IDENTIFIER_PATTERN,
+    `(?:, ${COPY_IDENTIFIER_PATTERN})*`,
+    String.raw`\) FROM stdin;$`,
+  ].join(""),
+);
+
+const COPY_FROM_STDIN_TERMINATOR = String.raw`\.`;
+
+// Broadly detects any line that looks like it was meant to be a COPY
+// FROM stdin header but does not match COPY_FROM_STDIN_HEADER_RE exactly.
+const COPY_FROM_STDIN_LOOSE_RE = /^COPY .* FROM stdin;$/;
+
+async function* readRestoreStatements(
+  backupFile: string,
+  sql: ReturnType<typeof postgres>,
+): AsyncGenerator<string> {
   const raw = createReadStream(backupFile);
   const stream = backupFile.endsWith(".gz") ? raw.pipe(createGunzip()) : raw;
   stream.setEncoding("utf8");
@@ -492,6 +517,32 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
     return statement;
   };
 
+  const consumeCopyFromStdin = async (header: string): Promise<void> => {
+    const copyStream = await sql.unsafe(header).writable();
+    try {
+      let sawTerminator = false;
+      for await (const dataLine of reader) {
+        if (dataLine === COPY_FROM_STDIN_TERMINATOR) {
+          sawTerminator = true;
+          break;
+        }
+        if (!copyStream.write(`${dataLine}\n`)) {
+          await once(copyStream, "drain");
+        }
+      }
+      if (!sawTerminator) {
+        throw new Error("Malformed backup: unterminated COPY FROM stdin block");
+      }
+      copyStream.end();
+      await finished(copyStream);
+    } catch (error) {
+      const normalizedError =
+        error instanceof Error ? error : new Error(String(error));
+      copyStream.destroy(normalizedError);
+      throw normalizedError;
+    }
+  };
+
   try {
     for await (const line of reader) {
       if (line === STATEMENT_BREAKPOINT) {
@@ -501,6 +552,23 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
         }
         continue;
       }
+
+      if (COPY_FROM_STDIN_HEADER_RE.test(line)) {
+        const pendingIsOnlyComments = statementLines.every(
+          (pendingLine) => pendingLine.trim().length === 0 || pendingLine.trimStart().startsWith("--"),
+        );
+        if (!pendingIsOnlyComments) {
+          throw new Error("Malformed backup: COPY header appeared mid-statement");
+        }
+        statementLines = [];
+        await consumeCopyFromStdin(line);
+        continue;
+      }
+
+      if (COPY_FROM_STDIN_LOOSE_RE.test(line)) {
+        throw new Error("Malformed backup: invalid COPY FROM stdin header");
+      }
+
       statementLines.push(line);
     }
 
@@ -1191,7 +1259,7 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 
   try {
     await sql`SELECT 1`;
-    for await (const statement of readRestoreStatements(opts.backupFile)) {
+    for await (const statement of readRestoreStatements(opts.backupFile, sql)) {
       await sql.unsafe(statement).execute();
     }
   } catch (error) {

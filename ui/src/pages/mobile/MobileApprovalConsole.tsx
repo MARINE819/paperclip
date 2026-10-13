@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useNavigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCompany } from "../../context/CompanyContext";
@@ -7,10 +7,11 @@ import { approvalsApi } from "../../api/approvals";
 import { companiesApi } from "../../api/companies";
 import { healthApi } from "../../api/health";
 import { queryKeys } from "../../lib/queryKeys";
+import { isMuted, toggleMuted, playApprovalChime } from "../../lib/audio-chime";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { ShieldCheck, ShieldAlert, ShieldX, Clock, RefreshCw, Power } from "lucide-react";
+import { ShieldCheck, ShieldAlert, ShieldX, Clock, RefreshCw, Power, Volume2, VolumeX } from "lucide-react";
 import { startAuthentication, browserSupportsWebAuthn } from "@simplewebauthn/browser";
 import { webauthnApi } from "../../api/webauthn";
 
@@ -22,6 +23,12 @@ export function MobileApprovalConsole() {
   const [activeTab, setActiveTab] = useState<"pending" | "history">("pending");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isEmergencyActionPending, setIsEmergencyActionPending] = useState(false);
+  const [soundMuted, setSoundMuted] = useState(() => isMuted());
+
+  const handleToggleSound = () => {
+    const next = toggleMuted();
+    setSoundMuted(next);
+  };
 
   useEffect(() => {
     setBreadcrumbs([{ label: "모바일 관제탑" }]);
@@ -47,24 +54,104 @@ export function MobileApprovalConsole() {
   // as AIOfficeStatus.tsx) instead of a raw-status client filter — a raw
   // filter on `approvals` above would count long-expired approvals as still
   // "pending", which is exactly the bug this replaces.
-  const {
-    data: pendingStatusApprovals,
-    isLoading: isLoadingPending,
-    refetch: refetchPending,
-  } = useQuery({
+  const pendingStatusQuery = useQuery({
     queryKey: queryKeys.approvals.list(selectedCompanyId || "", "pending"),
     queryFn: () => approvalsApi.list(selectedCompanyId || "", "pending"),
     enabled: !!selectedCompanyId,
   });
-  const {
-    data: revisionRequestedApprovals,
-    isLoading: isLoadingRevisionRequested,
-    refetch: refetchRevisionRequested,
-  } = useQuery({
+  const revisionRequestedQuery = useQuery({
     queryKey: queryKeys.approvals.list(selectedCompanyId || "", "revision_requested"),
     queryFn: () => approvalsApi.list(selectedCompanyId || "", "revision_requested"),
     enabled: !!selectedCompanyId,
   });
+
+  const pendingStatusApprovals = pendingStatusQuery.data;
+  const isLoadingPending = pendingStatusQuery.isLoading;
+  const refetchPending = pendingStatusQuery.refetch;
+
+  const revisionRequestedApprovals = revisionRequestedQuery.data;
+  const isLoadingRevisionRequested = revisionRequestedQuery.isLoading;
+  const refetchRevisionRequested = revisionRequestedQuery.refetch;
+
+  const trackedCompanyIdRef = useRef<string | null>(null);
+  const baselineEstablishedRef = useRef(false);
+  const knownApprovalIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!selectedCompanyId) {
+      trackedCompanyIdRef.current = null;
+      baselineEstablishedRef.current = false;
+      knownApprovalIdsRef.current = new Set();
+      return;
+    }
+
+    if (trackedCompanyIdRef.current !== selectedCompanyId) {
+      trackedCompanyIdRef.current = selectedCompanyId;
+      baselineEstablishedRef.current = false;
+      knownApprovalIdsRef.current = new Set();
+    }
+
+    const isPendingSettled =
+      pendingStatusQuery.status === "success" &&
+      !pendingStatusQuery.isLoading &&
+      !pendingStatusQuery.isFetching &&
+      !pendingStatusQuery.isError &&
+      !pendingStatusQuery.isPlaceholderData &&
+      Array.isArray(pendingStatusQuery.data);
+
+    const isRevisionSettled =
+      revisionRequestedQuery.status === "success" &&
+      !revisionRequestedQuery.isLoading &&
+      !revisionRequestedQuery.isFetching &&
+      !revisionRequestedQuery.isError &&
+      !revisionRequestedQuery.isPlaceholderData &&
+      Array.isArray(revisionRequestedQuery.data);
+
+    if (!isPendingSettled || !isRevisionSettled) {
+      return;
+    }
+
+    const rawPending = pendingStatusQuery.data ?? [];
+    const rawRevision = revisionRequestedQuery.data ?? [];
+
+    const hasMismatchedCompany =
+      rawPending.some((a) => a.companyId !== selectedCompanyId) ||
+      rawRevision.some((a) => a.companyId !== selectedCompanyId);
+    if (hasMismatchedCompany) {
+      return;
+    }
+
+    const currentCompanyPending = [...rawPending, ...rawRevision].filter(
+      (a) => a.companyId === selectedCompanyId,
+    );
+
+    if (!baselineEstablishedRef.current) {
+      knownApprovalIdsRef.current = new Set(currentCompanyPending.map((a) => String(a.id)));
+      baselineEstablishedRef.current = true;
+    } else {
+      for (const approval of currentCompanyPending) {
+        const idStr = String(approval.id);
+        if (!knownApprovalIdsRef.current.has(idStr)) {
+          knownApprovalIdsRef.current.add(idStr);
+          playApprovalChime(approval.id, { cooldownMs: 10_000 });
+        }
+      }
+    }
+  }, [
+    selectedCompanyId,
+    pendingStatusQuery.status,
+    pendingStatusQuery.isLoading,
+    pendingStatusQuery.isFetching,
+    pendingStatusQuery.isError,
+    pendingStatusQuery.isPlaceholderData,
+    pendingStatusQuery.data,
+    revisionRequestedQuery.status,
+    revisionRequestedQuery.isLoading,
+    revisionRequestedQuery.isFetching,
+    revisionRequestedQuery.isError,
+    revisionRequestedQuery.isPlaceholderData,
+    revisionRequestedQuery.data,
+  ]);
 
   const emergencyPauseMutation = useMutation({
     mutationFn: () => companiesApi.emergencyPause(selectedCompanyId!),
@@ -189,15 +276,31 @@ export function MobileApprovalConsole() {
               PC Client: {isPcOnline ? "ONLINE" : "OFFLINE"}
             </span>
           </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-8 w-8 p-0"
-            onClick={handleManualRefresh}
-            disabled={isFetchingHealth || isLoadingApprovals}
-          >
-            <RefreshCw className={`h-4 w-4 ${isFetchingHealth ? "animate-spin" : ""}`} />
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 w-8 p-0"
+              onClick={handleToggleSound}
+              title={soundMuted ? "알림음 켜기" : "알림음 음소거"}
+              aria-label={soundMuted ? "알림음 켜기" : "알림음 음소거"}
+            >
+              {soundMuted ? (
+                <VolumeX className="h-4 w-4 text-muted-foreground" />
+              ) : (
+                <Volume2 className="h-4 w-4" />
+              )}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 w-8 p-0"
+              onClick={handleManualRefresh}
+              disabled={isFetchingHealth || isLoadingApprovals}
+            >
+              <RefreshCw className={`h-4 w-4 ${isFetchingHealth ? "animate-spin" : ""}`} />
+            </Button>
+          </div>
         </div>
 
         <div className="flex items-center justify-between border-t border-border/40 pt-3">

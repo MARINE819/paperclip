@@ -31,12 +31,25 @@ export type RunDatabaseBackupOptions = {
   onEvent?: (event: BackupLifecycleEvent) => void;
   /** Overrides the gzip-finalize timeout. Primarily for tests; defaults to 5 minutes. */
   gzipTimeoutMs?: number;
+  /**
+   * When true, retention pruning computes and reports exactly the same
+   * deletion-candidate set as a normal run, but never calls unlinkSync on
+   * any of them -- every backup file on disk is left untouched. Defaults to
+   * false (existing delete behavior, unchanged).
+   */
+  dryRun?: boolean;
 };
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
   sizeBytes: number;
   prunedCount: number;
+  /**
+   * Absolute paths of every backup file the retention policy identified as
+   * beyond its tier (the same set that is deleted when dryRun is false/unset,
+   * and the set that is left untouched when dryRun is true).
+   */
+  prunedFiles: string[];
 };
 
 export type RunDatabaseRestoreOptions = {
@@ -137,8 +150,13 @@ function monthlyRetentionCutoff(nowMs: number, monthlyMonths: number): number {
  * - Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
  * - Everything else is deleted
  */
-function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
-  if (!existsSync(backupDir)) return 0;
+function pruneOldBackups(
+  backupDir: string,
+  retention: BackupRetentionPolicy,
+  filenamePrefix: string,
+  dryRun = false,
+): { count: number; files: string[] } {
+  if (!existsSync(backupDir)) return { count: 0, files: [] };
 
   const now = Date.now();
   const dailyCutoff = now - Math.max(1, retention.dailyDays) * 24 * 60 * 60 * 1000;
@@ -195,11 +213,13 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
     toDelete.push(entry.fullPath);
   }
 
-  for (const filePath of toDelete) {
-    unlinkSync(filePath);
+  if (!dryRun) {
+    for (const filePath of toDelete) {
+      unlinkSync(filePath);
+    }
   }
 
-  return toDelete.length;
+  return { count: toDelete.length, files: toDelete };
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -614,11 +634,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         });
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
-        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+        const pruned = pruneOldBackups(opts.backupDir, retention, filenamePrefix, opts.dryRun ?? false);
         return {
           backupFile,
           sizeBytes,
-          prunedCount,
+          prunedCount: pruned.count,
+          prunedFiles: pruned.files,
         };
       } catch (error) {
         if (existsSync(backupFile)) {
@@ -1129,12 +1150,13 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
-    const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+    const pruned = pruneOldBackups(opts.backupDir, retention, filenamePrefix, opts.dryRun ?? false);
 
     return {
       backupFile,
       sizeBytes,
-      prunedCount,
+      prunedCount: pruned.count,
+      prunedFiles: pruned.files,
     };
   } catch (error) {
     await writer.abort();

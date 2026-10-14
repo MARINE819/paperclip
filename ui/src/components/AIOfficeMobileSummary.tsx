@@ -1,9 +1,12 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Agent, Approval, CostByAgentModel, DashboardSummary, Issue, IssueComment, IssueWorkProduct } from "@paperclipai/shared";
 import type { LiveRunForIssue } from "@/api/heartbeats";
 import { issuesApi } from "@/api/issues";
 import { approvalsApi } from "@/api/approvals";
 import { companiesApi } from "@/api/companies";
+import { webauthnApi } from "@/api/webauthn";
+import { isMuted, toggleMuted } from "@/lib/audio-chime";
+import { Link } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { VoiceCommandBar } from "@/components/VoiceCommandBar";
 import { AIOfficeJarvisTaskInstruction } from "@/components/AIOfficeJarvisTaskInstruction";
@@ -39,12 +42,17 @@ import {
   ExternalLink,
   FileCheck,
   FileText,
+  Fingerprint,
   GitBranch,
   GitCommit,
   Globe,
   Package,
   Server,
+  Shield,
   ShieldAlert,
+  Smartphone,
+  Volume2,
+  VolumeX,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
@@ -277,6 +285,40 @@ export function AIOfficeMobileSummary({
 
   const queryClient = useQueryClient();
 
+  const [soundMuted, setSoundMuted] = useState(() => isMuted());
+  const handleToggleSound = () => {
+    const next = toggleMuted();
+    setSoundMuted(next);
+  };
+
+  const [isStandalone, setIsStandalone] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return Boolean(
+      window.matchMedia?.("(display-mode: standalone)")?.matches ||
+      (navigator as unknown as { standalone?: boolean })?.standalone,
+    );
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mediaQuery = window.matchMedia("(display-mode: standalone)");
+    const handler = (e: MediaQueryListEvent) => {
+      setIsStandalone(e.matches || Boolean((navigator as unknown as { standalone?: boolean })?.standalone));
+    };
+    mediaQuery.addEventListener?.("change", handler);
+    return () => mediaQuery.removeEventListener?.("change", handler);
+  }, []);
+
+  const {
+    data: webauthnCredentials,
+    isLoading: isWebauthnLoading,
+    isError: isWebauthnError,
+  } = useQuery({
+    queryKey: ["webauthn-credentials", effectiveCompanyId],
+    queryFn: () => (effectiveCompanyId ? webauthnApi.listCredentials(effectiveCompanyId) : Promise.resolve([])),
+    enabled: !!effectiveCompanyId,
+  });
+
   const [emergencyConfirmOpen, setEmergencyConfirmOpen] = useState(false);
   const emergencyPauseMutation = useMutation({
     mutationFn: () => {
@@ -378,7 +420,107 @@ export function AIOfficeMobileSummary({
 
   return (
     <div className="space-y-4 pb-8" data-testid="ai-office-mobile-summary">
-      {/* 0. 모바일 경영진 안전 제어 및 음성 사령탑 바 (Executive Safe Action & Voice Bar) */}
+      {/* 0. 모바일 경영진 거버넌스 헤더 (Mobile Executive Governance Header) */}
+      <Card className="border-border bg-card shadow-xs" data-testid="mobile-governance-header">
+        <CardContent className="flex flex-col gap-2.5 p-3">
+          {/* 상단 행: 브랜드/타이틀, PWA standalone 상태, 음소거 토글 버튼 */}
+          <div className="flex items-center justify-between gap-2 min-w-0">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <Shield className="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
+              <span className="truncate text-xs font-semibold text-foreground">
+                경영진 거버넌스 사령탑
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1.5 shrink-0">
+              {/* PWA Standalone 상태 */}
+              <div
+                data-testid="mobile-pwa-status"
+                className="inline-flex items-center gap-1 rounded-full border border-border bg-muted/40 px-2 py-0.5 text-xs text-muted-foreground"
+              >
+                <Smartphone className="h-3 w-3 shrink-0" aria-hidden="true" />
+                <span>{isStandalone ? "PWA Standalone" : "Browser Web"}</span>
+              </div>
+
+              {/* 사운드 토글 버튼 (최소 h-9 w-9, aria-pressed={soundMuted}) */}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-9 w-9 min-h-9 min-w-9 p-0 shrink-0"
+                onClick={handleToggleSound}
+                aria-pressed={soundMuted}
+                aria-label={soundMuted ? "알림음 음소거 해제" : "알림음 음소거"}
+                title={soundMuted ? "알림음 음소거 해제" : "알림음 음소거"}
+                data-testid="mobile-sound-toggle-btn"
+              >
+                {soundMuted ? (
+                  <VolumeX className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                ) : (
+                  <Volume2 className="h-4 w-4 text-primary" aria-hidden="true" />
+                )}
+                <span className="sr-only">{soundMuted ? "음소거 상태" : "알림음 활성 상태"}</span>
+              </Button>
+            </div>
+          </div>
+
+          {/* 중간 행: WebAuthn 생체 인증 상태 (로딩/등록됨/미등록/에러) */}
+          <div className="flex items-center justify-between gap-2 border-t border-border/40 pt-2 text-xs">
+            <div className="flex items-center gap-1.5 min-w-0 text-muted-foreground">
+              <Fingerprint className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+              <span className="font-medium text-foreground">생체 인증(WebAuthn):</span>
+            </div>
+
+            <div data-testid="mobile-webauthn-status" className="shrink-0">
+              {isWebauthnLoading && !!effectiveCompanyId ? (
+                <span
+                  data-testid="mobile-webauthn-loading"
+                  className="inline-flex items-center rounded-full border border-border bg-muted/30 px-2 py-0.5 text-xs font-medium text-muted-foreground"
+                >
+                  확인 중...
+                </span>
+              ) : isWebauthnError ? (
+                <span
+                  data-testid="mobile-webauthn-error"
+                  className="inline-flex items-center rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-xs font-medium text-destructive"
+                >
+                  조회 실패
+                </span>
+              ) : (webauthnCredentials?.length ?? 0) > 0 ? (
+                <span
+                  data-testid="mobile-webauthn-registered"
+                  className="inline-flex items-center rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary"
+                >
+                  등록됨 ({webauthnCredentials?.length}개)
+                </span>
+              ) : (
+                <span
+                  data-testid="mobile-webauthn-unregistered"
+                  className="inline-flex items-center rounded-full border border-border bg-muted/40 px-2 py-0.5 text-xs font-medium text-muted-foreground"
+                >
+                  미등록
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* 하단 행: 모바일 승인 및 모바일 설정 네비게이션 링크 (min-h-9 준수) */}
+          <div className="flex items-center gap-2 border-t border-border/40 pt-2">
+            <Button size="sm" variant="outline" asChild className="min-h-9 flex-1 text-xs">
+              <Link to="/mobile/approvals" data-testid="mobile-header-approvals-link">
+                모바일 승인
+              </Link>
+            </Button>
+            <Button size="sm" variant="outline" asChild className="min-h-9 flex-1 text-xs">
+              <Link to="/mobile/settings" data-testid="mobile-header-settings-link">
+                모바일 설정
+              </Link>
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* 0.5 모바일 경영진 안전 제어 및 음성 사령탑 바 (Executive Safe Action & Voice Bar) */}
       <Card className="border-border bg-card shadow-xs" data-testid="mobile-safe-action-bar">
         <CardContent className="flex flex-col gap-3 p-3">
           <div className="flex items-center justify-between gap-2">
@@ -444,12 +586,12 @@ export function AIOfficeMobileSummary({
           </div>
           <div className="text-xl font-bold">{pendingApprovalsCount}건</div>
           {pendingApprovalsCount > 0 ? (
-            <a
-              href="/mobile/approvals"
+            <Link
+              to="/mobile/approvals"
               className="mt-1 flex items-center font-medium text-primary hover:underline"
             >
               모바일 승인 →
-            </a>
+            </Link>
           ) : (
             <span className="text-muted-foreground">대기 없음</span>
           )}
@@ -533,12 +675,12 @@ export function AIOfficeMobileSummary({
                   CEO 승인 대기 안건 ({pendingApprovalsCount}건)
                 </CardTitle>
               </div>
-              <a
-                href="/mobile/approvals"
+              <Link
+                to="/mobile/approvals"
                 className="text-xs font-medium text-primary hover:underline"
               >
                 전체 콘솔 →
-              </a>
+              </Link>
             </div>
           </CardHeader>
           <CardContent className="space-y-2 p-3 pt-1">
@@ -868,10 +1010,10 @@ export function AIOfficeMobileSummary({
 
           <div className="flex flex-wrap gap-2 pt-2 border-t">
             <Button size="sm" variant="outline" asChild className="flex-1">
-              <a href="/mobile/approvals">모바일 승인 콘솔</a>
+              <Link to="/mobile/approvals">모바일 승인 콘솔</Link>
             </Button>
             <Button size="sm" variant="outline" asChild className="flex-1">
-              <a href="/mobile/settings">모바일 설정</a>
+              <Link to="/mobile/settings">모바일 설정</Link>
             </Button>
           </div>
         </CardContent>

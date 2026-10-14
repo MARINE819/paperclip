@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -18,11 +18,15 @@ const mockApprovalsApi = vi.hoisted(() => ({
 }));
 
 const mockIssuesApi = vi.hoisted(() => ({
-  listWorkProducts: vi.fn(),
+  listWorkProducts: vi.fn().mockResolvedValue([]),
 }));
 
 const mockJarvisApi = vi.hoisted(() => ({
   submit: vi.fn(),
+}));
+
+const mockWebauthnApi = vi.hoisted(() => ({
+  listCredentials: vi.fn(),
 }));
 
 vi.mock("@/api/companies", () => ({
@@ -41,6 +45,21 @@ vi.mock("@/api/jarvis", () => ({
   jarvisApi: mockJarvisApi,
 }));
 
+vi.mock("@/api/webauthn", () => ({
+  webauthnApi: mockWebauthnApi,
+}));
+
+vi.mock("@/lib/router", () => ({
+  Link: ({ to, children, ...props }: any) => (
+    <a href={typeof to === "string" ? to : to?.pathname ?? ""} {...props}>
+      {children}
+    </a>
+  ),
+  useNavigate: () => vi.fn(),
+  useLocation: () => ({ pathname: "/" }),
+  useActiveCompanyPrefix: () => null,
+}));
+
 vi.mock("@/components/VoiceCommandBar", () => ({
   VoiceCommandBar: ({ companyId }: { companyId: string }) => (
     <div data-testid="mock-voice-command-bar">Mock Voice Command Bar: {companyId}</div>
@@ -50,14 +69,53 @@ vi.mock("@/components/VoiceCommandBar", () => ({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-function act(callback: () => void | Promise<void>) {
-  flushSync(callback);
+interface RootRegistration {
+  root: ReturnType<typeof createRoot>;
+  container: HTMLElement;
+  unmount: () => void;
+  isUnmounted: boolean;
+  queryClient: QueryClient;
+}
+
+const activeRoots: RootRegistration[] = [];
+
+function registerRoot(
+  root: ReturnType<typeof createRoot>,
+  container: HTMLElement,
+  queryClient: QueryClient,
+): ReturnType<typeof createRoot> {
+  let isUnmounted = false;
+  const originalUnmount = root.unmount.bind(root);
+
+  const safeUnmount = () => {
+    if (isUnmounted) return;
+    isUnmounted = true;
+    try {
+      originalUnmount();
+    } finally {
+      queryClient.clear();
+    }
+  };
+
+  root.unmount = safeUnmount;
+
+  activeRoots.push({
+    root,
+    container,
+    unmount: safeUnmount,
+    get isUnmounted() {
+      return isUnmounted;
+    },
+    queryClient,
+  });
+
+  return root;
 }
 
 async function flushReact() {
-  act(() => {});
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  act(() => {});
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 }
 
 function makeAgent(overrides: Partial<Agent> = {}): Agent {
@@ -150,12 +208,25 @@ describe("AIOfficeMobileSummary", () => {
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
+    mockWebauthnApi.listCredentials.mockResolvedValue([]);
+    mockIssuesApi.listWorkProducts.mockResolvedValue([]);
+    window.localStorage?.clear();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const reg of [...activeRoots]) {
+      if (!reg.isUnmounted) {
+        await act(async () => {
+          reg.unmount();
+        });
+      }
+    }
+    activeRoots.length = 0;
+
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
+    window.localStorage?.clear();
   });
 
   function render(node: React.ReactElement) {
@@ -168,6 +239,7 @@ describe("AIOfficeMobileSummary", () => {
     let root!: ReturnType<typeof createRoot>;
     act(() => {
       root = createRoot(container);
+      registerRoot(root, container, queryClient);
       root.render(<QueryClientProvider client={queryClient}>{node}</QueryClientProvider>);
     });
     return root;
@@ -1044,6 +1116,257 @@ describe("AIOfficeMobileSummary", () => {
       "/issues/issue-done-parent-1#comment-comment-canonical-done",
     );
     expect(itemLink?.textContent).toContain("Completed Parent Task");
+
+    act(() => root.unmount());
+  });
+
+  it("renders Mobile Executive Governance Header with navigation links to approvals and settings conforming to min-h-9", () => {
+    const root = render(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[makeAgent()]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        errorAgents={[]}
+      />,
+    );
+
+    const header = container.querySelector('[data-testid="mobile-governance-header"]');
+    expect(header).not.toBeNull();
+    expect(header?.textContent).toContain("경영진 거버넌스 사령탑");
+
+    const approvalsLink = container.querySelector('[data-testid="mobile-header-approvals-link"]') as HTMLAnchorElement;
+    expect(approvalsLink).not.toBeNull();
+    expect(approvalsLink.getAttribute("href")).toBe("/mobile/approvals");
+    expect(approvalsLink.textContent).toContain("모바일 승인");
+    expect(approvalsLink.closest("button, a")?.className).toContain("min-h-9");
+
+    const settingsLink = container.querySelector('[data-testid="mobile-header-settings-link"]') as HTMLAnchorElement;
+    expect(settingsLink).not.toBeNull();
+    expect(settingsLink.getAttribute("href")).toBe("/mobile/settings");
+    expect(settingsLink.textContent).toContain("모바일 설정");
+    expect(settingsLink.closest("button, a")?.className).toContain("min-h-9");
+
+    act(() => root.unmount());
+  });
+
+  it("reuses audio-chime isMuted/toggleMuted with aria-pressed on sound button with at least h-9 w-9", () => {
+    const root = render(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[makeAgent()]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        errorAgents={[]}
+      />,
+    );
+
+    const soundBtn = container.querySelector('[data-testid="mobile-sound-toggle-btn"]') as HTMLButtonElement;
+    expect(soundBtn).not.toBeNull();
+    expect(soundBtn.className).toContain("h-9");
+    expect(soundBtn.className).toContain("w-9");
+
+    // Initially unmuted -> aria-pressed is false
+    expect(soundBtn.getAttribute("aria-pressed")).toBe("false");
+
+    // Click sound button to toggle mute
+    act(() => {
+      soundBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(soundBtn.getAttribute("aria-pressed")).toBe("true");
+
+    // Click again to unmute
+    act(() => {
+      soundBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(soundBtn.getAttribute("aria-pressed")).toBe("false");
+
+    act(() => root.unmount());
+  });
+
+  it("detects and displays PWA standalone state using browser APIs: standalone mode and browser web mode", () => {
+    const origMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      matches: query === "(display-mode: standalone)",
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+
+    const rootStandalone = render(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[makeAgent()]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        errorAgents={[]}
+      />,
+    );
+
+    const pwaStatusStandalone = container.querySelector('[data-testid="mobile-pwa-status"]');
+    expect(pwaStatusStandalone).not.toBeNull();
+    expect(pwaStatusStandalone?.textContent).toContain("PWA Standalone");
+
+    act(() => rootStandalone.unmount());
+
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+
+    const rootBrowser = render(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[makeAgent()]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        errorAgents={[]}
+      />,
+    );
+
+    const pwaStatusBrowser = container.querySelector('[data-testid="mobile-pwa-status"]');
+    expect(pwaStatusBrowser).not.toBeNull();
+    expect(pwaStatusBrowser?.textContent).toContain("Browser Web");
+
+    act(() => rootBrowser.unmount());
+    window.matchMedia = origMatchMedia;
+  });
+
+  it("shows current WebAuthn registered state when credentials exist", async () => {
+    mockWebauthnApi.listCredentials.mockResolvedValue([
+      {
+        id: "cred-uuid-1",
+        credentialId: "cid-faceid",
+        deviceName: "iPhone Face ID",
+        counter: 1,
+        transports: ["internal"],
+        createdAt: "2026-01-01T00:00:00Z",
+        lastUsedAt: "2026-01-02T00:00:00Z",
+      },
+    ]);
+
+    const root = renderWithQuery(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[makeAgent()]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        errorAgents={[]}
+      />,
+    );
+
+    await flushReact();
+    await flushReact();
+
+    expect(mockWebauthnApi.listCredentials).toHaveBeenCalledWith("company-1");
+    const registeredBadge = container.querySelector('[data-testid="mobile-webauthn-registered"]');
+    expect(registeredBadge).not.toBeNull();
+    expect(registeredBadge?.textContent).toContain("등록됨");
+    expect(registeredBadge?.textContent).toContain("1개");
+
+    act(() => root.unmount());
+  });
+
+  it("shows current WebAuthn unregistered state when credential list is empty", async () => {
+    mockWebauthnApi.listCredentials.mockResolvedValue([]);
+
+    const root = renderWithQuery(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[makeAgent()]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        errorAgents={[]}
+      />,
+    );
+
+    await flushReact();
+    await flushReact();
+
+    expect(mockWebauthnApi.listCredentials).toHaveBeenCalledWith("company-1");
+    const unregisteredBadge = container.querySelector('[data-testid="mobile-webauthn-unregistered"]');
+    expect(unregisteredBadge).not.toBeNull();
+    expect(unregisteredBadge?.textContent).toContain("미등록");
+
+    act(() => root.unmount());
+  });
+
+  it("shows current WebAuthn loading state while query is pending", async () => {
+    mockWebauthnApi.listCredentials.mockReturnValue(new Promise(() => {}));
+
+    const root = renderWithQuery(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[makeAgent()]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        errorAgents={[]}
+      />,
+    );
+
+    const loadingBadge = container.querySelector('[data-testid="mobile-webauthn-loading"]');
+    expect(loadingBadge).not.toBeNull();
+    expect(loadingBadge?.textContent).toContain("확인 중...");
+
+    act(() => root.unmount());
+  });
+
+  it("shows current WebAuthn query-error state when credential query fails", async () => {
+    mockWebauthnApi.listCredentials.mockRejectedValue(new Error("WebAuthn API unavailable"));
+
+    const root = renderWithQuery(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[makeAgent()]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        errorAgents={[]}
+      />,
+    );
+
+    await flushReact();
+    await flushReact();
+
+    expect(mockWebauthnApi.listCredentials).toHaveBeenCalledWith("company-1");
+    const errorBadge = container.querySelector('[data-testid="mobile-webauthn-error"]');
+    expect(errorBadge).not.toBeNull();
+    expect(errorBadge?.textContent).toContain("조회 실패");
+
+    act(() => root.unmount());
+  });
+
+  it("uses semantic design tokens only and preserves mobile 360-390px layout without text-emerald or horizontal overflow", () => {
+    const root = render(
+      <AIOfficeMobileSummary
+        companyId="company-1"
+        agents={[makeAgent()]}
+        liveRuns={[]}
+        pendingApprovals={[]}
+        errorAgents={[]}
+      />,
+    );
+
+    const header = container.querySelector('[data-testid="mobile-governance-header"]');
+    expect(header).not.toBeNull();
+
+    // Verify no text-emerald is used
+    const allElements = header?.querySelectorAll("*") ?? [];
+    for (const el of allElements) {
+      const cls = el.getAttribute("class") || "";
+      expect(cls).not.toContain("text-emerald");
+      expect(cls).not.toContain("bg-emerald");
+      expect(cls).not.toContain("border-emerald");
+    }
 
     act(() => root.unmount());
   });

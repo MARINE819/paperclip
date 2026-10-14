@@ -1,10 +1,22 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { finished, pipeline } from "node:stream/promises";
 import { once } from "node:events";
+import { createHash } from "node:crypto";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
 
@@ -57,6 +69,12 @@ export type RunDatabaseRestoreOptions = {
   connectionString: string;
   backupFile: string;
   connectTimeoutSeconds?: number;
+  /**
+   * When true, verifyBackupManifest(backupFile) must pass before any DB
+   * connection or restore attempt starts. Defaults to false/unset, which
+   * preserves existing CLI and legacy restore behavior unchanged.
+   */
+  verifyManifestBeforeRestore?: boolean;
 };
 
 type SequenceDefinition = {
@@ -217,10 +235,134 @@ function pruneOldBackups(
   if (!dryRun) {
     for (const filePath of toDelete) {
       unlinkSync(filePath);
+      const manifestPath = backupManifestPath(filePath);
+      if (existsSync(manifestPath)) {
+        unlinkSync(manifestPath);
+      }
     }
   }
 
   return { count: toDelete.length, files: toDelete };
+}
+
+export type BackupManifest = {
+  version: 1;
+  backupFile: string;
+  sha256: string;
+  sizeBytes: number;
+  createdAt: string;
+};
+
+export type VerifyBackupManifestResult =
+  | { ok: true; manifest: BackupManifest }
+  | { ok: false; reason: string };
+
+function backupManifestPath(backupFile: string): string {
+  return `${backupFile}.manifest.json`;
+}
+
+async function computeFileSha256(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  const stream = createReadStream(filePath);
+  for await (const chunk of stream) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
+}
+
+async function writeBackupManifest(backupFile: string, sizeBytes: number): Promise<void> {
+  const sha256 = await computeFileSha256(backupFile);
+  const manifest: BackupManifest = {
+    version: 1,
+    backupFile: basename(backupFile),
+    sha256,
+    sizeBytes,
+    createdAt: new Date().toISOString(),
+  };
+  const manifestPath = backupManifestPath(backupFile);
+  const tmpPath = `${manifestPath}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmpPath, JSON.stringify(manifest, null, 2), "utf8");
+  try {
+    renameSync(tmpPath, manifestPath);
+  } catch (error) {
+    if (existsSync(tmpPath)) {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        /* best-effort cleanup only; the rename error below is authoritative */
+      }
+    }
+    throw error;
+  }
+}
+
+export async function verifyBackupManifest(backupFile: string): Promise<VerifyBackupManifestResult> {
+  const manifestPath = backupManifestPath(backupFile);
+  if (!existsSync(manifestPath)) {
+    return { ok: false, reason: "manifest missing" };
+  }
+
+  let parsed: unknown;
+  try {
+    const raw = readFileSync(manifestPath, "utf8");
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return { ok: false, reason: `manifest corrupted: ${errorMessage(error)}` };
+  }
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: "manifest corrupted: not an object" };
+  }
+  const manifest = parsed as Record<string, unknown>;
+
+  if (manifest.version !== 1) {
+    return { ok: false, reason: "manifest corrupted: unsupported version" };
+  }
+  if (manifest.backupFile !== basename(backupFile)) {
+    return { ok: false, reason: "manifest corrupted: backupFile name mismatch" };
+  }
+  if (typeof manifest.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(manifest.sha256)) {
+    return { ok: false, reason: "manifest corrupted: invalid sha256 field" };
+  }
+  if (
+    typeof manifest.sizeBytes !== "number" ||
+    !Number.isSafeInteger(manifest.sizeBytes) ||
+    manifest.sizeBytes < 0
+  ) {
+    return { ok: false, reason: "manifest corrupted: invalid sizeBytes field" };
+  }
+  if (typeof manifest.createdAt !== "string") {
+    return { ok: false, reason: "manifest corrupted: invalid createdAt field" };
+  }
+  try {
+    if (new Date(manifest.createdAt).toISOString() !== manifest.createdAt) {
+      return { ok: false, reason: "manifest corrupted: invalid createdAt field" };
+    }
+  } catch {
+    return { ok: false, reason: "manifest corrupted: invalid createdAt field" };
+  }
+
+  if (!existsSync(backupFile)) {
+    return { ok: false, reason: "backup file missing" };
+  }
+
+  let actualSizeBytes: number;
+  let actualSha256: string;
+  try {
+    actualSizeBytes = statSync(backupFile).size;
+    actualSha256 = await computeFileSha256(backupFile);
+  } catch (error) {
+    return { ok: false, reason: `backup verification failed: ${errorMessage(error)}` };
+  }
+
+  if (actualSizeBytes !== manifest.sizeBytes) {
+    return { ok: false, reason: "sizeBytes mismatch" };
+  }
+  if (actualSha256 !== manifest.sha256) {
+    return { ok: false, reason: "sha256 mismatch" };
+  }
+
+  return { ok: true, manifest: manifest as unknown as BackupManifest };
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -721,6 +863,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         });
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
+        await writeBackupManifest(backupFile, sizeBytes);
         const pruned = pruneOldBackups(opts.backupDir, retention, filenamePrefix, opts.dryRun ?? false);
         return {
           backupFile,
@@ -1237,6 +1380,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
+    await writeBackupManifest(backupFile, sizeBytes);
     const pruned = pruneOldBackups(opts.backupDir, retention, filenamePrefix, opts.dryRun ?? false);
 
     return {
@@ -1260,6 +1404,15 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 }
 
 export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promise<void> {
+  if (opts.verifyManifestBeforeRestore) {
+    const verification = await verifyBackupManifest(opts.backupFile);
+    if (!verification.ok) {
+      throw new Error(
+        `Refusing to restore ${basename(opts.backupFile)}: ${verification.reason}`,
+      );
+    }
+  }
+
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
   let psqlRestoreError: unknown = null;
   try {

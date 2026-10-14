@@ -1035,6 +1035,387 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
   );
 
   it(
+    "writes a SHA-256 manifest alongside a new backup",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-manifest-");
+
+      const result = await runDatabaseBackup({
+        connectionString: sourceConnectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        filenamePrefix: "paperclip-manifest-test",
+      });
+
+      const manifestPath = `${result.backupFile}.manifest.json`;
+      expect(fs.existsSync(manifestPath)).toBe(true);
+
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      expect(manifest.version).toBe(1);
+      expect(manifest.backupFile).toBe(path.basename(result.backupFile));
+      expect(manifest.sizeBytes).toBe(result.sizeBytes);
+      expect(manifest.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(new Date(manifest.createdAt).toISOString()).toBe(manifest.createdAt);
+
+      const actualBytes = fs.readFileSync(result.backupFile);
+      const actualSha256 = createHash("sha256").update(actualBytes).digest("hex");
+      expect(manifest.sha256).toBe(actualSha256);
+    },
+    30_000,
+  );
+
+  it(
+    "restores successfully when verifyManifestBeforeRestore is true and the manifest is valid",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_manifest_verified_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-backup-manifest-verified-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."manifest_verified_rows" ("id" serial PRIMARY KEY, "note" text NOT NULL);
+          INSERT INTO "public"."manifest_verified_rows" ("note") VALUES ('verified');
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-manifest-verified-test",
+        });
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+          verifyManifestBeforeRestore: true,
+        });
+
+        const rows = await restoreSql.unsafe<{ note: string }[]>(`
+          SELECT "note" FROM "public"."manifest_verified_rows"
+        `);
+        expect(rows).toEqual([{ note: "verified" }]);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "rejects restore when the manifest is missing, without touching the target database",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_manifest_missing_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-backup-manifest-missing-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."manifest_missing_rows" ("id" serial PRIMARY KEY);
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-manifest-missing-test",
+        });
+
+        fs.unlinkSync(`${result.backupFile}.manifest.json`);
+
+        await expect(
+          runDatabaseRestore({
+            connectionString: restoreConnectionString,
+            backupFile: result.backupFile,
+            verifyManifestBeforeRestore: true,
+          }),
+        ).rejects.toThrow("manifest missing");
+
+        const tables = await restoreSql.unsafe<{ table_name: string }[]>(`
+          SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name = 'manifest_missing_rows'
+        `);
+        expect(tables).toEqual([]);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "rejects restore when the manifest is corrupted, without touching the target database",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_manifest_corrupted_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-backup-manifest-corrupted-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."manifest_corrupted_rows" ("id" serial PRIMARY KEY);
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-manifest-corrupted-test",
+        });
+
+        fs.writeFileSync(`${result.backupFile}.manifest.json`, "{not valid json", "utf8");
+
+        await expect(
+          runDatabaseRestore({
+            connectionString: restoreConnectionString,
+            backupFile: result.backupFile,
+            verifyManifestBeforeRestore: true,
+          }),
+        ).rejects.toThrow("manifest corrupted");
+
+        const tables = await restoreSql.unsafe<{ table_name: string }[]>(`
+          SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name = 'manifest_corrupted_rows'
+        `);
+        expect(tables).toEqual([]);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "rejects restore when the manifest sha256 does not match the backup file, without touching the target database",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_manifest_hash_mismatch_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-backup-manifest-hash-mismatch-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."manifest_hash_mismatch_rows" ("id" serial PRIMARY KEY);
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-manifest-hash-mismatch-test",
+        });
+
+        const manifestPath = `${result.backupFile}.manifest.json`;
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+        manifest.sha256 = "0".repeat(64);
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest), "utf8");
+
+        await expect(
+          runDatabaseRestore({
+            connectionString: restoreConnectionString,
+            backupFile: result.backupFile,
+            verifyManifestBeforeRestore: true,
+          }),
+        ).rejects.toThrow("sha256 mismatch");
+
+        const tables = await restoreSql.unsafe<{ table_name: string }[]>(`
+          SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name = 'manifest_hash_mismatch_rows'
+        `);
+        expect(tables).toEqual([]);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "rejects restore when the manifest sizeBytes does not match the backup file, without touching the target database",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_manifest_size_mismatch_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-backup-manifest-size-mismatch-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."manifest_size_mismatch_rows" ("id" serial PRIMARY KEY);
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-manifest-size-mismatch-test",
+        });
+
+        const manifestPath = `${result.backupFile}.manifest.json`;
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+        manifest.sizeBytes = manifest.sizeBytes + 1;
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest), "utf8");
+
+        await expect(
+          runDatabaseRestore({
+            connectionString: restoreConnectionString,
+            backupFile: result.backupFile,
+            verifyManifestBeforeRestore: true,
+          }),
+        ).rejects.toThrow("sizeBytes mismatch");
+
+        const tables = await restoreSql.unsafe<{ table_name: string }[]>(`
+          SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name = 'manifest_size_mismatch_rows'
+        `);
+        expect(tables).toEqual([]);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "retention pruning deletes a pruned backup's manifest alongside the backup file",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-manifest-retention-");
+      const realDateNow = Date.now;
+      Date.now = () => Date.UTC(2026, 2, 31, 12, 0, 0);
+
+      const decOld = path.join(
+        backupDir,
+        "paperclip-manifest-retention-test-2025-12-15T12-00-00.sql.gz",
+      );
+      const decOldManifest = `${decOld}.manifest.json`;
+
+      try {
+        fs.writeFileSync(decOld, "dec-old");
+        fs.writeFileSync(decOldManifest, JSON.stringify({ version: 1 }));
+        fs.utimesSync(decOld, new Date("2025-12-15T12:00:00Z"), new Date("2025-12-15T12:00:00Z"));
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-manifest-retention-test",
+        });
+
+        expect(result.prunedFiles).toContain(decOld);
+        expect(fs.existsSync(decOld)).toBe(false);
+        expect(fs.existsSync(decOldManifest)).toBe(false);
+      } finally {
+        Date.now = realDateNow;
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "dryRun retention leaves a prune candidate's backup and manifest both untouched",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-manifest-retention-dryrun-");
+      const realDateNow = Date.now;
+      Date.now = () => Date.UTC(2026, 2, 31, 12, 0, 0);
+
+      const decOld = path.join(
+        backupDir,
+        "paperclip-manifest-retention-dryrun-test-2025-12-15T12-00-00.sql.gz",
+      );
+      const decOldManifest = `${decOld}.manifest.json`;
+
+      try {
+        fs.writeFileSync(decOld, "dec-old");
+        fs.writeFileSync(decOldManifest, JSON.stringify({ version: 1 }));
+        fs.utimesSync(decOld, new Date("2025-12-15T12:00:00Z"), new Date("2025-12-15T12:00:00Z"));
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-manifest-retention-dryrun-test",
+          dryRun: true,
+        });
+
+        expect(result.prunedFiles).toContain(decOld);
+        expect(fs.existsSync(decOld)).toBe(true);
+        expect(fs.existsSync(decOldManifest)).toBe(true);
+      } finally {
+        Date.now = realDateNow;
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "retention manifest deletion failure is not reported as success",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-manifest-delete-failure-");
+      const realDateNow = Date.now;
+      Date.now = () => Date.UTC(2026, 2, 31, 12, 0, 0);
+
+      const decOld = path.join(
+        backupDir,
+        "paperclip-manifest-delete-failure-test-2025-12-15T12-00-00.sql.gz",
+      );
+      const decOldManifestDir = `${decOld}.manifest.json`;
+
+      try {
+        fs.writeFileSync(decOld, "dec-old");
+        // A directory at the manifest path (instead of a regular file) makes
+        // unlinkSync fail deterministically with EPERM on this platform --
+        // confirmed by direct probe, so no readonly-attribute/chmod trickery
+        // (unreliable on Windows) is needed here.
+        fs.mkdirSync(decOldManifestDir);
+        fs.utimesSync(decOld, new Date("2025-12-15T12:00:00Z"), new Date("2025-12-15T12:00:00Z"));
+
+        await expect(
+          runDatabaseBackup({
+            connectionString: sourceConnectionString,
+            backupDir,
+            retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+            filenamePrefix: "paperclip-manifest-delete-failure-test",
+          }),
+        ).rejects.toMatchObject({ code: "EPERM" });
+
+        expect(fs.existsSync(decOldManifestDir)).toBe(true);
+      } finally {
+        Date.now = realDateNow;
+        fs.rmSync(decOldManifestDir, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it(
     "restores legacy public-only backups without migration history",
     async () => {
       const restoreConnectionString = await createTempDatabase();

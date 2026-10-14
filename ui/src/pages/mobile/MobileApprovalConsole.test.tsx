@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, forwardRef } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -53,6 +53,14 @@ let mockCurrentCompany: MockCompany | null = {
 
 vi.mock("@/lib/router", () => ({
   useNavigate: () => mockNavigate,
+  Link: forwardRef<
+    HTMLAnchorElement,
+    React.AnchorHTMLAttributes<HTMLAnchorElement> & { to: string }
+  >(({ to, children, ...props }, ref) => (
+    <a ref={ref} href={to} {...props}>
+      {children}
+    </a>
+  )),
 }));
 
 vi.mock("../../context/BreadcrumbContext", () => ({
@@ -449,5 +457,72 @@ describe("MobileApprovalConsole Emergency Pause & Resume UI Pipeline (6 Core Sce
     expect(mockWebauthnApi.getAuthenticationOptions).not.toHaveBeenCalled();
     expect(mockCompaniesApi.emergencyResume).not.toHaveBeenCalled();
     expect(container.textContent).toContain("이 브라우저 또는 기기는 WebAuthn 생체 인증을 지원하지 않습니다.");
+  });
+
+  // ── Scenario 8: Upper control navigation links (Summary & Settings) ───────────
+  it("Scenario 8a: Renders both summary and settings navigation links in the upper control area", async () => {
+    mockCurrentCompany = {
+      id: "company-1",
+      name: "Acme Corp",
+      status: "active",
+    };
+
+    renderComponent();
+    await flushUi();
+
+    const summaryLink = container.querySelector('[data-testid="mobile-console-summary-link"]');
+    const settingsLink = container.querySelector('[data-testid="mobile-console-settings-link"]');
+
+    expect(summaryLink).not.toBeNull();
+    expect(settingsLink).not.toBeNull();
+  });
+
+  it("Scenario 8b: Verifies exact destinations and labels for both links", async () => {
+    mockCurrentCompany = {
+      id: "company-1",
+      name: "Acme Corp",
+      status: "active",
+    };
+
+    renderComponent();
+    await flushUi();
+
+    const summaryLink = container.querySelector<HTMLAnchorElement>(
+      '[data-testid="mobile-console-summary-link"]',
+    );
+    const settingsLink = container.querySelector<HTMLAnchorElement>(
+      '[data-testid="mobile-console-settings-link"]',
+    );
+
+    expect(summaryLink).not.toBeNull();
+    expect(summaryLink?.getAttribute("href")).toBe("/ai-office?view=summary");
+    expect(summaryLink?.textContent?.trim()).toBe("경영진 요약");
+
+    expect(settingsLink).not.toBeNull();
+    expect(settingsLink?.getAttribute("href")).toBe("/mobile/settings");
+    expect(settingsLink?.textContent?.trim()).toBe("기기·보안 설정");
+  });
+
+  it("Scenario 8c: Verifies min-h-9 touch targets on both links", async () => {
+    mockCurrentCompany = {
+      id: "company-1",
+      name: "Acme Corp",
+      status: "active",
+    };
+
+    renderComponent();
+    await flushUi();
+
+    const summaryLink = container.querySelector(
+      '[data-testid="mobile-console-summary-link"]',
+    );
+    const settingsLink = container.querySelector(
+      '[data-testid="mobile-console-settings-link"]',
+    );
+
+    expect(summaryLink).not.toBeNull();
+    expect(settingsLink).not.toBeNull();
+    expect(summaryLink?.classList.contains("min-h-9")).toBe(true);
+    expect(settingsLink?.classList.contains("min-h-9")).toBe(true);
   });
 });

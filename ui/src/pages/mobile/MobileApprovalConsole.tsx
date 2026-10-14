@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { useNavigate } from "@/lib/router";
+import { useNavigate, Link } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCompany } from "../../context/CompanyContext";
 import { useBreadcrumbs } from "../../context/BreadcrumbContext";
@@ -323,6 +323,27 @@ export function MobileApprovalConsole() {
         {errorMsg && (
           <p className="text-xs text-destructive bg-destructive/10 p-2 rounded-md">{errorMsg}</p>
         )}
+
+        <div className="grid grid-cols-2 gap-2 border-t border-border/40 pt-3">
+          <Button asChild variant="outline" size="sm" className="min-h-9 w-full text-xs font-medium">
+            <Link
+              to="/ai-office?view=summary"
+              data-testid="mobile-console-summary-link"
+              className="min-h-9"
+            >
+              경영진 요약
+            </Link>
+          </Button>
+          <Button asChild variant="outline" size="sm" className="min-h-9 w-full text-xs font-medium">
+            <Link
+              to="/mobile/settings"
+              data-testid="mobile-console-settings-link"
+              className="min-h-9"
+            >
+              기기·보안 설정
+            </Link>
+          </Button>
+        </div>
       </Card>
 
       {/* Tabs */}

@@ -1003,7 +1003,7 @@ describe("AIOfficeMobileSummary", () => {
     act(() => root.unmount());
   });
 
-  it("renders live run issue chip as clickable link to issue without selecting agent", async () => {
+  it("stops propagation when clicking issue link in active agent row to preserve onSelectAgent semantics", async () => {
     const onSelect = vi.fn();
     const agent = makeAgent({ id: "agent-1", name: "Alpha" });
     const liveRun = makeLiveRun({
@@ -1030,6 +1030,7 @@ describe("AIOfficeMobileSummary", () => {
 
     // Clicking the issue link should not trigger onSelectAgent
     act(() => {
+      issueLink.addEventListener("click", (event) => event.preventDefault(), { once: true });
       issueLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
     expect(onSelect).not.toHaveBeenCalled();

@@ -142,12 +142,44 @@ vi.mock("../api/knowledge", () => ({
   knowledgeApi: mockKnowledgeApi,
 }));
 
-vi.mock("../context/CompanyContext", () => ({
-  useCompany: () => ({ selectedCompanyId: "company-1" }),
-}));
+vi.mock("../context/CompanyContext", () => {
+  const company = { id: "company-1", name: "Company 1", issuePrefix: "PAP" };
+  const value = {
+    selectedCompanyId: "company-1",
+    selectedCompany: company,
+    companies: [company],
+  };
+  return {
+    useCompany: () => value,
+    useOptionalCompany: () => value,
+  };
+});
 
 vi.mock("../context/BreadcrumbContext", () => ({
   useBreadcrumbs: () => ({ setBreadcrumbs: vi.fn() }),
+}));
+
+const mockLiveEventState = vi.hoisted(() => ({
+  callback: null as ((event: any) => void) | null,
+}));
+
+const mockUseCompanyLiveEvent = vi.hoisted(() =>
+  vi.fn((cb: (event: any) => void) => {
+    mockLiveEventState.callback = cb;
+  }),
+);
+
+vi.mock("../context/LiveUpdatesProvider", () => ({
+  useCompanyLiveEvent: mockUseCompanyLiveEvent,
+}));
+
+// Provide the theme context required by the JARVIS final report card.
+vi.mock("../context/ThemeContext", () => ({
+  useTheme: () => ({
+    theme: "light",
+    setTheme: vi.fn(),
+    toggleTheme: vi.fn(),
+  }),
 }));
 
 // ActivityFeed and DecisionQueueRail pull in their own heavy query/router
@@ -281,6 +313,7 @@ describe("AIOffice", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mockLiveEventState.callback = null;
     mockAgentsApi.list.mockResolvedValue([]);
     mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
     mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
@@ -1409,6 +1442,69 @@ describe("AIOffice", () => {
 
       act(() => root.unmount());
     });
+
+    it("Test F: recognizes JARVIS final report via sections-title fallback when authorizationReason is missing", async () => {
+      const now = new Date();
+      const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+      mockAgentsApi.list.mockResolvedValue([jarvis]);
+      mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+      mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string }) => {
+        if (filter?.status === "in_review") {
+          return Promise.resolve([
+            {
+              id: "issue-parent-fallback",
+              identifier: "PAP-105",
+              title: "Parent Orchestration with Fallback",
+              status: "in_review",
+              parentId: null,
+              assigneeAgentId: "agent-jarvis",
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockIssuesApi.listComments.mockImplementation((issueId: string) => {
+        if (issueId === "issue-parent-fallback") {
+          return Promise.resolve([
+            {
+              id: "comment-fallback-1",
+              issueId: "issue-parent-fallback",
+              authorType: "agent",
+              authorAgentId: "agent-jarvis",
+              body: "## Section Title Fallback Report\n- All subtasks verified",
+              metadata: {
+                version: 1,
+                sections: [
+                  {
+                    title: "Overview",
+                    summary: "Subtasks overview",
+                  },
+                  {
+                    title: "JARVIS parent report",
+                    summary: "Subtasks completed",
+                  },
+                ],
+              },
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const root = await renderPage();
+      await flushReact();
+      await flushReact();
+
+      const inReviewItem = container.querySelector('[data-testid="desktop-in-review-item-issue-parent-fallback"]') as HTMLAnchorElement;
+      expect(inReviewItem).not.toBeNull();
+      expect(inReviewItem.getAttribute("href")).toBe("/issues/issue-parent-fallback#comment-comment-fallback-1");
+      expect(inReviewItem.textContent).toContain("JARVIS 최종 보고");
+      expect(inReviewItem.textContent).toContain("최종 보고서 확인 →");
+
+      act(() => root.unmount());
+    });
   });
 
   describe("AI Office Operational Consistency", () => {
@@ -1528,6 +1624,157 @@ describe("AIOffice", () => {
       expect(metricCard).not.toBeNull();
       // Total 2 approvals (1 pending + 1 revision_requested)
       expect(metricCard?.textContent).toContain("2");
+
+      act(() => root.unmount());
+    });
+
+    it("renders deep-link for completed parent issues when report uses sections-title fallback", async () => {
+      const now = new Date();
+      const jarvis = makeAgent({ id: "agent-jarvis", name: "JARVIS", status: "idle", lastHeartbeatAt: now });
+      mockAgentsApi.list.mockResolvedValue([jarvis]);
+      mockAgentsApi.orgUnitsStatus.mockResolvedValue([]);
+
+      mockIssuesApi.list.mockImplementation((_companyId: string, filter?: { status?: string; sortField?: string; sortDir?: string }) => {
+        if (filter?.status === "done") {
+          return Promise.resolve([
+            {
+              id: "issue-done-fallback",
+              identifier: "PAP-202",
+              title: "Completed Task via Section Fallback",
+              status: "done",
+              parentId: null,
+              assigneeAgentId: "agent-jarvis",
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockIssuesApi.listComments.mockImplementation((issueId: string) => {
+        if (issueId === "issue-done-fallback") {
+          return Promise.resolve([
+            {
+              id: "comment-done-fallback-1",
+              issueId: "issue-done-fallback",
+              authorType: "agent",
+              authorAgentId: "agent-jarvis",
+              body: "Completed report with sections title fallback",
+              metadata: {
+                version: 1,
+                sections: [
+                  {
+                    title: "JARVIS parent report",
+                  },
+                ],
+              },
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const root = await renderPage();
+      await flushReact();
+      await flushReact();
+
+      const doneLink = container.querySelector('[data-testid="desktop-completed-item-issue-done-fallback"]') as HTMLAnchorElement;
+      expect(doneLink).not.toBeNull();
+      expect(doneLink.getAttribute("href")).toBe("/issues/issue-done-fallback#comment-comment-done-fallback-1");
+      expect(doneLink.textContent).toContain("PAP-202: Completed Task via Section Fallback");
+
+      act(() => root.unmount());
+    });
+  });
+
+  describe("Live Event Query Invalidation", () => {
+    it("invalidates live runs query on heartbeat.run.progress live event", async () => {
+      const root = await renderPage();
+      expect(mockUseCompanyLiveEvent).toHaveBeenCalled();
+      expect(mockLiveEventState.callback).toBeTypeOf("function");
+
+      const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+      // 1. Event object with type property
+      act(() => {
+        mockLiveEventState.callback!({ type: "heartbeat.run.progress" });
+      });
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: ["ai-office-2d-live-runs", "company-1"],
+      });
+
+      invalidateSpy.mockClear();
+
+      // 2. String event type
+      act(() => {
+        mockLiveEventState.callback!("heartbeat.run.progress");
+      });
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: ["ai-office-2d-live-runs", "company-1"],
+      });
+
+      invalidateSpy.mockClear();
+
+      // 3. Event object with event property
+      act(() => {
+        mockLiveEventState.callback!({ event: "heartbeat.run.progress" });
+      });
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: ["ai-office-2d-live-runs", "company-1"],
+      });
+
+      invalidateSpy.mockClear();
+
+      // 4. Unrelated event does not trigger invalidation
+      act(() => {
+        mockLiveEventState.callback!({ type: "other.event" });
+      });
+      expect(invalidateSpy).not.toHaveBeenCalled();
+
+      act(() => root.unmount());
+    });
+
+    it("invalidates status query on plugin.ui.updated live event", async () => {
+      const root = await renderPage();
+      expect(mockUseCompanyLiveEvent).toHaveBeenCalled();
+      expect(mockLiveEventState.callback).toBeTypeOf("function");
+
+      const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+      // 1. Event object with type property
+      act(() => {
+        mockLiveEventState.callback!({ type: "plugin.ui.updated" });
+      });
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: ["ai-office-2d-status"],
+      });
+
+      invalidateSpy.mockClear();
+
+      // 2. String event type
+      act(() => {
+        mockLiveEventState.callback!("plugin.ui.updated");
+      });
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: ["ai-office-2d-status"],
+      });
+
+      invalidateSpy.mockClear();
+
+      // 3. Event object with event property
+      act(() => {
+        mockLiveEventState.callback!({ event: "plugin.ui.updated" });
+      });
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: ["ai-office-2d-status"],
+      });
+
+      invalidateSpy.mockClear();
+
+      // 4. Unrelated event does not trigger status invalidation
+      act(() => {
+        mockLiveEventState.callback!({ type: "other.event" });
+      });
+      expect(invalidateSpy).not.toHaveBeenCalled();
 
       act(() => root.unmount());
     });

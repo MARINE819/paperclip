@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useMutation, useQueries, useQuery } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { IssueComment } from "@paperclipai/shared";
 import { Bot, Building2, Coffee, DoorOpen, ShieldAlert, Sofa, Sprout, Users } from "lucide-react";
 import { JarvisNeuralCommandInterface } from "@/components/neural/JarvisNeuralCommandInterface";
@@ -15,6 +15,7 @@ import { knowledgeApi } from "@/api/knowledge";
 import { describeApiError } from "@/api/client";
 import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
+import { useCompanyLiveEvent } from "@/context/LiveUpdatesProvider";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
@@ -155,11 +156,36 @@ export function useAIOfficeViewMode(
 export function AIOffice() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
+  const queryClient = useQueryClient();
   const [emergencyStopConfirmOpen, setEmergencyStopConfirmOpen] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [controlCenterTab, setControlCenterTab] = useControlCenterTab("sre");
   const [viewMode, setViewMode] = useAIOfficeViewMode("floor");
   const [voiceState, setVoiceState] = useState<VoiceBarState>("idle");
+
+  useCompanyLiveEvent(
+    useCallback(
+      (event: any) => {
+        const eventType =
+          typeof event === "string"
+            ? event
+            : event?.type ?? event?.event;
+
+        if (eventType === "heartbeat.run.progress") {
+          if (selectedCompanyId) {
+            queryClient.invalidateQueries({
+              queryKey: ["ai-office-2d-live-runs", selectedCompanyId],
+            });
+          }
+        } else if (eventType === "plugin.ui.updated") {
+          queryClient.invalidateQueries({
+            queryKey: ["ai-office-2d-status"],
+          });
+        }
+      },
+      [queryClient, selectedCompanyId],
+    ),
+  );
 
   useEffect(() => {
     setBreadcrumbs([{ label: "AI Office" }]);
@@ -347,7 +373,11 @@ export function AIOffice() {
       const candidate = jarvisReportCandidates[idx];
       if (!candidate || !q.data || !Array.isArray(q.data)) return;
       const reportComment = q.data.find(
-        (comment) => comment.metadata?.authorizationReason === "canonical_jarvis_parent_report",
+        (comment) =>
+          comment.metadata?.authorizationReason === "canonical_jarvis_parent_report" ||
+          (comment.metadata?.sections as Array<{ title?: string | null }> | undefined)?.some(
+            (section) => section?.title === "JARVIS parent report",
+          ),
       );
       if (reportComment) {
         map.set(candidate.id, reportComment);

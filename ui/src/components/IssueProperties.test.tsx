@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
-import type { ComponentProps, ReactNode } from "react";
-import { flushSync } from "react-dom";
+import { act, type ComponentProps, type ReactNode } from "react";
+
 import { createRoot } from "react-dom/client";
 import type {
   ExecutionWorkspace,
@@ -188,12 +188,53 @@ if (!globalThis.PointerEvent) {
   (globalThis as any).PointerEvent = MouseEvent;
 }
 
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
+type Root = ReturnType<typeof createRoot>;
+
+interface RootRegistration {
+  root: Root;
+  queryClient?: QueryClient;
+  unmounted: boolean;
+}
+
+const activeRoots = new Set<RootRegistration>();
+
+function registerRoot(root: Root, queryClient?: QueryClient): Root {
+  for (const existing of activeRoots) {
+    if (existing.root === root) {
+      if (queryClient && !existing.queryClient) {
+        existing.queryClient = queryClient;
+      }
+      return root;
+    }
+  }
+
+  const reg: RootRegistration = {
+    root,
+    queryClient,
+    unmounted: false,
+  };
+  activeRoots.add(reg);
+
+  const originalUnmount = root.unmount.bind(root);
+  let queryClientCleared = false;
+
+  root.unmount = () => {
+    if (reg.unmounted) {
+      return;
+    }
+    try {
+      originalUnmount();
+    } finally {
+      reg.unmounted = true;
+      activeRoots.delete(reg);
+      if (reg.queryClient && !queryClientCleared) {
+        queryClientCleared = true;
+        reg.queryClient.clear();
+      }
+    }
+  };
+
+  return root;
 }
 
 async function flush() {
@@ -445,7 +486,7 @@ function renderPropertiesWithQueryClient(container: HTMLDivElement, props: Compo
       queries: { retry: false },
     },
   });
-  const root = createRoot(container);
+  const root = registerRoot(createRoot(container), queryClient);
   act(() => {
     root.render(
       <QueryClientProvider client={queryClient}>
@@ -510,7 +551,13 @@ describe("IssueProperties", () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const reg of Array.from(activeRoots)) {
+      await act(async () => {
+        reg.root.unmount();
+      });
+    }
+    activeRoots.clear();
     document.body.innerHTML = "";
   });
 
@@ -1569,7 +1616,7 @@ describe("IssueProperties", () => {
         queries: { retry: false },
       },
     });
-    const root = createRoot(container);
+    const root = registerRoot(createRoot(container), queryClient);
 
     act(() => {
       root.render(
@@ -2538,7 +2585,7 @@ describe("IssueProperties", () => {
       clearReason: null,
     };
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const root = createRoot(container);
+    const root = registerRoot(createRoot(container), queryClient);
     const monitorRowText = () => container.querySelector('[data-testid="monitor-row-trigger"]')?.textContent;
     const renderMonitor = (issue: Issue) => {
       act(() => {

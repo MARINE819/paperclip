@@ -692,13 +692,27 @@ describe("IssueProperties", () => {
     });
     mockIssuesApi.listWorkProducts.mockResolvedValue([{
       id: "work-product-1",
-      title: "Existing artifact",
+      companyId: "company-1",
+      projectId: null,
+      issueId: "issue-1",
+      executionWorkspaceId: null,
+      runtimeServiceId: null,
       type: "artifact",
       provider: "paperclip",
-      status: "ready_for_review",
+      externalId: null,
+      title: "Existing artifact",
       url: null,
+      status: "ready_for_review",
+      reviewState: "none",
+      isPrimary: true,
+      healthStatus: "unknown",
+      summary: null,
       metadata: { openPath: "/api/attachments/a/content" },
-    } as IssueWorkProduct]);
+      sourceTrust: null,
+      createdByRunId: null,
+      createdAt: new Date("2026-08-23T00:52:13.017Z"),
+      updatedAt: new Date("2026-08-23T00:52:13.017Z"),
+    } satisfies IssueWorkProduct]);
 
     const root = renderProperties(container, {
       issue: createIssue({ id: "issue-1" }),

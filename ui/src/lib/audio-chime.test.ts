@@ -9,7 +9,7 @@ import {
   clearCooldowns,
   canPlayChime,
   playApprovalChime,
-} from "./audio-chime.ts";
+} from "./audio-chime";
 
 describe("audio-chime", () => {
   let mockStorage: Record<string, string>;

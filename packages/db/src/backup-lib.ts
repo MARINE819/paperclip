@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -16,6 +17,7 @@ import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { finished, pipeline } from "node:stream/promises";
 import { once } from "node:events";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -162,6 +164,54 @@ function monthlyRetentionCutoff(nowMs: number, monthlyMonths: number): number {
   return Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - months, 1);
 }
 
+export function canonicalBackupDirKey(backupDir: string): string {
+  mkdirSync(backupDir, { recursive: true });
+  let real: string;
+  try {
+    real = realpathSync(backupDir);
+  } catch (error) {
+    throw new Error(
+      `Cannot canonicalize backupDir for locking: ${backupDir}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return process.platform === "win32" ? real.toLowerCase() : real;
+}
+
+const backupDirLockHeldKeys = new AsyncLocalStorage<ReadonlySet<string>>();
+const backupDirLocks = new Map<string, Promise<void>>();
+
+export async function withBackupDirLock<T>(backupDir: string, fn: () => Promise<T>): Promise<T> {
+  const key = canonicalBackupDirKey(backupDir);
+  const held = backupDirLockHeldKeys.getStore() ?? new Set<string>();
+  if (held.has(key)) {
+    throw new Error(`Reentrant withBackupDirLock() call detected for key: ${key}`);
+  }
+
+  const previousTail = backupDirLocks.get(key) ?? Promise.resolve();
+  let releaseNext!: () => void;
+  const myTail = new Promise<void>((res) => {
+    releaseNext = res;
+  });
+  backupDirLocks.set(key, myTail);
+
+  await previousTail.catch(() => {});
+
+  const nextHeld = new Set(held);
+  nextHeld.add(key);
+  try {
+    return await backupDirLockHeldKeys.run(nextHeld, fn);
+  } finally {
+    releaseNext();
+    if (backupDirLocks.get(key) === myTail) {
+      backupDirLocks.delete(key);
+    }
+  }
+}
+
+function backupPinPath(backupFile: string): string {
+  return `${backupFile}.pinned`;
+}
+
 /**
  * Tiered backup pruning:
  * - Daily tier: keep ALL backups from the last `dailyDays` days
@@ -232,17 +282,26 @@ function pruneOldBackups(
     toDelete.push(entry.fullPath);
   }
 
-  if (!dryRun) {
-    for (const filePath of toDelete) {
-      unlinkSync(filePath);
-      const manifestPath = backupManifestPath(filePath);
-      if (existsSync(manifestPath)) {
-        unlinkSync(manifestPath);
-      }
+  const candidates = toDelete.filter((filePath) => !existsSync(backupPinPath(filePath)));
+
+  if (dryRun) {
+    return { count: candidates.length, files: candidates };
+  }
+
+  const deletedFiles: string[] = [];
+  for (const filePath of candidates) {
+    if (existsSync(backupPinPath(filePath))) {
+      continue;
+    }
+    unlinkSync(filePath);
+    deletedFiles.push(filePath);
+    const manifestPath = backupManifestPath(filePath);
+    if (existsSync(manifestPath)) {
+      unlinkSync(manifestPath);
     }
   }
 
-  return { count: toDelete.length, files: toDelete };
+  return { count: deletedFiles.length, files: deletedFiles };
 }
 
 export type BackupManifest = {
@@ -864,7 +923,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
         await writeBackupManifest(backupFile, sizeBytes);
-        const pruned = pruneOldBackups(opts.backupDir, retention, filenamePrefix, opts.dryRun ?? false);
+        const pruned = await withBackupDirLock(opts.backupDir, async () =>
+          pruneOldBackups(opts.backupDir, retention, filenamePrefix, opts.dryRun ?? false),
+        );
         return {
           backupFile,
           sizeBytes,
@@ -1381,7 +1442,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     const sizeBytes = statSync(backupFile).size;
     await writeBackupManifest(backupFile, sizeBytes);
-    const pruned = pruneOldBackups(opts.backupDir, retention, filenamePrefix, opts.dryRun ?? false);
+    const pruned = await withBackupDirLock(opts.backupDir, async () =>
+      pruneOldBackups(opts.backupDir, retention, filenamePrefix, opts.dryRun ?? false),
+    );
 
     return {
       backupFile,

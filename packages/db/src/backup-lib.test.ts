@@ -9,6 +9,8 @@ import {
   createBufferedTextFileWriter,
   runDatabaseBackup,
   runDatabaseRestore,
+  canonicalBackupDirKey,
+  withBackupDirLock,
   GzipFinalizeTimeoutError,
   type BackupLifecycleEvent,
 } from "./backup-lib.js";
@@ -29,6 +31,117 @@ function createTempDir(prefix: string): string {
   });
   return dir;
 }
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+describe("canonicalBackupDirKey", () => {
+  it("creates the directory if missing and returns its realpath-based canonical form", () => {
+    const parent = createTempDir("paperclip-db-canonical-");
+    const nested = path.join(parent, "nested", "backups");
+    expect(fs.existsSync(nested)).toBe(false);
+
+    const key = canonicalBackupDirKey(nested);
+
+    expect(fs.existsSync(nested)).toBe(true);
+    const realKey = fs.realpathSync(nested);
+    expect(key).toBe(process.platform === "win32" ? realKey.toLowerCase() : realKey);
+  });
+
+  it("normalizes the canonical key to lowercase when process.platform is mocked as win32", () => {
+    const dir = createTempDir("paperclip-db-canonical-win32-");
+    const originalDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      const key = canonicalBackupDirKey(dir);
+      expect(key).toBe(fs.realpathSync(dir).toLowerCase());
+    } finally {
+      Object.defineProperty(process, "platform", originalDescriptor);
+    }
+  });
+
+  it("fails closed (throws, never silently proceeds) for a path Node cannot resolve", () => {
+    expect(() => canonicalBackupDirKey("invalid\0path")).toThrow();
+  });
+});
+
+describe("withBackupDirLock", () => {
+  it("serializes calls for the same key in FIFO order", async () => {
+    const dir = createTempDir("paperclip-db-mutex-fifo-");
+    const order: string[] = [];
+    const first = createDeferred<void>();
+    const second = createDeferred<void>();
+
+    const callA = withBackupDirLock(dir, async () => {
+      order.push("A-start");
+      await first.promise;
+      order.push("A-end");
+    });
+    const callB = withBackupDirLock(dir, async () => {
+      order.push("B-start");
+      await second.promise;
+      order.push("B-end");
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toEqual(["A-start"]);
+
+    first.resolve();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toEqual(["A-start", "A-end", "B-start"]);
+
+    second.resolve();
+    await Promise.all([callA, callB]);
+    expect(order).toEqual(["A-start", "A-end", "B-start", "B-end"]);
+  });
+
+  it("lets a queued call proceed even though the call ahead of it rejects", async () => {
+    const dir = createTempDir("paperclip-db-mutex-failure-queue-");
+    const firstError = new Error("intentional failure");
+    const gate = createDeferred<void>();
+
+    const firstCall = withBackupDirLock(dir, async () => {
+      await gate.promise;
+      throw firstError;
+    });
+    const secondCall = withBackupDirLock(dir, async () => "second-ran");
+
+    gate.resolve();
+    await expect(firstCall).rejects.toBe(firstError);
+    await expect(secondCall).resolves.toBe("second-ran");
+  });
+
+  it("rejects immediately on reentrant calls for the same key without hanging", async () => {
+    const dir = createTempDir("paperclip-db-mutex-reentrant-");
+    const outer = withBackupDirLock(dir, async () => {
+      return withBackupDirLock(dir, async () => "should not run");
+    });
+    await expect(outer).rejects.toThrow(/Reentrant withBackupDirLock/);
+  }, 5_000);
+
+  it("does not block a different backupDir key while one key's lock is held", async () => {
+    const dirA = createTempDir("paperclip-db-mutex-independent-a-");
+    const dirB = createTempDir("paperclip-db-mutex-independent-b-");
+    const gate = createDeferred<void>();
+
+    const heldA = withBackupDirLock(dirA, async () => {
+      await gate.promise;
+      return "A-done";
+    });
+    const quickB = await withBackupDirLock(dirB, async () => "B-done");
+    expect(quickB).toBe("B-done");
+
+    gate.resolve();
+    await expect(heldA).resolves.toBe("A-done");
+  });
+});
 
 async function createTempDatabase(): Promise<string> {
   const db = await startEmbeddedPostgresTestDatabase("paperclip-db-backup-");
@@ -1367,6 +1480,111 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         expect(result.prunedFiles).toContain(decOld);
         expect(fs.existsSync(decOld)).toBe(true);
         expect(fs.existsSync(decOldManifest)).toBe(true);
+      } finally {
+        Date.now = realDateNow;
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "excludes a pinned backup from retention deletion",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-pin-retention-");
+      const realDateNow = Date.now;
+      Date.now = () => Date.UTC(2026, 2, 31, 12, 0, 0);
+
+      const decOld = path.join(
+        backupDir,
+        "paperclip-pin-retention-test-2025-12-15T12-00-00.sql.gz",
+      );
+      const pinPath = `${decOld}.pinned`;
+
+      try {
+        fs.writeFileSync(decOld, "dec-old");
+        fs.writeFileSync(pinPath, "");
+        fs.utimesSync(decOld, new Date("2025-12-15T12:00:00Z"), new Date("2025-12-15T12:00:00Z"));
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-pin-retention-test",
+        });
+
+        expect(result.prunedFiles).not.toContain(decOld);
+        expect(fs.existsSync(decOld)).toBe(true);
+        expect(fs.existsSync(pinPath)).toBe(true);
+      } finally {
+        Date.now = realDateNow;
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "dryRun also excludes a pinned backup from the reported prune candidates",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-pin-retention-dryrun-");
+      const realDateNow = Date.now;
+      Date.now = () => Date.UTC(2026, 2, 31, 12, 0, 0);
+
+      const decOld = path.join(
+        backupDir,
+        "paperclip-pin-retention-dryrun-test-2025-12-15T12-00-00.sql.gz",
+      );
+      const pinPath = `${decOld}.pinned`;
+
+      try {
+        fs.writeFileSync(decOld, "dec-old");
+        fs.writeFileSync(pinPath, "");
+        fs.utimesSync(decOld, new Date("2025-12-15T12:00:00Z"), new Date("2025-12-15T12:00:00Z"));
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-pin-retention-dryrun-test",
+          dryRun: true,
+        });
+
+        expect(result.prunedFiles).not.toContain(decOld);
+        expect(fs.existsSync(decOld)).toBe(true);
+      } finally {
+        Date.now = realDateNow;
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "prunes a non-pinned old backup exactly as before when no pin exists",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-no-pin-retention-");
+      const realDateNow = Date.now;
+      Date.now = () => Date.UTC(2026, 2, 31, 12, 0, 0);
+
+      const decOld = path.join(
+        backupDir,
+        "paperclip-no-pin-retention-test-2025-12-15T12-00-00.sql.gz",
+      );
+
+      try {
+        fs.writeFileSync(decOld, "dec-old");
+        fs.utimesSync(decOld, new Date("2025-12-15T12:00:00Z"), new Date("2025-12-15T12:00:00Z"));
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-no-pin-retention-test",
+        });
+
+        expect(result.prunedFiles).toContain(decOld);
+        expect(fs.existsSync(decOld)).toBe(false);
       } finally {
         Date.now = realDateNow;
       }

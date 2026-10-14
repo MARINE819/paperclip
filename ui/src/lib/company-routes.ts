@@ -30,6 +30,7 @@ const BOARD_ROUTE_ROOTS = new Set([
   "settings",
   "timeline",
   "ai-office",
+  "mobile",
 ]);
 
 const GLOBAL_ROUTE_ROOTS = new Set(["auth", "invite", "board-claim", "cli-auth", "docs", "instance"]);

@@ -704,6 +704,7 @@ export function App() {
           <Route path="execution-workspaces/:workspaceId/routines" element={<UnprefixedBoardRedirect />} />
           <Route path="ai-office" element={<UnprefixedBoardRedirect />} />
           <Route path="ai-office/*" element={<UnprefixedBoardRedirect />} />
+          <Route path="mobile/*" element={<UnprefixedBoardRedirect />} />
           <Route path=":companyPrefix" element={<Layout />}>
             {boardRoutes()}
           </Route>

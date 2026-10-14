@@ -127,6 +127,23 @@ describe("company routes", () => {
     expect(toCompanyRelativePath("/NEXORA/ai-office")).toBe("/ai-office");
   });
 
+  it("treats mobile routes as board routes that receive and preserve the company prefix", () => {
+    expect(isBoardPathWithoutPrefix("/mobile")).toBe(true);
+    expect(isBoardPathWithoutPrefix("/mobile/approvals")).toBe(true);
+    expect(isBoardPathWithoutPrefix("/mobile/approvals/appr-123")).toBe(true);
+    expect(isBoardPathWithoutPrefix("/mobile/settings")).toBe(true);
+    expect(extractCompanyPrefixFromPath("/mobile")).toBeNull();
+    expect(extractCompanyPrefixFromPath("/mobile/approvals")).toBeNull();
+    expect(extractCompanyPrefixFromPath("/mobile/settings")).toBeNull();
+    expect(applyCompanyPrefix("/mobile/approvals", "PAP")).toBe("/PAP/mobile/approvals");
+    expect(applyCompanyPrefix("/mobile/approvals/appr-123", "PAP")).toBe("/PAP/mobile/approvals/appr-123");
+    expect(applyCompanyPrefix("/mobile/settings", "PAP")).toBe("/PAP/mobile/settings");
+    expect(applyCompanyPrefix("/PAP/mobile/approvals", "PAP")).toBe("/PAP/mobile/approvals");
+    expect(applyCompanyPrefix("/PAP/mobile/settings", "PAP")).toBe("/PAP/mobile/settings");
+    expect(toCompanyRelativePath("/PAP/mobile/approvals")).toBe("/mobile/approvals");
+    expect(toCompanyRelativePath("/PAP/mobile/settings")).toBe("/mobile/settings");
+  });
+
   it("treats /timeline as a board route that needs a company prefix", () => {
     expect(isBoardPathWithoutPrefix("/timeline")).toBe(true);
     expect(extractCompanyPrefixFromPath("/timeline")).toBeNull();

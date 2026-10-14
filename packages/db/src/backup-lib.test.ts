@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
@@ -120,6 +121,116 @@ const malformedCopyHeaderBackupText = malformedCopyHeaderBackupLines.join("\n");
 const selectMalformedCopyTestTableSql = `
   SELECT table_name FROM information_schema.tables
   WHERE table_schema = 'public' AND table_name = 'malformed_copy_test'
+`;
+
+const SANDBOX_UAT_ITEM_COUNT = 3000;
+
+const createSandboxUatSchemaSql = `
+  CREATE SCHEMA "sandbox_uat";
+  CREATE TYPE "sandbox_uat"."item_status"
+    AS ENUM ('pending', 'done');
+
+  CREATE TABLE "public"."sandbox_uat_parents" (
+    "id" uuid PRIMARY KEY,
+    "name" text NOT NULL
+  );
+  INSERT INTO "public"."sandbox_uat_parents"
+    ("id", "name")
+  VALUES (
+    '11111111-1111-4111-8111-111111111111',
+    'parent-a'
+  );
+
+  CREATE TABLE "sandbox_uat"."items" (
+    "id" bigserial PRIMARY KEY,
+    "parent_id" uuid NOT NULL
+      REFERENCES "public"."sandbox_uat_parents" ("id")
+      ON DELETE CASCADE,
+    "status" "sandbox_uat"."item_status" NOT NULL,
+    "metadata" jsonb NOT NULL,
+    "note" text
+  );
+`;
+
+const insertSandboxUatItemsSql = `
+  INSERT INTO "sandbox_uat"."items" (
+    "parent_id",
+    "status",
+    "metadata",
+    "note"
+  )
+  SELECT
+    '11111111-1111-4111-8111-111111111111',
+    (
+      CASE WHEN g % 2 = 0
+        THEN 'pending'
+        ELSE 'done'
+      END
+    )::"sandbox_uat"."item_status",
+    jsonb_build_object('index', g),
+    CASE (g % 500)
+      WHEN 0 THEN NULL
+      WHEN 1 THEN 'tab' || chr(9) || 'here'
+      WHEN 2 THEN 'line one' || chr(10) || 'line two'
+      WHEN 3 THEN 'back' || chr(92) || 'slash'
+      WHEN 4 THEN '한글 데이터 ' || g
+      ELSE 'row-' || g
+    END
+  FROM generate_series(1, ${SANDBOX_UAT_ITEM_COUNT}) AS g;
+`;
+
+const countSandboxUatItemsSql = `
+  SELECT count(*)::int AS n
+  FROM "sandbox_uat"."items"
+`;
+
+const sandboxUatFkJoinCountSql = `
+  SELECT count(*)::int AS n
+  FROM "sandbox_uat"."items" i
+  JOIN "public"."sandbox_uat_parents" p
+    ON p."id" = i."parent_id"
+`;
+
+const maxSandboxUatItemIdSql = `
+  SELECT max("id")::bigint AS max_id
+  FROM "sandbox_uat"."items"
+`;
+
+const insertSandboxUatItemSql = `
+  INSERT INTO "sandbox_uat"."items" (
+    "parent_id",
+    "status",
+    "metadata",
+    "note"
+  )
+  VALUES (
+    '11111111-1111-4111-8111-111111111111',
+    'pending',
+    '{}'::jsonb,
+    'post-restore-insert'
+  )
+  RETURNING "id"
+`;
+
+const selectSandboxUatSpecialRowsSql = `
+  SELECT "id"::int AS id, "note", "metadata"
+  FROM "sandbox_uat"."items"
+  WHERE "id" IN (500, 501, 502, 503, 504)
+  ORDER BY "id"
+`;
+
+const expectedSandboxUatSpecialRows = [
+  { id: 500, note: null, metadata: { index: 500 } },
+  { id: 501, note: "tab\there", metadata: { index: 501 } },
+  { id: 502, note: "line one\nline two", metadata: { index: 502 } },
+  { id: 503, note: "back\\slash", metadata: { index: 503 } },
+  { id: 504, note: "한글 데이터 504", metadata: { index: 504 } },
+];
+
+const selectSandboxUatSchemaExistsSql = `
+  SELECT schema_name
+  FROM information_schema.schemata
+  WHERE schema_name = 'sandbox_uat'
 `;
 
 afterEach(async () => {
@@ -817,6 +928,110 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       }
     },
     20_000,
+  );
+
+  it(
+    "F03 sandbox UAT: backs up and restores a realistic dataset in full isolation",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_sandbox_uat_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-sandbox-uat-backup-");
+      const sourceSql = postgres(sourceConnectionString, {
+        max: 1,
+        onnotice: () => {},
+      });
+      const restoreSql = postgres(restoreConnectionString, {
+        max: 1,
+        onnotice: () => {},
+      });
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+
+      try {
+        const sourcePort = new URL(sourceConnectionString).port;
+        const restorePort = new URL(restoreConnectionString).port;
+        expect(sourcePort).not.toBe("54329");
+        expect(restorePort).not.toBe("54329");
+
+        const sourceDbName = new URL(sourceConnectionString).pathname;
+        const restoreDbName = new URL(restoreConnectionString).pathname;
+        expect(sourceDbName).not.toBe(restoreDbName);
+
+        await sourceSql.unsafe(createSandboxUatSchemaSql);
+        await sourceSql.unsafe(insertSandboxUatItemsSql);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-sandbox-uat-test",
+          backupEngine: "auto",
+        });
+
+        const backupBytes = await fs.promises.readFile(result.backupFile);
+        const backupSizeBytes = backupBytes.length;
+        const backupSha256 = createHash("sha256")
+          .update(backupBytes)
+          .digest("hex");
+        expect(backupSizeBytes).toBeGreaterThan(0);
+        expect(backupSha256).toMatch(/^[0-9a-f]{64}$/);
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        const [itemCountRow] = await restoreSql.unsafe<{ n: number }[]>(
+          countSandboxUatItemsSql,
+        );
+        expect(itemCountRow?.n).toBe(SANDBOX_UAT_ITEM_COUNT);
+
+        const [fkJoinRow] = await restoreSql.unsafe<{ n: number }[]>(
+          sandboxUatFkJoinCountSql,
+        );
+        expect(fkJoinRow?.n).toBe(SANDBOX_UAT_ITEM_COUNT);
+
+        const schemaRows = await restoreSql.unsafe<{ schema_name: string }[]>(
+          selectSandboxUatSchemaExistsSql,
+        );
+        expect(schemaRows).toHaveLength(1);
+
+        const [maxIdRow] = await restoreSql.unsafe<{ max_id: string }[]>(
+          maxSandboxUatItemIdSql,
+        );
+        expect(Number(maxIdRow?.max_id)).toBe(SANDBOX_UAT_ITEM_COUNT);
+
+        const specialRows = await restoreSql.unsafe<
+          { id: number; note: string | null; metadata: { index: number } }[]
+        >(selectSandboxUatSpecialRowsSql);
+        expect(specialRows).toEqual(expectedSandboxUatSpecialRows);
+
+        const [insertedRow] = await restoreSql.unsafe<{ id: string }[]>(
+          insertSandboxUatItemSql,
+        );
+        const newId = Number(insertedRow?.id);
+        expect(newId).toBeGreaterThan(SANDBOX_UAT_ITEM_COUNT);
+
+        const [duplicateIdCheck] = await restoreSql.unsafe<{ n: number }[]>(`
+          SELECT count(*)::int AS n
+          FROM "sandbox_uat"."items"
+          WHERE "id" = ${newId}
+        `);
+        expect(duplicateIdCheck?.n).toBe(1);
+      } finally {
+        if (originalPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+        }
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    60_000,
   );
 
   it(

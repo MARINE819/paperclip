@@ -509,6 +509,12 @@ async function* readRestoreStatements(
     input: stream,
     crlfDelay: Infinity,
   });
+  const lineIterator = reader[Symbol.asyncIterator]();
+  const nextLine = async (): Promise<string | null> => {
+    const { value, done } = await lineIterator.next();
+    return done ? null : value;
+  };
+
   let statementLines: string[] = [];
 
   const flushStatement = () => {
@@ -519,32 +525,45 @@ async function* readRestoreStatements(
 
   const consumeCopyFromStdin = async (header: string): Promise<void> => {
     const copyStream = await sql.unsafe(header).writable();
+    const completion = finished(copyStream);
+    void completion.catch(() => {});
+
     try {
       let sawTerminator = false;
-      for await (const dataLine of reader) {
+      let linesRead = 0;
+      for (let dataLine = await nextLine(); dataLine !== null; dataLine = await nextLine()) {
+        linesRead++;
         if (dataLine === COPY_FROM_STDIN_TERMINATOR) {
           sawTerminator = true;
           break;
         }
         if (!copyStream.write(`${dataLine}\n`)) {
-          await once(copyStream, "drain");
+          await Promise.race([
+            once(copyStream, "drain"),
+            completion.then(() => {
+              throw new Error("COPY stream closed before input completed");
+            }),
+          ]);
         }
       }
       if (!sawTerminator) {
-        throw new Error("Malformed backup: unterminated COPY FROM stdin block");
+        throw new Error(
+          `Malformed backup: unterminated COPY FROM stdin block (header=${JSON.stringify(header)}, linesRead=${linesRead})`,
+        );
       }
       copyStream.end();
-      await finished(copyStream);
+      await completion;
     } catch (error) {
       const normalizedError =
         error instanceof Error ? error : new Error(String(error));
       copyStream.destroy(normalizedError);
+      await completion.catch(() => {});
       throw normalizedError;
     }
   };
 
   try {
-    for await (const line of reader) {
+    for (let line = await nextLine(); line !== null; line = await nextLine()) {
       if (line === STATEMENT_BREAKPOINT) {
         const statement = flushStatement();
         if (statement.length > 0) {

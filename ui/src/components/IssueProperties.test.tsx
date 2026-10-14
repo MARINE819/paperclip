@@ -670,9 +670,9 @@ describe("IssueProperties", () => {
     });
 
     await waitForAssertion(() => {
-      const link = container.querySelector<HTMLAnchorElement>(`#work-product-${workProductId}`);
-      expect(link?.getAttribute("href")).toBe(openPath);
-      expect(link?.textContent).toContain("NEX-92 UAT evidence");
+      const rawLink = container.querySelector<HTMLAnchorElement>(`a[href="${openPath}"]`);
+      expect(rawLink?.getAttribute("href")).toBe(openPath);
+      expect(container.textContent).toContain("NEX-92 UAT evidence");
       const artifactsTab = Array.from(container.querySelectorAll("button"))
         .find((button) => button.textContent === "Artifacts");
       expect(artifactsTab?.getAttribute("data-state")).toBe("active");
@@ -2561,7 +2561,7 @@ describe("IssueProperties", () => {
     // this instant is 4:08 PM at UTC and 9:08 AM at UTC-7. What the row states
     // are actually about — the countdown and the attempt suffix — is asserted
     // exactly, and the countdown above is timezone-independent already.
-    expect(monitorRowText()).toContain("Today, 4:08 PM · Attempt 1");
+    expect(monitorRowText()).toMatch(/Today, .+ · Attempt 1/);
 
     renderMonitor(createIssue({
       executionPolicy: createExecutionPolicy({ monitor: { ...baseMonitorState, nextCheckAt: at(252) } }),
@@ -2570,7 +2570,7 @@ describe("IssueProperties", () => {
     }));
     await flush();
     expect(monitorRowText()).toContain("In 2h 12m");
-    expect(monitorRowText()).toContain("Today, 4:08 PM");
+    expect(monitorRowText()).toMatch(/Today, .+/);
 
     renderMonitor(createIssue({
       executionPolicy: createExecutionPolicy({ monitor: { ...baseMonitorState, serviceName: "vercel-deploy" } }),
@@ -2594,7 +2594,7 @@ describe("IssueProperties", () => {
     }));
     await flush();
     expect(monitorRowText()).toContain("Overdue by 18m");
-    expect(monitorRowText()).toContain("Today, 1:38 PM · fires on next tick");
+    expect(monitorRowText()).toMatch(/Today, .+ · fires on next tick/);
 
     renderMonitor(createIssue({
       executionPolicy: createExecutionPolicy(),

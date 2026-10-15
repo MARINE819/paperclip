@@ -2,9 +2,10 @@ import { Router } from "express";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { verifyBackupManifest } from "@paperclipai/db/backup-lib";
-import { forbidden } from "../errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
-import { assertInstanceAdmin } from "./authz.js";
+import { acceptRestoreJob } from "../services/restore-control.js";
+import { assertInstanceAdmin, getActorInfo } from "./authz.js";
 
 export type BackupCatalogManifestStatus = "valid" | "missing" | "malformed" | "hash_mismatch";
 
@@ -18,6 +19,8 @@ export type BackupCatalogEntry = {
 
 export type InstanceDatabaseRestoreCatalogService = {
   backupDir: string;
+  /** Test-only override for where restore job files are read/written. */
+  homeDir?: string;
 };
 
 // Maps verifyBackupManifest's own reason strings (packages/db/src/backup-lib.ts)
@@ -85,6 +88,39 @@ export function instanceDatabaseRestoreCatalogRoutes(service: InstanceDatabaseRe
     }
 
     res.status(200).json({ backups });
+  });
+
+  router.post("/instance/database-restores/jobs", async (req, res) => {
+    assertInstanceAdmin(req);
+    if (isCloudManagedInstance()) {
+      throw forbidden("Database restore is platform-managed on cloud-managed instances", {
+        code: "database_restores_platform_managed",
+      });
+    }
+
+    const backupId = typeof req.body?.backupId === "string" ? req.body.backupId : "";
+    const requestedBy = getActorInfo(req).actorId;
+
+    const result = await acceptRestoreJob({
+      backupId,
+      backupDir: service.backupDir,
+      requestedBy,
+      homeDir: service.homeDir,
+    });
+
+    if (!result.ok) {
+      if (result.httpStatus === 409) {
+        throw conflict(result.message, { code: result.code });
+      }
+      if (result.httpStatus === 404) {
+        throw notFound(result.message, { code: result.code });
+      }
+      throw badRequest(result.message, { code: result.code });
+    }
+
+    // 202: the job has only been accepted, not executed. No restore has
+    // started, no shutdown has been triggered.
+    res.status(202).json({ jobId: result.jobId, state: "accepted" });
   });
 
   return router;

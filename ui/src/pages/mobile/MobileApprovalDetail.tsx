@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParams, useNavigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { approvalsApi } from "../../api/approvals";
@@ -10,6 +10,40 @@ import { Textarea } from "@/components/ui/textarea";
 import { ShieldCheck, ShieldAlert, ChevronDown, ChevronUp, Lock, RefreshCw } from "lucide-react";
 import { startAuthentication, browserSupportsWebAuthn } from "@simplewebauthn/browser";
 import { webauthnApi } from "../../api/webauthn";
+import { ApiError } from "@/api/client";
+
+export const UI_TOKEN_TTL_MS = 60_000;
+
+export function isTokenExpiredError(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    const errObj = err as unknown as {
+      status?: number;
+      body?: { reason?: string };
+      data?: { reason?: string };
+      reason?: string;
+    };
+    const reason = errObj.body?.reason ?? errObj.data?.reason ?? errObj.reason;
+    return err.status === 410 && reason === "approval_token_expired";
+  }
+  if (!err || typeof err !== "object") return false;
+  const anyErr = err as {
+    status?: number;
+    statusCode?: number;
+    response?: { status?: number; data?: { reason?: string } };
+    body?: { reason?: string };
+    data?: { reason?: string };
+    reason?: string;
+  };
+
+  const status = anyErr.status ?? anyErr.statusCode ?? anyErr.response?.status;
+  const reason =
+    anyErr.body?.reason ??
+    anyErr.data?.reason ??
+    anyErr.response?.data?.reason ??
+    anyErr.reason;
+
+  return status === 410 && reason === "approval_token_expired";
+}
 
 export function MobileApprovalDetail() {
   const { approvalId } = useParams<{ approvalId: string }>();
@@ -22,6 +56,40 @@ export function MobileApprovalDetail() {
   const [approvalToken, setApprovalToken] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isAuthProcessing, setIsAuthProcessing] = useState(false);
+  const [expiresAt, setExpiresAt] = useState<number | null>(null);
+  const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
+
+  const resetAuthState = useCallback((msg?: string) => {
+    setApprovalToken(null);
+    setIsAuthenticated(false);
+    setExpiresAt(null);
+    setRemainingSeconds(null);
+    if (msg) {
+      setErrorMsg(msg);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated || !expiresAt) {
+      return;
+    }
+
+    const updateCountdown = () => {
+      const diff = expiresAt - Date.now();
+      const remaining = Math.max(0, Math.ceil(diff / 1000));
+      if (diff <= 0 || remaining <= 0) {
+        resetAuthState("인증 시간이 만료되었습니다. Face ID로 다시 인증해 주세요.");
+      } else {
+        setRemainingSeconds(remaining);
+      }
+    };
+
+    const timerId = setInterval(updateCountdown, 1000);
+
+    return () => {
+      clearInterval(timerId);
+    };
+  }, [isAuthenticated, expiresAt, resetAuthState]);
 
   const { data: approval, isLoading, refetch } = useQuery({
     queryKey: queryKeys.approvals.detail(approvalId || ""),
@@ -49,7 +117,11 @@ export function MobileApprovalDetail() {
       refresh();
       navigate("/mobile/approvals", { replace: true });
     },
-    onError: (err) => {
+    onError: (err: unknown) => {
+      if (isTokenExpiredError(err)) {
+        resetAuthState("인증 시간이 만료되었습니다. Face ID로 다시 인증해 주세요.");
+        return;
+      }
       setErrorMsg(err instanceof Error ? err.message : "승인 실행 실패");
     }
   });
@@ -61,7 +133,7 @@ export function MobileApprovalDetail() {
       refresh();
       navigate("/mobile/approvals", { replace: true });
     },
-    onError: (err) => {
+    onError: (err: unknown) => {
       setErrorMsg(err instanceof Error ? err.message : "거절 실행 실패");
     }
   });
@@ -73,7 +145,7 @@ export function MobileApprovalDetail() {
       refresh();
       navigate("/mobile/approvals", { replace: true });
     },
-    onError: (err) => {
+    onError: (err: unknown) => {
       setErrorMsg(err instanceof Error ? err.message : "수정 요청 실패");
     }
   });
@@ -108,6 +180,10 @@ export function MobileApprovalDetail() {
       if (verifyResult.verified && verifyResult.approvalToken) {
         setApprovalToken(verifyResult.approvalToken);
         setIsAuthenticated(true);
+        const expires = Date.now() + UI_TOKEN_TTL_MS;
+        setExpiresAt(expires);
+        setRemainingSeconds(Math.ceil(UI_TOKEN_TTL_MS / 1000));
+        setErrorMsg(null);
       } else {
         setErrorMsg("생체 인증 검증에 실패했습니다.");
       }
@@ -259,8 +335,16 @@ export function MobileApprovalDetail() {
               {isAuthProcessing ? "바이오 챌린지 검증 중..." : "Face ID / 기기 생체 인증 수행"}
             </Button>
           ) : (
-            <div className="bg-green-500/10 p-2 rounded border border-green-500/20 text-xs text-green-700 font-bold text-center">
-              생체인증 완료 (결정 승인 가드 해제됨)
+            <div className="bg-green-500/10 p-2 rounded border border-green-500/20 text-xs text-green-700 font-bold text-center space-y-1">
+              <div>생체인증 완료 (결정 승인 가드 해제됨)</div>
+              {remainingSeconds !== null && (
+                <div
+                  data-testid="approval-token-countdown"
+                  className="text-xs font-semibold text-green-800 dark:text-green-300"
+                >
+                  남은 시간: {remainingSeconds}초
+                </div>
+              )}
             </div>
           )}
         </Card>

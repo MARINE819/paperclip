@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MobileApprovalDetail } from "./MobileApprovalDetail";
+import { MobileApprovalDetail, UI_TOKEN_TTL_MS } from "./MobileApprovalDetail";
 
 const mockNavigate = vi.fn();
 const mockApprovalsApi = vi.hoisted(() => ({
@@ -47,8 +47,17 @@ vi.mock("@simplewebauthn/browser", () => ({
 
 async function flushUi() {
   await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (let i = 0; i < 20; i++) {
+      await Promise.resolve();
+    }
+    if (vi.isFakeTimers()) {
+      vi.advanceTimersByTime(0);
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    for (let i = 0; i < 20; i++) {
+      await Promise.resolve();
+    }
   });
 }
 
@@ -56,15 +65,17 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
   let queryClient: QueryClient;
+  let isUnmounted = false;
 
   beforeEach(() => {
+    isUnmounted = false;
     vi.clearAllMocks();
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
     queryClient = new QueryClient({
       defaultOptions: {
-        queries: { retry: false },
+        queries: { retry: false, gcTime: 0 },
         mutations: { retry: false },
       },
     });
@@ -84,20 +95,30 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
     mockSimpleWebauthn.browserSupportsWebAuthn.mockReturnValue(true);
   });
 
-  afterEach(() => {
-    act(() => {
-      root.unmount();
-    });
+  afterEach(async () => {
+    if (vi.isFakeTimers()) {
+      vi.useRealTimers();
+    }
+    if (!isUnmounted) {
+      await act(async () => {
+        root.unmount();
+      });
+    }
+    queryClient.clear();
     container.remove();
   });
 
-  function renderComponent() {
-    act(() => {
+  async function renderComponent() {
+    await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
           <MobileApprovalDetail />
         </QueryClientProvider>,
       );
+    });
+    await flushUi();
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
     });
   }
 
@@ -122,7 +143,7 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
       status: "approved",
     });
 
-    renderComponent();
+    await renderComponent();
     await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
 
     // Click Face ID authentication button
@@ -177,7 +198,7 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
     notAllowedError.name = "NotAllowedError";
     mockSimpleWebauthn.startAuthentication.mockRejectedValue(notAllowedError);
 
-    renderComponent();
+    await renderComponent();
     await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
 
     const authButton = Array.from(container.querySelectorAll("button")).find((b) =>
@@ -208,7 +229,7 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
     mockSimpleWebauthn.startAuthentication.mockResolvedValue({ id: "cred-bad", response: {} });
     mockWebauthnApi.verifyAuthentication.mockResolvedValue({ verified: false });
 
-    renderComponent();
+    await renderComponent();
     await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
 
     const authButton = Array.from(container.querySelectorAll("button")).find((b) =>
@@ -227,7 +248,7 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
   it("unsupported browser shows error and NEVER calls approvalsApi.approve", async () => {
     mockSimpleWebauthn.browserSupportsWebAuthn.mockReturnValue(false);
 
-    renderComponent();
+    await renderComponent();
     await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
 
     const authButton = Array.from(container.querySelectorAll("button")).find((b) =>
@@ -253,7 +274,7 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
     });
     mockApprovalsApi.approve.mockResolvedValue({ id: "app-1", status: "approved" });
 
-    renderComponent();
+    await renderComponent();
     await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
 
     // Authenticate first
@@ -268,7 +289,7 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
     // Enter decision note
     const textarea = container.querySelector("textarea")!;
     expect(textarea).toBeDefined();
-    act(() => {
+    await act(async () => {
       const setter = Object.getOwnPropertyDescriptor(
         window.HTMLTextAreaElement.prototype,
         "value",
@@ -294,7 +315,7 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
   });
 
   it("renders approval actions container with sticky positioning above bottom navigation", async () => {
-    renderComponent();
+    await renderComponent();
     await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
 
     const actionsContainer = container.querySelector(
@@ -309,5 +330,309 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
     expect(className).toContain("transition-[bottom]");
     expect(className).not.toContain("fixed");
     expect(className).not.toContain("bottom-0");
+  });
+
+  it("automatic reset after 60 seconds", async () => {
+    expect(UI_TOKEN_TTL_MS).toBe(60_000);
+
+    mockWebauthnApi.getAuthenticationOptions.mockResolvedValue({
+      challenge: "server-challenge-123",
+      rpId: "localhost",
+    });
+    mockSimpleWebauthn.startAuthentication.mockResolvedValue({
+      id: "cred-1",
+      rawId: "raw-1",
+      response: { clientDataJSON: "abc", authenticatorData: "def", signature: "ghi" },
+      type: "public-key",
+    });
+    mockWebauthnApi.verifyAuthentication.mockResolvedValue({
+      verified: true,
+      credentialId: "cred-1",
+      approvalToken: "tok_mobile_sec_999",
+    });
+
+    await renderComponent();
+    await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
+
+    vi.useFakeTimers();
+
+    const authButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Face ID"),
+    );
+    expect(authButton).toBeDefined();
+
+    await act(async () => {
+      authButton!.click();
+    });
+    await flushUi();
+
+    expect(container.textContent).toContain("생체인증 완료");
+    expect(container.textContent).toContain("60초");
+
+    // Advance timers by 60 seconds (TTL expiration)
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    await flushUi();
+
+    // Verify reset state: error message displayed and authenticated badge removed
+    expect(container.textContent).toContain(
+      "인증 시간이 만료되었습니다. Face ID로 다시 인증해 주세요.",
+    );
+    expect(container.textContent).not.toContain("생체인증 완료");
+
+    // Face ID button restored
+    const restoredAuthButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Face ID"),
+    );
+    expect(restoredAuthButton).toBeDefined();
+
+    // Approve button should be disabled
+    const approveButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("승인 실행"),
+    );
+    expect(approveButton?.hasAttribute("disabled")).toBe(true);
+
+    // Clicking approve does not call API
+    await act(async () => {
+      approveButton!.click();
+    });
+    expect(mockApprovalsApi.approve).not.toHaveBeenCalled();
+  });
+
+  it("HTTP 410 reset", async () => {
+    mockWebauthnApi.getAuthenticationOptions.mockResolvedValue({
+      challenge: "server-challenge-123",
+      rpId: "localhost",
+    });
+    mockSimpleWebauthn.startAuthentication.mockResolvedValue({
+      id: "cred-1",
+      rawId: "raw-1",
+      response: { clientDataJSON: "abc", authenticatorData: "def", signature: "ghi" },
+      type: "public-key",
+    });
+    mockWebauthnApi.verifyAuthentication.mockResolvedValue({
+      verified: true,
+      credentialId: "cred-1",
+      approvalToken: "tok_mobile_sec_999",
+    });
+
+    const http410Error = Object.assign(new Error("Approval token expired"), {
+      status: 410,
+      body: { reason: "approval_token_expired" },
+    });
+    mockApprovalsApi.approve.mockRejectedValue(http410Error);
+
+    await renderComponent();
+    await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
+
+    // Authenticate
+    const authButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Face ID"),
+    );
+    expect(authButton).toBeDefined();
+
+    await act(async () => {
+      authButton!.click();
+    });
+    await flushUi();
+
+    expect(container.textContent).toContain("생체인증 완료");
+
+    // Click Approve
+    const approveButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("승인 실행"),
+    );
+    expect(approveButton).toBeDefined();
+
+    await act(async () => {
+      approveButton!.click();
+    });
+    await flushUi();
+
+    // Verify HTTP 410 reset
+    expect(container.textContent).toContain(
+      "인증 시간이 만료되었습니다. Face ID로 다시 인증해 주세요.",
+    );
+    expect(container.textContent).not.toContain("생체인증 완료");
+
+    // Face ID button restored
+    const restoredAuthButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Face ID"),
+    );
+    expect(restoredAuthButton).toBeDefined();
+
+    // Approve button disabled
+    const currentApproveButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("승인 실행"),
+    );
+    expect(currentApproveButton?.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("45 seconds remaining after 15 seconds", async () => {
+    mockWebauthnApi.getAuthenticationOptions.mockResolvedValue({
+      challenge: "server-challenge-123",
+      rpId: "localhost",
+    });
+    mockSimpleWebauthn.startAuthentication.mockResolvedValue({
+      id: "cred-1",
+      rawId: "raw-1",
+      response: { clientDataJSON: "abc", authenticatorData: "def", signature: "ghi" },
+      type: "public-key",
+    });
+    mockWebauthnApi.verifyAuthentication.mockResolvedValue({
+      verified: true,
+      credentialId: "cred-1",
+      approvalToken: "tok_mobile_sec_999",
+    });
+
+    await renderComponent();
+    await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
+
+    vi.useFakeTimers();
+
+    const authButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Face ID"),
+    );
+    expect(authButton).toBeDefined();
+
+    await act(async () => {
+      authButton!.click();
+    });
+    await flushUi();
+
+    expect(container.textContent).toContain("생체인증 완료");
+    expect(container.textContent).toContain("60초");
+
+    // Advance 15 seconds
+    await act(async () => {
+      vi.advanceTimersByTime(15_000);
+    });
+    await flushUi();
+
+    // Verify 45 seconds remaining
+    expect(container.textContent).toContain("45초");
+    expect(container.textContent).toContain("생체인증 완료");
+  });
+
+  it("timer cleanup on unmount", async () => {
+    mockWebauthnApi.getAuthenticationOptions.mockResolvedValue({
+      challenge: "server-challenge-123",
+      rpId: "localhost",
+    });
+    mockSimpleWebauthn.startAuthentication.mockResolvedValue({
+      id: "cred-1",
+      rawId: "raw-1",
+      response: { clientDataJSON: "abc", authenticatorData: "def", signature: "ghi" },
+      type: "public-key",
+    });
+    mockWebauthnApi.verifyAuthentication.mockResolvedValue({
+      verified: true,
+      credentialId: "cred-1",
+      approvalToken: "tok_mobile_sec_999",
+    });
+
+    await renderComponent();
+    await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
+
+    vi.useFakeTimers();
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+
+    const authButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Face ID"),
+    );
+    expect(authButton).toBeDefined();
+
+    await act(async () => {
+      authButton!.click();
+    });
+    await flushUi();
+
+    expect(container.textContent).toContain("생체인증 완료");
+
+    await act(async () => {
+      root.unmount();
+    });
+    isUnmounted = true;
+
+    expect(clearIntervalSpy).toHaveBeenCalled();
+    clearIntervalSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("does not reset authentication when 410 reason is approval_expired or 400 with approval_token_expired", async () => {
+    mockWebauthnApi.getAuthenticationOptions.mockResolvedValue({
+      challenge: "server-challenge-123",
+      rpId: "localhost",
+    });
+    mockSimpleWebauthn.startAuthentication.mockResolvedValue({
+      id: "cred-1",
+      rawId: "raw-1",
+      response: { clientDataJSON: "abc", authenticatorData: "def", signature: "ghi" },
+      type: "public-key",
+    });
+    mockWebauthnApi.verifyAuthentication.mockResolvedValue({
+      verified: true,
+      credentialId: "cred-1",
+      approvalToken: "tok_mobile_sec_999",
+    });
+
+    await renderComponent();
+    await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
+
+    const authButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Face ID"),
+    );
+    expect(authButton).toBeDefined();
+
+    await act(async () => {
+      authButton!.click();
+    });
+    await flushUi();
+
+    expect(container.textContent).toContain("생체인증 완료");
+
+    const approveButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("승인 실행"),
+    );
+    expect(approveButton).toBeDefined();
+
+    // 1. 410 with reason 'approval_expired' (not approval_token_expired)
+    const error410WrongReason = Object.assign(new Error("Approval expired"), {
+      status: 410,
+      body: { reason: "approval_expired" },
+    });
+    mockApprovalsApi.approve.mockRejectedValueOnce(error410WrongReason);
+
+    await act(async () => {
+      approveButton!.click();
+    });
+    await flushUi();
+
+    expect(container.textContent).toContain("생체인증 완료");
+    expect(container.textContent).not.toContain(
+      "인증 시간이 만료되었습니다. Face ID로 다시 인증해 주세요.",
+    );
+    expect(container.textContent).toContain("Approval expired");
+    expect(approveButton?.hasAttribute("disabled")).toBe(false);
+
+    // 2. 400 with reason 'approval_token_expired' (status is 400, not 410)
+    const error400WrongStatus = Object.assign(new Error("Bad request"), {
+      status: 400,
+      body: { reason: "approval_token_expired" },
+    });
+    mockApprovalsApi.approve.mockRejectedValueOnce(error400WrongStatus);
+
+    await act(async () => {
+      approveButton!.click();
+    });
+    await flushUi();
+
+    expect(container.textContent).toContain("생체인증 완료");
+    expect(container.textContent).not.toContain(
+      "인증 시간이 만료되었습니다. Face ID로 다시 인증해 주세요.",
+    );
+    expect(container.textContent).toContain("Bad request");
+    expect(approveButton?.hasAttribute("disabled")).toBe(false);
   });
 });

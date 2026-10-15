@@ -292,4 +292,22 @@ describe("MobileApprovalDetail WebAuthn wiring and token gate", () => {
       approvalToken: "token-with-note-123",
     });
   });
+
+  it("renders approval actions container with sticky positioning above bottom navigation", async () => {
+    renderComponent();
+    await vi.waitFor(() => expect(container.textContent).toContain("HIGH RISK WARNING"));
+
+    const actionsContainer = container.querySelector(
+      '[data-testid="mobile-approval-actions"]',
+    );
+    expect(actionsContainer).not.toBeNull();
+    const className = actionsContainer?.getAttribute("class") ?? "";
+
+    expect(className).toContain("sticky");
+    expect(className).toContain("bottom-(--tc-composer-bottom)");
+    expect(className).toContain("z-20");
+    expect(className).toContain("transition-[bottom]");
+    expect(className).not.toContain("fixed");
+    expect(className).not.toContain("bottom-0");
+  });
 });

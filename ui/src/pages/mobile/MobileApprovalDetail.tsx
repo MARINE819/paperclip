@@ -275,7 +275,10 @@ export function MobileApprovalDetail() {
 
       {/* 8. Bottom Buttons (Strict gate validation) */}
       {isPending && (
-        <div className="fixed bottom-0 left-0 right-0 p-4 border-t border-border bg-background/95 backdrop-blur z-20 flex gap-2 max-w-md mx-auto justify-between">
+        <div
+          data-testid="mobile-approval-actions"
+          className="sticky bottom-(--tc-composer-bottom) z-20 transition-[bottom] duration-200 ease-out p-4 border-t border-border bg-background/95 backdrop-blur flex gap-2 max-w-md mx-auto justify-between"
+        >
           <Button
             variant="outline"
             size="sm"

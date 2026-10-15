@@ -77,6 +77,24 @@ export type RunDatabaseRestoreOptions = {
    * preserves existing CLI and legacy restore behavior unchanged.
    */
   verifyManifestBeforeRestore?: boolean;
+  /**
+   * When true, skip restoreWithPsql entirely and use the JS-native engine
+   * unconditionally. Defaults to false/unset, which preserves the existing
+   * psql-first behavior. Automatically forced true whenever `sentinel` is
+   * provided, since psql has no sentinel-injection mechanism.
+   */
+  forceJavaScriptEngine?: boolean;
+  /**
+   * When provided, a validated sentinel row is inserted on the same
+   * connection and in the same transaction immediately before the backup
+   * file's single COMMIT statement executes, so the sentinel and the
+   * restored data always commit or roll back together.
+   */
+  sentinel?: {
+    jobId: string;
+    backupId: string;
+    manifestSha256: string;
+  };
 };
 
 type SequenceDefinition = {
@@ -698,6 +716,120 @@ const COPY_FROM_STDIN_TERMINATOR = String.raw`\.`;
 // Broadly detects any line that looks like it was meant to be a COPY
 // FROM stdin header but does not match COPY_FROM_STDIN_HEADER_RE exactly.
 const COPY_FROM_STDIN_LOOSE_RE = /^COPY .* FROM stdin;$/;
+
+const SENTINEL_JOB_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SENTINEL_BACKUP_ID_RE = /^[A-Za-z0-9._-]+\.sql(\.gz)?$/;
+const SENTINEL_MANIFEST_SHA256_RE = /^[0-9a-f]{64}$/;
+
+function validateRestoreSentinel(sentinel: { jobId: string; backupId: string; manifestSha256: string }): void {
+  if (!SENTINEL_JOB_ID_RE.test(sentinel.jobId)) {
+    throw new Error(`Invalid restore sentinel jobId (must be a UUID): ${JSON.stringify(sentinel.jobId)}`);
+  }
+  if (!SENTINEL_BACKUP_ID_RE.test(sentinel.backupId)) {
+    throw new Error(`Invalid restore sentinel backupId (must be a .sql/.sql.gz filename): ${JSON.stringify(sentinel.backupId)}`);
+  }
+  if (!SENTINEL_MANIFEST_SHA256_RE.test(sentinel.manifestSha256)) {
+    throw new Error(`Invalid restore sentinel manifestSha256 (must be 64 lowercase hex chars): ${JSON.stringify(sentinel.manifestSha256)}`);
+  }
+}
+
+// The backup writer bundles any "-- comment" / blank lines immediately
+// preceding a statement into the same breakpoint-delimited block (e.g. the
+// file's leading "-- Paperclip database backup" / "-- Created: ..." lines
+// sit in the same block as the literal "BEGIN;" line). This strips exactly
+// that leading comment/blank-line prefix so the remaining text can be
+// compared against the bare "BEGIN;"/"COMMIT;" literal.
+function stripLeadingCommentsAndBlankLines(statement: string): string {
+  const lines = statement.split("\n");
+  let i = 0;
+  while (i < lines.length && (lines[i]!.trim().length === 0 || lines[i]!.trimStart().startsWith("--"))) {
+    i += 1;
+  }
+  return lines.slice(i).join("\n").trim();
+}
+
+// Streams the backup file once, tracking only bounded counters -- never
+// materializes an array of statements, so this is safe to run against a
+// multi-gigabyte backup before any DB connection is opened. COPY FROM stdin
+// blocks are skipped line-by-line up to their terminator using the same
+// detection constants readRestoreStatements uses, so COPY data can never be
+// miscounted as a top-level BEGIN/COMMIT statement.
+async function validateRestoreTransactionStructure(backupFile: string): Promise<void> {
+  const raw = createReadStream(backupFile);
+  const stream = backupFile.endsWith(".gz") ? raw.pipe(createGunzip()) : raw;
+  stream.setEncoding("utf8");
+  const reader = createInterface({ input: stream, crlfDelay: Infinity });
+  const lineIterator = reader[Symbol.asyncIterator]();
+  const nextLine = async (): Promise<string | null> => {
+    const { value, done } = await lineIterator.next();
+    return done ? null : value;
+  };
+
+  let statementLines: string[] = [];
+  let topLevelStatementCount = 0;
+  let beginCount = 0;
+  let beginIndex = -1;
+  let commitCount = 0;
+  let commitIndex = -1;
+
+  const flush = () => {
+    const statement = statementLines.join("\n").trim();
+    statementLines = [];
+    if (statement.length === 0) return;
+    const index = topLevelStatementCount;
+    topLevelStatementCount += 1;
+    const bareStatement = stripLeadingCommentsAndBlankLines(statement);
+    if (bareStatement === "BEGIN;") {
+      beginCount += 1;
+      beginIndex = index;
+    } else if (bareStatement === "COMMIT;") {
+      commitCount += 1;
+      commitIndex = index;
+    }
+  };
+
+  try {
+    for (let line = await nextLine(); line !== null; line = await nextLine()) {
+      if (line === STATEMENT_BREAKPOINT) {
+        flush();
+        continue;
+      }
+
+      if (COPY_FROM_STDIN_HEADER_RE.test(line)) {
+        if (statementLines.some((pendingLine) => pendingLine.trim().length > 0 && !pendingLine.trimStart().startsWith("--"))) {
+          throw new Error("Malformed backup: COPY header appeared mid-statement");
+        }
+        for (let dataLine = await nextLine(); dataLine !== null; dataLine = await nextLine()) {
+          if (dataLine === COPY_FROM_STDIN_TERMINATOR) break;
+        }
+        statementLines = [];
+        continue;
+      }
+
+      if (COPY_FROM_STDIN_LOOSE_RE.test(line)) {
+        throw new Error("Malformed backup: invalid COPY FROM stdin header");
+      }
+
+      statementLines.push(line);
+    }
+    flush();
+  } finally {
+    reader.close();
+    stream.destroy();
+    raw.destroy();
+  }
+
+  if (beginCount !== 1 || beginIndex !== 0) {
+    throw new Error(
+      `Malformed backup: expected exactly one BEGIN; as the first statement (beginCount=${beginCount}, beginIndex=${beginIndex})`,
+    );
+  }
+  if (commitCount !== 1 || commitIndex !== topLevelStatementCount - 1) {
+    throw new Error(
+      `Malformed backup: expected exactly one COMMIT; as the last statement (commitCount=${commitCount}, commitIndex=${commitIndex}, total=${topLevelStatementCount})`,
+    );
+  }
+}
 
 async function* readRestoreStatements(
   backupFile: string,
@@ -1467,6 +1599,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 }
 
 export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promise<void> {
+  if (opts.sentinel) {
+    validateRestoreSentinel(opts.sentinel);
+  }
+
   if (opts.verifyManifestBeforeRestore) {
     const verification = await verifyBackupManifest(opts.backupFile);
     if (!verification.ok) {
@@ -1476,17 +1612,25 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
     }
   }
 
+  const mustUseJavaScriptEngine = opts.forceJavaScriptEngine === true || opts.sentinel != null;
+  if (mustUseJavaScriptEngine) {
+    await validateRestoreTransactionStructure(opts.backupFile);
+  }
+
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
   let psqlRestoreError: unknown = null;
-  try {
-    await restoreWithPsql(opts, connectTimeout);
-    return;
-  } catch (error) {
-    psqlRestoreError = error;
-    if (!(await hasStatementBreakpoints(opts.backupFile))) {
-      throw new Error(
-        `Failed to restore ${basename(opts.backupFile)} with psql: ${sanitizeRestoreErrorMessage(error)}`,
-      );
+
+  if (!mustUseJavaScriptEngine) {
+    try {
+      await restoreWithPsql(opts, connectTimeout);
+      return;
+    } catch (error) {
+      psqlRestoreError = error;
+      if (!(await hasStatementBreakpoints(opts.backupFile))) {
+        throw new Error(
+          `Failed to restore ${basename(opts.backupFile)} with psql: ${sanitizeRestoreErrorMessage(error)}`,
+        );
+      }
     }
   }
 
@@ -1495,6 +1639,21 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
   try {
     await sql`SELECT 1`;
     for await (const statement of readRestoreStatements(opts.backupFile, sql)) {
+      if (opts.sentinel && stripLeadingCommentsAndBlankLines(statement) === "COMMIT;") {
+        await sql.unsafe(`
+          CREATE SCHEMA IF NOT EXISTS _paperclip_restore_control;
+          CREATE TABLE IF NOT EXISTS _paperclip_restore_control.journal (
+            job_id uuid PRIMARY KEY,
+            backup_id text NOT NULL,
+            manifest_sha256 text NOT NULL,
+            completed_at timestamptz NOT NULL
+          );
+        `);
+        await sql`
+          INSERT INTO _paperclip_restore_control.journal (job_id, backup_id, manifest_sha256, completed_at)
+          VALUES (${opts.sentinel.jobId}, ${opts.sentinel.backupId}, ${opts.sentinel.manifestSha256}, now())
+        `;
+      }
       await sql.unsafe(statement).execute();
     }
   } catch (error) {

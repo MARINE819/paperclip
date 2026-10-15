@@ -1221,6 +1221,574 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
   );
 
   it(
+    "never spawns psql when forceJavaScriptEngine is set",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_force_js_no_psql_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-force-js-no-psql-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      const markerPath = path.join(backupDir, "psql-was-invoked.marker");
+      const requireScript = path.join(backupDir, "mark-psql-invocation.cjs");
+      fs.writeFileSync(
+        requireScript,
+        `require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "invoked"); process.exit(0);`,
+        "utf8",
+      );
+      const originalPsqlPath = process.env.PAPERCLIP_PSQL_PATH;
+      const originalNodeOptions = process.env.NODE_OPTIONS;
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."force_js_no_psql_rows" ("id" serial PRIMARY KEY);
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-force-js-no-psql-test",
+        });
+
+        process.env.PAPERCLIP_PSQL_PATH = process.execPath;
+        process.env.NODE_OPTIONS = `--require ${requireScript}`;
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+          forceJavaScriptEngine: true,
+        });
+
+        expect(fs.existsSync(markerPath)).toBe(false);
+
+        const tables = await restoreSql.unsafe<{ table_name: string }[]>(`
+          SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name = 'force_js_no_psql_rows'
+        `);
+        expect(tables).toHaveLength(1);
+      } finally {
+        if (originalPsqlPath === undefined) {
+          delete process.env.PAPERCLIP_PSQL_PATH;
+        } else {
+          process.env.PAPERCLIP_PSQL_PATH = originalPsqlPath;
+        }
+        if (originalNodeOptions === undefined) {
+          delete process.env.NODE_OPTIONS;
+        } else {
+          process.env.NODE_OPTIONS = originalNodeOptions;
+        }
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "never spawns psql when a sentinel is provided, even without forceJavaScriptEngine",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_sentinel_no_psql_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-sentinel-no-psql-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      const markerPath = path.join(backupDir, "psql-was-invoked.marker");
+      const requireScript = path.join(backupDir, "mark-psql-invocation.cjs");
+      fs.writeFileSync(
+        requireScript,
+        `require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "invoked"); process.exit(0);`,
+        "utf8",
+      );
+      const originalPsqlPath = process.env.PAPERCLIP_PSQL_PATH;
+      const originalNodeOptions = process.env.NODE_OPTIONS;
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."sentinel_no_psql_rows" ("id" serial PRIMARY KEY);
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-sentinel-no-psql-test",
+        });
+
+        process.env.PAPERCLIP_PSQL_PATH = process.execPath;
+        process.env.NODE_OPTIONS = `--require ${requireScript}`;
+
+        const backupBytes = fs.readFileSync(result.backupFile);
+        const backupSha256 = createHash("sha256").update(backupBytes).digest("hex");
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+          sentinel: {
+            jobId: "22222222-2222-4222-8222-222222222222",
+            backupId: path.basename(result.backupFile),
+            manifestSha256: backupSha256,
+          },
+        });
+
+        expect(fs.existsSync(markerPath)).toBe(false);
+
+        const tables = await restoreSql.unsafe<{ table_name: string }[]>(`
+          SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name = 'sentinel_no_psql_rows'
+        `);
+        expect(tables).toHaveLength(1);
+      } finally {
+        if (originalPsqlPath === undefined) {
+          delete process.env.PAPERCLIP_PSQL_PATH;
+        } else {
+          process.env.PAPERCLIP_PSQL_PATH = originalPsqlPath;
+        }
+        if (originalNodeOptions === undefined) {
+          delete process.env.NODE_OPTIONS;
+        } else {
+          process.env.NODE_OPTIONS = originalNodeOptions;
+        }
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "rejects an invalid sentinel jobId before any DB connection is attempted",
+    async () => {
+      await expect(
+        runDatabaseRestore({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupFile: "unused.sql.gz",
+          sentinel: {
+            jobId: "not-a-uuid",
+            backupId: "paperclip-test.sql.gz",
+            manifestSha256: "a".repeat(64),
+          },
+        }),
+      ).rejects.toThrow(/jobId/);
+    },
+    2_000,
+  );
+
+  it(
+    "rejects an invalid sentinel backupId before any DB connection is attempted",
+    async () => {
+      await expect(
+        runDatabaseRestore({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupFile: "unused.sql.gz",
+          sentinel: {
+            jobId: "11111111-1111-4111-8111-111111111111",
+            backupId: "../escape.sql.gz",
+            manifestSha256: "a".repeat(64),
+          },
+        }),
+      ).rejects.toThrow(/backupId/);
+    },
+    2_000,
+  );
+
+  it(
+    "rejects an invalid sentinel manifestSha256 before any DB connection is attempted",
+    async () => {
+      await expect(
+        runDatabaseRestore({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupFile: "unused.sql.gz",
+          sentinel: {
+            jobId: "11111111-1111-4111-8111-111111111111",
+            backupId: "paperclip-test.sql.gz",
+            manifestSha256: "NOT-HEX-OR-WRONG-LENGTH",
+          },
+        }),
+      ).rejects.toThrow(/manifestSha256/);
+    },
+    2_000,
+  );
+
+  it(
+    "rejects a backup with zero top-level BEGIN statements before any DB connection",
+    async () => {
+      const fixtureDir = createTempDir("paperclip-db-structure-begin0-");
+      const backupFile = path.join(fixtureDir, "begin0.sql");
+      fs.writeFileSync(
+        backupFile,
+        [
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "CREATE TABLE public.structure_test_begin0 (id integer primary key);",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "COMMIT;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        ].join("\n"),
+        "utf8",
+      );
+
+      await expect(
+        runDatabaseRestore({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupFile,
+          forceJavaScriptEngine: true,
+        }),
+      ).rejects.toThrow(/exactly one BEGIN/);
+    },
+    2_000,
+  );
+
+  it(
+    "rejects a backup with two top-level BEGIN statements before any DB connection",
+    async () => {
+      const fixtureDir = createTempDir("paperclip-db-structure-begin2-");
+      const backupFile = path.join(fixtureDir, "begin2.sql");
+      fs.writeFileSync(
+        backupFile,
+        [
+          "BEGIN;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "BEGIN;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "CREATE TABLE public.structure_test_begin2 (id integer primary key);",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "COMMIT;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        ].join("\n"),
+        "utf8",
+      );
+
+      await expect(
+        runDatabaseRestore({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupFile,
+          forceJavaScriptEngine: true,
+        }),
+      ).rejects.toThrow(/exactly one BEGIN/);
+    },
+    2_000,
+  );
+
+  it(
+    "rejects a backup whose BEGIN is not the first statement before any DB connection",
+    async () => {
+      const fixtureDir = createTempDir("paperclip-db-structure-begin-not-first-");
+      const backupFile = path.join(fixtureDir, "begin-not-first.sql");
+      fs.writeFileSync(
+        backupFile,
+        [
+          "SELECT 1;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "BEGIN;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "CREATE TABLE public.structure_test_begin_not_first (id integer primary key);",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "COMMIT;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        ].join("\n"),
+        "utf8",
+      );
+
+      await expect(
+        runDatabaseRestore({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupFile,
+          forceJavaScriptEngine: true,
+        }),
+      ).rejects.toThrow(/exactly one BEGIN/);
+    },
+    2_000,
+  );
+
+  it(
+    "rejects a backup with zero top-level COMMIT statements before any DB connection",
+    async () => {
+      const fixtureDir = createTempDir("paperclip-db-structure-commit0-");
+      const backupFile = path.join(fixtureDir, "commit0.sql");
+      fs.writeFileSync(
+        backupFile,
+        [
+          "BEGIN;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "CREATE TABLE public.structure_test_commit0 (id integer primary key);",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        ].join("\n"),
+        "utf8",
+      );
+
+      await expect(
+        runDatabaseRestore({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupFile,
+          forceJavaScriptEngine: true,
+        }),
+      ).rejects.toThrow(/exactly one COMMIT/);
+    },
+    2_000,
+  );
+
+  it(
+    "rejects a backup with two top-level COMMIT statements before any DB connection",
+    async () => {
+      const fixtureDir = createTempDir("paperclip-db-structure-commit2-");
+      const backupFile = path.join(fixtureDir, "commit2.sql");
+      fs.writeFileSync(
+        backupFile,
+        [
+          "BEGIN;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "CREATE TABLE public.structure_test_commit2 (id integer primary key);",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "COMMIT;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "COMMIT;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        ].join("\n"),
+        "utf8",
+      );
+
+      await expect(
+        runDatabaseRestore({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupFile,
+          forceJavaScriptEngine: true,
+        }),
+      ).rejects.toThrow(/exactly one COMMIT/);
+    },
+    2_000,
+  );
+
+  it(
+    "rejects a backup whose COMMIT is not the last statement before any DB connection",
+    async () => {
+      const fixtureDir = createTempDir("paperclip-db-structure-commit-not-last-");
+      const backupFile = path.join(fixtureDir, "commit-not-last.sql");
+      fs.writeFileSync(
+        backupFile,
+        [
+          "BEGIN;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "CREATE TABLE public.structure_test_commit_not_last (id integer primary key);",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "COMMIT;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+          "SELECT 1;",
+          "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        ].join("\n"),
+        "utf8",
+      );
+
+      await expect(
+        runDatabaseRestore({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupFile,
+          forceJavaScriptEngine: true,
+        }),
+      ).rejects.toThrow(/exactly one COMMIT/);
+    },
+    2_000,
+  );
+
+  it(
+    "ignores BEGIN;/COMMIT; strings that appear inside COPY data when validating transaction structure",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_copy_data_begin_commit_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-copy-data-begin-commit-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."copy_data_begin_commit_rows" ("id" serial PRIMARY KEY, "note" text NOT NULL);
+          INSERT INTO "public"."copy_data_begin_commit_rows" ("note") VALUES ('BEGIN;'), ('COMMIT;');
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-copy-data-begin-commit-test",
+        });
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+          forceJavaScriptEngine: true,
+        });
+
+        const rows = await restoreSql.unsafe<{ note: string }[]>(`
+          SELECT "note" FROM "public"."copy_data_begin_commit_rows" ORDER BY "id"
+        `);
+        expect(rows).toEqual([{ note: "BEGIN;" }, { note: "COMMIT;" }]);
+      } finally {
+        if (originalPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+        }
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "commits the sentinel journal row together with the restored data",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_sentinel_commit_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-sentinel-commit-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."sentinel_commit_rows" ("id" serial PRIMARY KEY, "note" text NOT NULL);
+          INSERT INTO "public"."sentinel_commit_rows" ("note") VALUES ('committed-together');
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-sentinel-commit-test",
+        });
+
+        const backupBytes = fs.readFileSync(result.backupFile);
+        const backupSha256 = createHash("sha256").update(backupBytes).digest("hex");
+        const jobId = "33333333-3333-4333-8333-333333333333";
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+          sentinel: {
+            jobId,
+            backupId: path.basename(result.backupFile),
+            manifestSha256: backupSha256,
+          },
+        });
+
+        const rows = await restoreSql.unsafe<{ note: string }[]>(`
+          SELECT "note" FROM "public"."sentinel_commit_rows"
+        `);
+        expect(rows).toEqual([{ note: "committed-together" }]);
+
+        const journalRows = await restoreSql.unsafe<{ job_id: string; backup_id: string }[]>(`
+          SELECT "job_id"::text, "backup_id" FROM "_paperclip_restore_control"."journal" WHERE "job_id" = '${jobId}'
+        `);
+        expect(journalRows).toHaveLength(1);
+        expect(journalRows[0]?.backup_id).toBe(path.basename(result.backupFile));
+      } finally {
+        if (originalPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+        }
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "rolls back all restored data when the sentinel insert hits a PK conflict, leaving the pre-existing journal row untouched",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_sentinel_pk_conflict_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-sentinel-pk-conflict-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+      const jobId = "44444444-4444-4444-8444-444444444444";
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."sentinel_pk_conflict_rows" ("id" serial PRIMARY KEY);
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-sentinel-pk-conflict-test",
+        });
+
+        const backupBytes = fs.readFileSync(result.backupFile);
+        const backupSha256 = createHash("sha256").update(backupBytes).digest("hex");
+
+        await restoreSql.unsafe(`
+          CREATE SCHEMA IF NOT EXISTS "_paperclip_restore_control";
+          CREATE TABLE IF NOT EXISTS "_paperclip_restore_control"."journal" (
+            "job_id" uuid PRIMARY KEY,
+            "backup_id" text NOT NULL,
+            "manifest_sha256" text NOT NULL,
+            "completed_at" timestamptz NOT NULL
+          );
+          INSERT INTO "_paperclip_restore_control"."journal" ("job_id", "backup_id", "manifest_sha256", "completed_at")
+          VALUES ('${jobId}', 'pre-existing-backup-id.sql.gz', '${"a".repeat(64)}', '2020-01-01T00:00:00Z');
+        `);
+
+        await expect(
+          runDatabaseRestore({
+            connectionString: restoreConnectionString,
+            backupFile: result.backupFile,
+            sentinel: {
+              jobId,
+              backupId: path.basename(result.backupFile),
+              manifestSha256: backupSha256,
+            },
+          }),
+        ).rejects.toThrow();
+
+        const tables = await restoreSql.unsafe<{ table_name: string }[]>(`
+          SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name = 'sentinel_pk_conflict_rows'
+        `);
+        expect(tables).toEqual([]);
+
+        const journalRows = await restoreSql.unsafe<{ backup_id: string }[]>(`
+          SELECT "backup_id" FROM "_paperclip_restore_control"."journal" WHERE "job_id" = '${jobId}'
+        `);
+        expect(journalRows).toHaveLength(1);
+        expect(journalRows[0]?.backup_id).toBe("pre-existing-backup-id.sql.gz");
+      } finally {
+        if (originalPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+        }
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
     "rejects restore when the manifest is missing, without touching the target database",
     async () => {
       const sourceConnectionString = await createTempDatabase();

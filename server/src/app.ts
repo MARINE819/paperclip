@@ -82,6 +82,7 @@ import {
   instanceDatabaseBackupRoutes,
   type InstanceDatabaseBackupService,
 } from "./routes/instance-database-backups.js";
+import { instanceDatabaseRestoreCatalogRoutes } from "./routes/instance-database-restores.js";
 import { instanceIncidentRoutes } from "./routes/instance-incidents.js";
 import { evalRoutes } from "./routes/evals.js";
 import { toolTrustRegistryRoutes } from "./routes/tool-trust-registry.js";
@@ -576,6 +577,9 @@ export async function createApp(
   api.use(instanceSettingsRoutes(db));
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
+  }
+  if (opts.databaseBackupHealth) {
+    api.use(instanceDatabaseRestoreCatalogRoutes({ backupDir: opts.databaseBackupHealth.backupDir }));
   }
   api.use(instanceIncidentRoutes(db));
   api.use(evalRoutes(db));

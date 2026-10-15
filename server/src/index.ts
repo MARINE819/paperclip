@@ -97,6 +97,7 @@ import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { getServerInfoSnapshot } from "./server-info.js";
 import { consumeRestartControlRequest } from "./services/restart-control.js";
+import { resumeDatabaseRestoreIfNeeded } from "./services/restore-control.js";
 import { resolvePaperclipInstanceId } from "./home-paths.js";
 import { defaultIncidentScanPaths, runIncidentScan } from "./services/incident-scanner.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
@@ -360,6 +361,10 @@ export async function startServer(): Promise<StartedServer> {
   assertCloudDatabaseContract();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
+    await resumeDatabaseRestoreIfNeeded({
+      connectionString: migrationUrl,
+      backupDir: config.databaseBackupDir,
+    });
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
   
     db = createDb(config.databaseUrl);
@@ -554,6 +559,10 @@ export async function startServer(): Promise<StartedServer> {
     }
   
     const embeddedConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+    await resumeDatabaseRestoreIfNeeded({
+      connectionString: embeddedConnectionString,
+      backupDir: config.databaseBackupDir,
+    });
     const shouldAutoApplyFirstRunMigrations = !clusterAlreadyInitialized || dbStatus === "created";
     if (shouldAutoApplyFirstRunMigrations) {
       logger.info("Detected first-run embedded PostgreSQL setup; applying pending migrations automatically");

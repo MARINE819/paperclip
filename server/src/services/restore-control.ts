@@ -1,19 +1,19 @@
 import { closeSync, existsSync, mkdirSync, openSync, unlinkSync, writeSync } from "node:fs";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
-import { verifyBackupManifest } from "@paperclipai/db/backup-lib";
+import { queryRestoreJournalEntry, runDatabaseRestore, verifyBackupManifest } from "@paperclipai/db/backup-lib";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { logger } from "../middleware/logger.js";
 import { writeSelfTargetedRestartControlRequest } from "./restart-control.js";
 
-// This batch writes/reads "accepted" and "shutting_down" only. No code here
-// calls runDatabaseRestore, touches the database, or actually shuts anything
-// down/restarts anything -- confirmShutdown() below only *requests* a
-// self-targeted restart through the existing, unmodified restart-control
-// watcher (consumeRestartControlRequest in index.ts decides whether and when
-// to actually shut down). Reading shutting_down back at boot and resuming a
-// restore is a later, separately-gated batch.
-export type RestoreJobState = "accepted" | "shutting_down";
+// active-job.json only ever holds one of these three states. succeeded and
+// failed are never written here -- they exist only as TerminalRestoreJobRecord
+// content in a separate archive file (see below). confirmShutdown() only
+// *requests* a self-targeted restart through the existing, unmodified
+// restart-control watcher; resumeDatabaseRestoreIfNeeded() below is the only
+// code that actually calls runDatabaseRestore.
+export type ActiveRestoreJobState = "accepted" | "shutting_down" | "restoring";
 
 // Deliberately holds no absolute paths, connection strings, or secrets --
 // only a bare backup filename and a server-derived manifest hash.
@@ -22,10 +22,29 @@ export type RestoreJob = {
   jobId: string;
   backupId: string;
   manifestSha256: string;
-  state: RestoreJobState;
+  state: ActiveRestoreJobState;
   requestedBy: string;
   requestedAt: string;
   updatedAt: string;
+  restoreAttempts: number;
+};
+
+export type TerminalRestoreJobState = "succeeded" | "failed";
+
+// Separate type from RestoreJob on purpose (CEO decision): succeeded/failed
+// are a different kind of record, stored only in restore-jobs/archive/, never
+// as active-job.json content.
+export type TerminalRestoreJobRecord = {
+  version: 1;
+  jobId: string;
+  backupId: string;
+  manifestSha256: string;
+  state: TerminalRestoreJobState;
+  requestedBy: string;
+  requestedAt: string;
+  updatedAt: string;
+  restoreAttempts: number;
+  lastError: { code: string; message: string } | null;
 };
 
 export type AcceptRestoreJobInput = {
@@ -106,6 +125,7 @@ export async function acceptRestoreJob(input: AcceptRestoreJobInput): Promise<Ac
     requestedBy,
     requestedAt: now,
     updatedAt: now,
+    restoreAttempts: 0,
   };
 
   const dir = restoreJobsDir(homeDir);
@@ -440,4 +460,372 @@ export async function confirmShutdown(input: {
     code: "restart_request_publish_ambiguous",
     message: "Could not confirm whether the restart-control request was published; manual review required",
   };
+}
+
+export const MAX_RESTORE_ATTEMPTS = 2;
+
+function normalizeLegacyRestoreAttempts(value: unknown): number | null {
+  if (value === undefined) return 0;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) return null;
+  return value;
+}
+
+type ActiveJobForResume = {
+  jobId: string;
+  backupId: string;
+  manifestSha256: string;
+  state: ActiveRestoreJobState;
+  requestedBy: string;
+  requestedAt: string;
+  restoreAttempts: number | null;
+};
+
+function parseActiveJobForResume(raw: unknown): ActiveJobForResume | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const record = raw as Record<string, unknown>;
+  if (typeof record.jobId !== "string") return null;
+  if (typeof record.backupId !== "string") return null;
+  if (typeof record.manifestSha256 !== "string") return null;
+  if (record.state !== "accepted" && record.state !== "shutting_down" && record.state !== "restoring") return null;
+  if (typeof record.requestedBy !== "string") return null;
+  if (typeof record.requestedAt !== "string") return null;
+  return {
+    jobId: record.jobId,
+    backupId: record.backupId,
+    manifestSha256: record.manifestSha256,
+    state: record.state,
+    requestedBy: record.requestedBy,
+    requestedAt: record.requestedAt,
+    restoreAttempts: normalizeLegacyRestoreAttempts(record.restoreAttempts),
+  };
+}
+
+const FIXED_ERROR_MESSAGES = {
+  journal_query_failed: "Could not query the restore journal; manual review required",
+  journal_mismatch: "Restore journal entry does not match the expected backup; manual review required",
+  retry_limit_exceeded: "Restore attempt limit reached without a matching journal entry; manual review required",
+  journal_missing_after_restore: "No matching journal entry found after the restore completed; manual review required",
+  restore_failed: "Database restore failed; manual review required",
+} as const;
+
+function fixedError(code: keyof typeof FIXED_ERROR_MESSAGES): { code: string; message: string } {
+  return { code, message: FIXED_ERROR_MESSAGES[code] };
+}
+
+function archiveFilePath(jobId: string, homeDir?: string): string {
+  return resolve(restoreJobsDir(homeDir), "archive", `${jobId}.json`);
+}
+
+type ArchiveTerminalInput = {
+  jobId: string;
+  backupId: string;
+  manifestSha256: string;
+  requestedBy: string;
+  requestedAt: string;
+  restoreAttempts: number;
+};
+
+type ArchiveTerminalOutcome = { releaseLock: true } | { releaseLock: false; code: string };
+
+// Real implementation of the archive write, isolated behind an injectable
+// seam purely so tests can force terminal_archive_write_ambiguous
+// deterministically (an injected override throwing) instead of relying on an
+// OS-level file-locking trick. Production code never passes an override.
+async function defaultWriteArchiveFile(archivePath: string, candidate: TerminalRestoreJobRecord): Promise<void> {
+  const archiveDir = dirname(archivePath);
+  const tempPath = archivePath + "." + process.pid + "." + Date.now() + ".tmp";
+  await mkdir(archiveDir, { recursive: true });
+  try {
+    await writeFile(tempPath, JSON.stringify(candidate, null, 2) + "\n", "utf8");
+    await rename(tempPath, archivePath);
+  } catch (error) {
+    await unlink(tempPath).catch(function () { return undefined; });
+    throw error;
+  }
+}
+
+type ArchiveTerminalDeps = {
+  writeArchiveFile?: (archivePath: string, candidate: TerminalRestoreJobRecord) => Promise<void>;
+  removeActiveJobFile?: (activeJobFilePath: string) => Promise<void>;
+};
+
+async function archiveTerminal(
+  job: ArchiveTerminalInput,
+  state: TerminalRestoreJobState,
+  lastError: { code: string; message: string } | null,
+  homeDir?: string,
+  deps: ArchiveTerminalDeps = {},
+): Promise<ArchiveTerminalOutcome> {
+  const writeArchiveFileImpl = deps.writeArchiveFile ?? defaultWriteArchiveFile;
+  const removeActiveJobFileImpl = deps.removeActiveJobFile ?? ((p: string) => unlink(p));
+
+  const archivePath = archiveFilePath(job.jobId, homeDir);
+  const candidate: TerminalRestoreJobRecord = {
+    version: 1,
+    jobId: job.jobId,
+    backupId: job.backupId,
+    manifestSha256: job.manifestSha256,
+    state,
+    requestedBy: job.requestedBy,
+    requestedAt: job.requestedAt,
+    updatedAt: new Date().toISOString(),
+    restoreAttempts: job.restoreAttempts,
+    lastError,
+  };
+
+  let existing: Record<string, unknown> | undefined;
+  try {
+    const raw = await readFile(archivePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) {
+      return { releaseLock: false, code: "terminal_archive_conflict" };
+    }
+    existing = parsed as Record<string, unknown>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      return { releaseLock: false, code: "terminal_archive_conflict" };
+    }
+    existing = undefined;
+  }
+
+  if (existing !== undefined) {
+    const identityMatches =
+      existing.version === 1
+      && existing.jobId === job.jobId
+      && existing.backupId === job.backupId
+      && existing.manifestSha256 === job.manifestSha256
+      && existing.state === state;
+    if (!identityMatches) {
+      return { releaseLock: false, code: "terminal_archive_conflict" };
+    }
+  } else {
+    try {
+      await writeArchiveFileImpl(archivePath, candidate);
+    } catch {
+      return { releaseLock: false, code: "terminal_archive_write_ambiguous" };
+    }
+  }
+
+  try {
+    await removeActiveJobFileImpl(activeJobPath(homeDir));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { releaseLock: true };
+    }
+    return { releaseLock: false, code: "active_job_cleanup_ambiguous" };
+  }
+
+  return { releaseLock: true };
+}
+
+type RunResumeCriticalSectionDeps = {
+  writeJobFile?: (filePath: string, job: RestoreJob) => Promise<void>;
+  writeArchiveFile?: (archivePath: string, candidate: TerminalRestoreJobRecord) => Promise<void>;
+  removeActiveJobFile?: (activeJobFilePath: string) => Promise<void>;
+};
+
+async function runResumeCriticalSection(
+  job: ActiveJobForResume,
+  lock: { release: () => Promise<void> },
+  connectionString: string,
+  backupDir: string,
+  homeDir: string | undefined,
+  queryJournalEntryImpl: typeof queryRestoreJournalEntry,
+  runRestoreImpl: typeof runDatabaseRestore,
+  deps: RunResumeCriticalSectionDeps = {},
+): Promise<void> {
+  const writeJobFileImpl = deps.writeJobFile ?? writeJobFileAtomic;
+
+  async function finalize(
+    state: TerminalRestoreJobState,
+    lastError: { code: string; message: string } | null,
+    restoreAttempts: number,
+  ) {
+    const outcome = await archiveTerminal(
+      {
+        jobId: job.jobId,
+        backupId: job.backupId,
+        manifestSha256: job.manifestSha256,
+        requestedBy: job.requestedBy,
+        requestedAt: job.requestedAt,
+        restoreAttempts: restoreAttempts,
+      },
+      state,
+      lastError,
+      homeDir,
+      {
+        writeArchiveFile: deps.writeArchiveFile,
+        removeActiveJobFile: deps.removeActiveJobFile,
+      },
+    );
+    if (outcome.releaseLock) {
+      await lock.release();
+    } else {
+      logger.error({ jobId: job.jobId, code: outcome.code });
+    }
+  }
+
+  let journalEntry: Awaited<ReturnType<typeof queryRestoreJournalEntry>>;
+  try {
+    journalEntry = await queryJournalEntryImpl(connectionString, job.jobId);
+  } catch {
+    await finalize("failed", fixedError("journal_query_failed"), job.restoreAttempts === null ? 0 : job.restoreAttempts);
+    return;
+  }
+
+  if (journalEntry !== null) {
+    if (
+      journalEntry.jobId === job.jobId
+      && journalEntry.backupId === job.backupId
+      && journalEntry.manifestSha256 === job.manifestSha256
+    ) {
+      await finalize("succeeded", null, job.restoreAttempts === null ? 0 : job.restoreAttempts);
+    } else {
+      await finalize("failed", fixedError("journal_mismatch"), job.restoreAttempts === null ? 0 : job.restoreAttempts);
+    }
+    return;
+  }
+
+  if (job.restoreAttempts === null || job.restoreAttempts >= MAX_RESTORE_ATTEMPTS) {
+    await finalize("failed", fixedError("retry_limit_exceeded"), job.restoreAttempts === null ? MAX_RESTORE_ATTEMPTS : job.restoreAttempts);
+    return;
+  }
+
+  const nextAttempts = job.restoreAttempts + 1;
+
+  await writeJobFileImpl(activeJobPath(homeDir), {
+    version: 1,
+    jobId: job.jobId,
+    backupId: job.backupId,
+    manifestSha256: job.manifestSha256,
+    state: "restoring",
+    requestedBy: job.requestedBy,
+    requestedAt: job.requestedAt,
+    updatedAt: new Date().toISOString(),
+    restoreAttempts: nextAttempts,
+  });
+
+  try {
+    await runRestoreImpl({
+      backupFile: resolve(backupDir, job.backupId),
+      connectionString: connectionString,
+      verifyManifestBeforeRestore: true,
+      forceJavaScriptEngine: true,
+      sentinel: {
+        jobId: job.jobId,
+        backupId: job.backupId,
+        manifestSha256: job.manifestSha256,
+      },
+    });
+  } catch {
+    await finalize("failed", fixedError("restore_failed"), nextAttempts);
+    return;
+  }
+
+  let confirmEntry: Awaited<ReturnType<typeof queryRestoreJournalEntry>>;
+  try {
+    confirmEntry = await queryJournalEntryImpl(connectionString, job.jobId);
+  } catch {
+    await finalize("failed", fixedError("journal_query_failed"), nextAttempts);
+    return;
+  }
+
+  if (confirmEntry === null) {
+    await finalize("failed", fixedError("journal_missing_after_restore"), nextAttempts);
+    return;
+  }
+
+  if (
+    confirmEntry.jobId !== job.jobId
+    || confirmEntry.backupId !== job.backupId
+    || confirmEntry.manifestSha256 !== job.manifestSha256
+  ) {
+    await finalize("failed", fixedError("journal_mismatch"), nextAttempts);
+    return;
+  }
+
+  await finalize("succeeded", null, nextAttempts);
+}
+
+export async function resumeDatabaseRestoreIfNeeded(input: {
+  connectionString: string;
+  backupDir: string;
+  homeDir?: string;
+  // Test-only injection seams -- all default to the real implementation. No
+  // production call site passes these.
+  queryJournalEntry?: typeof queryRestoreJournalEntry;
+  runRestore?: typeof runDatabaseRestore;
+  acquireLock?: typeof acquireTransitionLock;
+  readActiveJobFile?: (filePath: string) => Promise<string>;
+  writeJobFile?: (filePath: string, job: RestoreJob) => Promise<void>;
+  writeArchiveFile?: (archivePath: string, candidate: TerminalRestoreJobRecord) => Promise<void>;
+  removeActiveJobFile?: (activeJobFilePath: string) => Promise<void>;
+}): Promise<void> {
+  if (!isDatabaseRestoreExecutionEnabled()) return;
+
+  const queryJournalEntryImpl = input.queryJournalEntry ?? queryRestoreJournalEntry;
+  const runRestoreImpl = input.runRestore ?? runDatabaseRestore;
+  const acquireLockImpl = input.acquireLock ?? acquireTransitionLock;
+  const readActiveJobFileImpl = input.readActiveJobFile ?? ((p: string) => readFile(p, "utf8"));
+  const finalPath = activeJobPath(input.homeDir);
+
+  let raw: string;
+  try {
+    raw = await readActiveJobFileImpl(finalPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+    logger.warn({ code: "active_restore_job_unreadable" });
+    return;
+  }
+
+  let job: ActiveJobForResume | null;
+  try {
+    job = parseActiveJobForResume(JSON.parse(raw));
+  } catch {
+    logger.warn({ code: "active_restore_job_unreadable" });
+    return;
+  }
+
+  if (job === null) {
+    logger.warn({ code: "active_restore_job_unreadable" });
+    return;
+  }
+
+  if (job.state !== "shutting_down" && job.state !== "restoring") {
+    return;
+  }
+
+  let lock: TransitionLockAcquireResult;
+  try {
+    lock = await acquireLockImpl(job.jobId, input.homeDir);
+  } catch {
+    logger.warn({ jobId: job.jobId, code: "restore_lock_acquisition_failed" });
+    return;
+  }
+
+  if (!lock.ok) {
+    logger.warn({ jobId: job.jobId, code: "restore_lock_unavailable", reason: lock.reason });
+    return;
+  }
+
+  try {
+    await runResumeCriticalSection(
+      job,
+      lock,
+      input.connectionString,
+      input.backupDir,
+      input.homeDir,
+      queryJournalEntryImpl,
+      runRestoreImpl,
+      {
+        writeJobFile: input.writeJobFile,
+        writeArchiveFile: input.writeArchiveFile,
+        removeActiveJobFile: input.removeActiveJobFile,
+      },
+    );
+  } catch {
+    logger.error({ jobId: job.jobId, code: "restore_resume_unexpected_error" });
+  }
 }

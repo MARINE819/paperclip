@@ -1672,6 +1672,54 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
   }
 }
 
+export type RestoreJournalEntry = {
+  jobId: string;
+  backupId: string;
+  manifestSha256: string;
+  completedAt: string;
+};
+
+// Queries the same _paperclip_restore_control.journal table runDatabaseRestore
+// commits a sentinel row into (see above). A missing schema/table is not an
+// error -- it just means no restore has ever committed on this database --
+// and is reported identically to "no matching row" (null), never thrown.
+// Any other failure (permissions, connection loss, etc.) propagates as-is:
+// callers must never treat an inconclusive query as proof of absence.
+export async function queryRestoreJournalEntry(
+  connectionString: string,
+  jobId: string,
+): Promise<RestoreJournalEntry | null> {
+  const sql = postgres(connectionString, { max: 1, connect_timeout: 5 });
+  try {
+    const rows = await sql`
+      SELECT job_id, backup_id, manifest_sha256, completed_at
+      FROM _paperclip_restore_control.journal
+      WHERE job_id = ${jobId}
+    `;
+    if (rows.length === 0) return null;
+    const row = rows[0] as {
+      job_id: string;
+      backup_id: string;
+      manifest_sha256: string;
+      completed_at: Date;
+    };
+    return {
+      jobId: row.job_id,
+      backupId: row.backup_id,
+      manifestSha256: row.manifest_sha256,
+      completedAt: row.completed_at.toISOString(),
+    };
+  } catch (error) {
+    if ((error as { code?: string } | null)?.code === "42P01") {
+      // undefined_table: the journal schema has never been created.
+      return null;
+    }
+    throw error;
+  } finally {
+    await sql.end({ timeout: 1 }).catch(() => undefined);
+  }
+}
+
 export function formatDatabaseBackupResult(result: RunDatabaseBackupResult): string {
   const size = formatBackupSize(result.sizeBytes);
   const pruned = result.prunedCount > 0 ? `; pruned ${result.prunedCount} old backup(s)` : "";

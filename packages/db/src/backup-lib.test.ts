@@ -9,6 +9,7 @@ import {
   createBufferedTextFileWriter,
   runDatabaseBackup,
   runDatabaseRestore,
+  queryRestoreJournalEntry,
   canonicalBackupDirKey,
   withBackupDirLock,
   GzipFinalizeTimeoutError,
@@ -1697,6 +1698,13 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         `);
         expect(journalRows).toHaveLength(1);
         expect(journalRows[0]?.backup_id).toBe(path.basename(result.backupFile));
+
+        const entry = await queryRestoreJournalEntry(restoreConnectionString, jobId);
+        expect(entry).not.toBeNull();
+        expect(entry?.jobId).toBe(jobId);
+        expect(entry?.backupId).toBe(path.basename(result.backupFile));
+        expect(entry?.manifestSha256).toBe(backupSha256);
+        expect(typeof entry?.completedAt).toBe("string");
       } finally {
         if (originalPgDumpPath === undefined) {
           delete process.env.PAPERCLIP_PG_DUMP_PATH;
@@ -1705,6 +1713,68 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         }
         await sourceSql.end();
         await restoreSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "queryRestoreJournalEntry returns null when the journal table does not exist yet (fresh database, no restore ever committed)",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const entry = await queryRestoreJournalEntry(connectionString, "11111111-1111-4111-8111-111111111111");
+      expect(entry).toBeNull();
+    },
+    30_000,
+  );
+
+  it(
+    "queryRestoreJournalEntry returns null for a job id not present in an existing journal table",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_sentinel_journal_lookup_miss_target",
+      );
+      const backupDir = createTempDir("paperclip-db-sentinel-journal-lookup-miss-");
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+
+      try {
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-sentinel-journal-lookup-miss-test",
+        });
+
+        const backupBytes = fs.readFileSync(result.backupFile);
+        const backupSha256 = createHash("sha256").update(backupBytes).digest("hex");
+        const committedJobId = "22222222-2222-4222-8222-222222222222";
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+          sentinel: {
+            jobId: committedJobId,
+            backupId: path.basename(result.backupFile),
+            manifestSha256: backupSha256,
+          },
+        });
+
+        // The journal table now exists (a different job committed it), but
+        // this specific job id was never recorded -- still null, not an error.
+        const entry = await queryRestoreJournalEntry(
+          restoreConnectionString,
+          "33333333-3333-4333-8333-333333333334",
+        );
+        expect(entry).toBeNull();
+      } finally {
+        if (originalPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+        }
       }
     },
     30_000,

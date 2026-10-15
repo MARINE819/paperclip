@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { verifyBackupManifest } from "@paperclipai/db/backup-lib";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
-import { acceptRestoreJob } from "../services/restore-control.js";
+import { acceptRestoreJob, confirmShutdown } from "../services/restore-control.js";
 import { assertInstanceAdmin, getActorInfo } from "./authz.js";
 
 export type BackupCatalogManifestStatus = "valid" | "missing" | "malformed" | "hash_mismatch";
@@ -121,6 +121,38 @@ export function instanceDatabaseRestoreCatalogRoutes(service: InstanceDatabaseRe
     // 202: the job has only been accepted, not executed. No restore has
     // started, no shutdown has been triggered.
     res.status(202).json({ jobId: result.jobId, state: "accepted" });
+  });
+
+  router.post("/instance/database-restores/jobs/:jobId/confirm-shutdown", async (req, res) => {
+    assertInstanceAdmin(req);
+    if (isCloudManagedInstance()) {
+      throw forbidden("Database restore is platform-managed on cloud-managed instances", {
+        code: "database_restores_platform_managed",
+      });
+    }
+
+    const requestedBy = getActorInfo(req).actorId;
+    const result = await confirmShutdown({
+      jobId: req.params.jobId,
+      requestedBy,
+      homeDir: service.homeDir,
+    });
+
+    if (!result.ok) {
+      if (result.httpStatus === 409) {
+        throw conflict(result.message, { code: result.code });
+      }
+      if (result.httpStatus === 404) {
+        throw notFound(result.message, { code: result.code });
+      }
+      throw forbidden(result.message, { code: result.code });
+    }
+
+    // 202: a self-targeted restart has only been *requested*. The existing
+    // restart-control watcher (unmodified by this batch) decides whether and
+    // when to actually shut the process down -- no real shutdown has
+    // happened yet.
+    res.status(202).json({ jobId: result.jobId, state: result.state });
   });
 
   return router;

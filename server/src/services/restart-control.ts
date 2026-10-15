@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { getServerInfoSnapshot } from "../server-info.js";
 
 const RESTART_CONTROL_AUDIT_FILENAME = "restart-control-audit.jsonl";
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
@@ -173,4 +175,142 @@ export async function consumeRestartControlRequest(input: {
     reason: request.reason,
   });
   return { action: "shutdown", request };
+}
+
+export type RestartControlRequestWriteOutcome =
+  | { outcome: "published"; request: RestartControlRequest }
+  | { outcome: "definite_no_publish"; error: unknown }
+  | { outcome: "ambiguous"; error: unknown };
+
+// Test-only injection seam (same pattern as hot-restart.ts's
+// ProcessCommandRunner/ProcessStatReader): lets tests force a specific fs
+// call to fail without needing a real OS-level race, while every other call
+// still goes through the real node:fs/promises implementation.
+export type RestartControlRequestFsOverrides = {
+  mkdir?: typeof fs.mkdir;
+  writeFile?: typeof fs.writeFile;
+  rename?: typeof fs.rename;
+  readFile?: typeof fs.readFile;
+  unlink?: typeof fs.unlink;
+};
+
+// Only a literal ENOENT on the post-failure read counts as proof the file
+// does not exist. Any other error (EACCES/EPERM/EBUSY/anything else) must
+// never be treated as "not there" -- it means the true state is unknown.
+async function classifyRestartControlRequestWriteFailure(
+  requestPath: string,
+  expected: RestartControlRequest,
+  readFileImpl: typeof fs.readFile,
+): Promise<RestartControlRequestWriteOutcome> {
+  let raw: string;
+  try {
+    raw = (await readFileImpl(requestPath, "utf8")) as string;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { outcome: "definite_no_publish", error };
+    }
+    return { outcome: "ambiguous", error };
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(raw);
+  } catch (error) {
+    return { outcome: "ambiguous", error };
+  }
+
+  const parsed = parseRestartControlRequest(parsedJson);
+  if (!parsed) {
+    return {
+      outcome: "ambiguous",
+      error: new Error("restart-control request file does not match the expected shape"),
+    };
+  }
+
+  // Finding *a* valid request at this path is not proof of *this call's*
+  // publish -- it could be a stale, unrelated request left over from before.
+  // Only an exact match on requestId + target identity counts as definite.
+  const identityMatches =
+    parsed.requestId === expected.requestId
+    && parsed.targetPid === expected.targetPid
+    && parsed.targetProcessStartedAt === expected.targetProcessStartedAt;
+  if (!identityMatches) {
+    return {
+      outcome: "ambiguous",
+      error: new Error("restart-control request file does not match this call's identity"),
+    };
+  }
+
+  return { outcome: "published", request: parsed };
+}
+
+// Writes (or confirms) a restart-control request targeting *this exact
+// process* (its own pid and boot identity), reusing the identical file
+// format and path convention consumeRestartControlRequest already polls for.
+// This function never shuts anything down itself -- it only ever writes a
+// request file; the existing watcher decides whether and when to act on it.
+export async function writeSelfTargetedRestartControlRequest(input: {
+  reason: string;
+  requestedBy: string;
+  homeDir?: string;
+  ttlMs?: number;
+  requestId?: string;
+  fsOverrides?: RestartControlRequestFsOverrides;
+}): Promise<RestartControlRequestWriteOutcome> {
+  const impl = {
+    mkdir: input.fsOverrides?.mkdir ?? fs.mkdir,
+    writeFile: input.fsOverrides?.writeFile ?? fs.writeFile,
+    rename: input.fsOverrides?.rename ?? fs.rename,
+    readFile: input.fsOverrides?.readFile ?? fs.readFile,
+    unlink: input.fsOverrides?.unlink ?? fs.unlink,
+  };
+
+  const targetPid = process.pid;
+  const requestPath = resolveRestartControlRequestPath(targetPid, input.homeDir);
+  const ttlMs = input.ttlMs ?? DEFAULT_TTL_MS;
+
+  // Idempotency: a still-valid request already targeting this exact process
+  // means an earlier call already published one -- don't write a second one.
+  try {
+    const existingRaw = (await impl.readFile(requestPath, "utf8")) as string;
+    const existingParsed = parseRestartControlRequest(JSON.parse(existingRaw));
+    if (existingParsed && existingParsed.targetPid === targetPid) {
+      const ageMs = Date.now() - Date.parse(existingParsed.createdAt);
+      if (Number.isFinite(ageMs) && ageMs >= -MAX_CLOCK_SKEW_MS && ageMs <= ttlMs) {
+        return { outcome: "published", request: existingParsed };
+      }
+    }
+  } catch {
+    // No existing (or unreadable/invalid) request at this path -- proceed to
+    // write a fresh one.
+  }
+
+  const request: RestartControlRequest = {
+    version: 1,
+    requestId: input.requestId ?? randomUUID(),
+    createdAt: new Date().toISOString(),
+    requestedBy: input.requestedBy,
+    reason: input.reason,
+    targetProcessStartedAt: getServerInfoSnapshot().processStartedAt,
+    targetPid,
+  };
+
+  const tempPath = `${requestPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await impl.mkdir(path.dirname(requestPath), { recursive: true });
+    await impl.writeFile(tempPath, `${JSON.stringify(request, null, 2)}\n`, "utf8");
+  } catch (error) {
+    // Rename was never attempted -- this call's content cannot possibly be
+    // at requestPath, regardless of what else is there.
+    return { outcome: "definite_no_publish", error };
+  }
+
+  try {
+    await impl.rename(tempPath, requestPath);
+    return { outcome: "published", request };
+  } catch (error) {
+    const classification = await classifyRestartControlRequestWriteFailure(requestPath, request, impl.readFile);
+    await impl.unlink(tempPath).catch(() => undefined);
+    return classification;
+  }
 }

@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   consumeRestartControlRequest,
   resolveRestartControlRequestPath,
+  writeSelfTargetedRestartControlRequest,
   type RestartControlRequest,
 } from "./restart-control.js";
+import { getServerInfoSnapshot } from "../server-info.js";
 
 const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
 
@@ -322,6 +324,199 @@ describe("consumeRestartControlRequest", () => {
       });
 
       expect(decision).toEqual({ action: "ignored", reason: "target_mismatch", request });
+    });
+  });
+});
+
+describe("writeSelfTargetedRestartControlRequest", () => {
+  it("writes a fresh self-targeted request when none exists", async () => {
+    await withTempHome(async (homeDir) => {
+      const outcome = await writeSelfTargetedRestartControlRequest({
+        reason: "test_reason",
+        requestedBy: "test-actor",
+        homeDir,
+      });
+
+      expect(outcome.outcome).toBe("published");
+      if (outcome.outcome !== "published") throw new Error("unreachable");
+      expect(outcome.request.targetPid).toBe(process.pid);
+      expect(outcome.request.targetProcessStartedAt).toBe(getServerInfoSnapshot().processStartedAt);
+
+      const requestPath = resolveRestartControlRequestPath(process.pid, homeDir);
+      const onDisk = JSON.parse(await fs.readFile(requestPath, "utf8"));
+      expect(onDisk).toEqual(outcome.request);
+    });
+  });
+
+  it("is idempotent: a second call while a valid request is still pending returns the existing request without rewriting it", async () => {
+    await withTempHome(async (homeDir) => {
+      const first = await writeSelfTargetedRestartControlRequest({
+        reason: "first_reason",
+        requestedBy: "test-actor",
+        homeDir,
+      });
+      const second = await writeSelfTargetedRestartControlRequest({
+        reason: "second_reason",
+        requestedBy: "different-actor",
+        homeDir,
+      });
+
+      expect(second).toEqual(first);
+    });
+  });
+
+  it("the written request is correctly consumable by the existing, unmodified restart-control watcher", async () => {
+    await withTempHome(async (homeDir) => {
+      const outcome = await writeSelfTargetedRestartControlRequest({
+        reason: "test_reason",
+        requestedBy: "test-actor",
+        homeDir,
+      });
+      if (outcome.outcome !== "published") throw new Error("unreachable");
+
+      const decision = await consumeRestartControlRequest({
+        currentPid: process.pid,
+        currentProcessStartedAt: getServerInfoSnapshot().processStartedAt,
+        homeDir,
+      });
+
+      expect(decision).toEqual({ action: "shutdown", request: outcome.request });
+    });
+  });
+
+  it("classifies a failed temp-file write as definite_no_publish (rename never attempted)", async () => {
+    await withTempHome(async (homeDir) => {
+      const outcome = await writeSelfTargetedRestartControlRequest({
+        reason: "test_reason",
+        requestedBy: "test-actor",
+        homeDir,
+        fsOverrides: {
+          writeFile: async () => {
+            throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+          },
+        },
+      });
+
+      expect(outcome.outcome).toBe("definite_no_publish");
+    });
+  });
+
+  it("[test 5] classifies an ENOENT found after a rename failure as definite_no_publish, and restores no leftover file", async () => {
+    await withTempHome(async (homeDir) => {
+      const outcome = await writeSelfTargetedRestartControlRequest({
+        reason: "test_reason",
+        requestedBy: "test-actor",
+        homeDir,
+        fsOverrides: {
+          rename: async () => {
+            throw Object.assign(new Error("rename failed"), { code: "EPERM" });
+          },
+        },
+      });
+
+      expect(outcome.outcome).toBe("definite_no_publish");
+      await expect(fs.access(resolveRestartControlRequestPath(process.pid, homeDir))).rejects.toThrow();
+    });
+  });
+
+  it("[test 1] never treats EACCES/EPERM on the post-failure read as ENOENT", async () => {
+    await withTempHome(async (homeDir) => {
+      const outcome = await writeSelfTargetedRestartControlRequest({
+        reason: "test_reason",
+        requestedBy: "test-actor",
+        homeDir,
+        fsOverrides: {
+          rename: async () => {
+            throw new Error("rename failed");
+          },
+          readFile: (async () => {
+            throw Object.assign(new Error("access denied"), { code: "EACCES" });
+          }) as typeof fs.readFile,
+        },
+      });
+
+      expect(outcome.outcome).toBe("ambiguous");
+    });
+  });
+
+  it("[test 2] a different, pre-existing request at the same path is never treated as definite publish", async () => {
+    await withTempHome(async (homeDir) => {
+      const requestPath = resolveRestartControlRequestPath(process.pid, homeDir);
+      await fs.mkdir(path.dirname(requestPath), { recursive: true });
+      await fs.writeFile(
+        requestPath,
+        JSON.stringify(
+          baseRequest({ requestId: "some-other-unrelated-request-id", targetPid: OTHER_PID }),
+        ),
+        "utf8",
+      );
+
+      const outcome = await writeSelfTargetedRestartControlRequest({
+        reason: "test_reason",
+        requestedBy: "test-actor",
+        homeDir,
+        requestId: "deterministic-test-request-id",
+        fsOverrides: {
+          rename: async () => {
+            throw new Error("rename failed");
+          },
+        },
+      });
+
+      expect(outcome.outcome).toBe("ambiguous");
+    });
+  });
+
+  it("[test 3] definite publish is recognized only when requestId, targetPid, and targetProcessStartedAt all match this call", async () => {
+    await withTempHome(async (homeDir) => {
+      const requestId = "deterministic-test-request-id-match";
+      const requestPath = resolveRestartControlRequestPath(process.pid, homeDir);
+      const matchingRequest: RestartControlRequest = {
+        version: 1,
+        requestId,
+        createdAt: new Date().toISOString(),
+        requestedBy: "someone-else",
+        reason: "a different reason string",
+        targetProcessStartedAt: getServerInfoSnapshot().processStartedAt,
+        targetPid: process.pid,
+      };
+      await fs.mkdir(path.dirname(requestPath), { recursive: true });
+      await fs.writeFile(requestPath, JSON.stringify(matchingRequest), "utf8");
+
+      const outcome = await writeSelfTargetedRestartControlRequest({
+        reason: "test_reason",
+        requestedBy: "test-actor",
+        homeDir,
+        requestId,
+        fsOverrides: {
+          rename: async () => {
+            throw new Error("rename failed");
+          },
+        },
+      });
+
+      expect(outcome).toEqual({ outcome: "published", request: matchingRequest });
+    });
+  });
+
+  it("[test 4] malformed JSON found after a rename failure is treated as ambiguous", async () => {
+    await withTempHome(async (homeDir) => {
+      const requestPath = resolveRestartControlRequestPath(process.pid, homeDir);
+      await fs.mkdir(path.dirname(requestPath), { recursive: true });
+      await fs.writeFile(requestPath, "{ not json", "utf8");
+
+      const outcome = await writeSelfTargetedRestartControlRequest({
+        reason: "test_reason",
+        requestedBy: "test-actor",
+        homeDir,
+        fsOverrides: {
+          rename: async () => {
+            throw new Error("rename failed");
+          },
+        },
+      });
+
+      expect(outcome.outcome).toBe("ambiguous");
     });
   });
 });

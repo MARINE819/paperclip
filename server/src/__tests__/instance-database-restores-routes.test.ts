@@ -11,6 +11,9 @@ import {
   type InstanceDatabaseRestoreCatalogService,
 } from "../routes/instance-database-restores.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { consumeRestartControlRequest, resolveRestartControlRequestPath } from "../services/restart-control.js";
+import { confirmShutdown } from "../services/restore-control.js";
+import { getServerInfoSnapshot } from "../server-info.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -432,5 +435,390 @@ describe("POST /instance/database-restores/jobs", () => {
     expect(raw.includes(homeDir)).toBe(false);
     expect(raw.toLowerCase().includes("password")).toBe(false);
     expect(raw.toLowerCase().includes("connectionstring")).toBe(false);
+  });
+});
+
+describe("POST /instance/database-restores/jobs/:jobId/confirm-shutdown", () => {
+  function activeJobFilePath(homeDir: string): string {
+    return path.join(resolvePaperclipInstanceRoot({ homeDir }), "restore-jobs", "active-job.json");
+  }
+
+  async function acceptJob(app: ReturnType<typeof createApp>, backupId: string): Promise<string> {
+    const res = await request(app).post("/api/instance/database-restores/jobs").send({ backupId });
+    expect(res.status).toBe(202);
+    return res.body.jobId as string;
+  }
+
+  function grantSupervisorCapability(homeDir: string): () => void {
+    const serverRoot = resolvePaperclipInstanceRoot({ homeDir });
+    const logsDir = path.join(serverRoot, "logs");
+    fs.mkdirSync(logsDir, { recursive: true });
+    fs.writeFileSync(path.join(logsDir, "control-plane-runtime.pid"), String(process.pid), "utf8");
+    fs.writeFileSync(path.join(logsDir, "control-plane-supervisor.pid"), String(process.pid), "utf8");
+    const originalInstanceRoot = process.env.PAPERCLIP_INSTANCE_ROOT;
+    process.env.PAPERCLIP_INSTANCE_ROOT = serverRoot;
+    return () => {
+      if (originalInstanceRoot === undefined) delete process.env.PAPERCLIP_INSTANCE_ROOT;
+      else process.env.PAPERCLIP_INSTANCE_ROOT = originalInstanceRoot;
+    };
+  }
+
+  it("rejects when the execution flag is off, even with full supervisor capability", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-flag-off.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-flag-off.sql.gz");
+
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      const res = await request(app)
+        .post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`)
+        .send({});
+
+      expect(res.status).toBe(403);
+      const job = JSON.parse(fs.readFileSync(activeJobFilePath(homeDir), "utf8"));
+      expect(job.state).toBe("accepted");
+    } finally {
+      restore();
+    }
+  });
+
+  it("rejects when supervisor capability cannot be established, even with the flag on", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-no-supervisor.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-no-supervisor.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    try {
+      const res = await request(app)
+        .post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`)
+        .send({});
+
+      expect(res.status).toBe(409);
+      const job = JSON.parse(fs.readFileSync(activeJobFilePath(homeDir), "utf8"));
+      expect(job.state).toBe("accepted");
+    } finally {
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
+  });
+
+  it("transitions accepted to shutting_down and publishes a self-targeted restart-control request when flag+gate both pass", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-success.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-success.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      const res = await request(app)
+        .post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`)
+        .send({});
+
+      expect(res.status).toBe(202);
+      expect(res.body).toEqual({ jobId, state: "shutting_down" });
+
+      const job = JSON.parse(fs.readFileSync(activeJobFilePath(homeDir), "utf8"));
+      expect(job.state).toBe("shutting_down");
+      expect(job.jobId).toBe(jobId);
+
+      const requestPath = resolveRestartControlRequestPath(process.pid, homeDir);
+      const writtenRequest = JSON.parse(fs.readFileSync(requestPath, "utf8"));
+      expect(writtenRequest.targetPid).toBe(process.pid);
+
+      // Prove this is consumable by the existing, unmodified watcher -- no
+      // real shutdown or restart is triggered here, only a direct call to
+      // the same decision function index.ts's poll loop calls.
+      const decision = await consumeRestartControlRequest({
+        currentPid: process.pid,
+        currentProcessStartedAt: getServerInfoSnapshot().processStartedAt,
+        homeDir,
+      });
+      expect(decision).toEqual({ action: "shutdown", request: writtenRequest });
+    } finally {
+      restore();
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
+  });
+
+  it("rejects a duplicate confirm on an already shutting_down job", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-duplicate.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-duplicate.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      const first = await request(app)
+        .post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`)
+        .send({});
+      expect(first.status).toBe(202);
+
+      const second = await request(app)
+        .post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`)
+        .send({});
+      expect(second.status).toBe(409);
+    } finally {
+      restore();
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
+  });
+
+  it("rejects an unknown or mismatched jobId", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-mismatch.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    await acceptJob(app, "paperclip-confirm-mismatch.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      const res = await request(app)
+        .post("/api/instance/database-restores/jobs/not-the-real-job-id/confirm-shutdown")
+        .send({});
+      expect(res.status).toBe(404);
+    } finally {
+      restore();
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
+  });
+
+  it("handles two concurrent confirm requests for the same job: exactly one succeeds", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-concurrent.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-concurrent.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      const [a, b] = await Promise.all([
+        request(app).post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`).send({}),
+        request(app).post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`).send({}),
+      ]);
+
+      expect([a.status, b.status].sort((x, y) => x - y)).toEqual([202, 409]);
+
+      const job = JSON.parse(fs.readFileSync(activeJobFilePath(homeDir), "utf8"));
+      expect(job.state).toBe("shutting_down");
+    } finally {
+      restore();
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
+  });
+
+  it("removes an orphaned transition lock left by a dead process once the supervisor's runtime pid has moved on", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-orphan-lock.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-orphan-lock.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      // A stale lock "owned" by a definitely-dead PID, recorded before the
+      // supervisor started the *current* runtime (process.pid).
+      const lockDir = path.join(path.dirname(activeJobFilePath(homeDir)), "transition.lock");
+      fs.mkdirSync(lockDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(lockDir, "owner.json"),
+        JSON.stringify({ jobId, pid: 999999999, createdAt: new Date(0).toISOString() }),
+        "utf8",
+      );
+
+      const res = await request(app)
+        .post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`)
+        .send({});
+      expect(res.status).toBe(202);
+    } finally {
+      restore();
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
+  });
+
+  it("fails closed on an ambiguous transition lock (owner.json unreadable) instead of removing it", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-ambiguous-lock.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-ambiguous-lock.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      const lockDir = path.join(path.dirname(activeJobFilePath(homeDir)), "transition.lock");
+      fs.mkdirSync(lockDir, { recursive: true });
+      // No owner.json at all -- unreadable/unparsable owner.
+
+      const res = await request(app)
+        .post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`)
+        .send({});
+      expect(res.status).toBe(409);
+
+      const job = JSON.parse(fs.readFileSync(activeJobFilePath(homeDir), "utf8"));
+      expect(job.state).toBe("accepted");
+      // The ambiguous lock is left exactly as it was -- not removed.
+      expect(fs.existsSync(lockDir)).toBe(true);
+    } finally {
+      restore();
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
+  });
+
+  it("integration: a definite_no_publish write outcome rolls the job back to accepted, releases the lock, and leaves no request file", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-definite-no-publish.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-definite-no-publish.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      const result = await confirmShutdown({
+        jobId,
+        requestedBy: "test-actor",
+        homeDir,
+        writeRestartControlRequest: async () => ({
+          outcome: "definite_no_publish",
+          error: new Error("injected: temp-file write never attempted a rename"),
+        }),
+      });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("unreachable");
+      expect(result.httpStatus).toBe(409);
+      expect(result.code).toBe("restart_request_not_published");
+
+      const job = JSON.parse(fs.readFileSync(activeJobFilePath(homeDir), "utf8"));
+      expect(job.state).toBe("accepted");
+
+      const lockDir = path.join(path.dirname(activeJobFilePath(homeDir)), "transition.lock");
+      expect(fs.existsSync(lockDir)).toBe(false);
+
+      const requestPath = resolveRestartControlRequestPath(process.pid, homeDir);
+      expect(fs.existsSync(requestPath)).toBe(false);
+
+      // Retryable: a fresh confirm attempt against the now-accepted job must
+      // be allowed to proceed again (not permanently stuck).
+      const retry = await request(app)
+        .post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`)
+        .send({});
+      expect(retry.status).toBe(202);
+    } finally {
+      restore();
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
+  });
+
+  it("integration: an ambiguous write outcome keeps the job shutting_down, preserves the lock, blocks a second confirm with 409, and never auto-retries", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-ambiguous.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-ambiguous.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      const result = await confirmShutdown({
+        jobId,
+        requestedBy: "test-actor",
+        homeDir,
+        writeRestartControlRequest: async () => ({
+          outcome: "ambiguous",
+          error: new Error("injected: post-failure identity check was inconclusive"),
+        }),
+      });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("unreachable");
+      expect(result.httpStatus).toBe(409);
+      expect(result.code).toBe("restart_request_publish_ambiguous");
+
+      const job = JSON.parse(fs.readFileSync(activeJobFilePath(homeDir), "utf8"));
+      expect(job.state).toBe("shutting_down");
+
+      const lockDir = path.join(path.dirname(activeJobFilePath(homeDir)), "transition.lock");
+      expect(fs.existsSync(lockDir)).toBe(true);
+
+      // No auto-retry: this same confirmShutdown call is never re-invoked
+      // automatically. A real second request (through the actual HTTP route)
+      // must be blocked by the still-held lock, not silently re-attempted.
+      const second = await request(app)
+        .post(`/api/instance/database-restores/jobs/${jobId}/confirm-shutdown`)
+        .send({});
+      expect(second.status).toBe(409);
+
+      const jobAfter = JSON.parse(fs.readFileSync(activeJobFilePath(homeDir), "utf8"));
+      expect(jobAfter.state).toBe("shutting_down");
+    } finally {
+      restore();
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
+  });
+
+  it("integration: a nested failure while rolling back to accepted keeps the lock held and reports neither success nor accepted", async () => {
+    const backupDir = createTempBackupDir();
+    const homeDir = createTempHomeDir();
+    writeValidBackupWithManifest(backupDir, "paperclip-confirm-nested-failure.sql.gz");
+    const app = createApp(adminActor, { backupDir, homeDir });
+    const jobId = await acceptJob(app, "paperclip-confirm-nested-failure.sql.gz");
+
+    process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED = "true";
+    const restore = grantSupervisorCapability(homeDir);
+    try {
+      let callCount = 0;
+      const flakyWriteJobFile = async (filePath: string, job: unknown) => {
+        callCount += 1;
+        if (callCount === 1) {
+          // The first call (accepted -> shutting_down) really writes, so the
+          // on-disk state reflects exactly what a real caller would see at
+          // the point the second (rollback) write then fails.
+          const tempPath = `${filePath}.test.${Date.now()}.tmp`;
+          fs.writeFileSync(tempPath, `${JSON.stringify(job, null, 2)}\n`, "utf8");
+          fs.renameSync(tempPath, filePath);
+          return;
+        }
+        throw new Error("injected rollback write failure");
+      };
+
+      await expect(
+        confirmShutdown({
+          jobId,
+          requestedBy: "test-actor",
+          homeDir,
+          writeJobFile: flakyWriteJobFile,
+          writeRestartControlRequest: async () => ({
+            outcome: "definite_no_publish",
+            error: new Error("injected"),
+          }),
+        }),
+      ).rejects.toThrow("injected rollback write failure");
+
+      expect(callCount).toBe(2);
+
+      // The real first write already landed shutting_down; the rollback
+      // write failed before changing it -- never falsely reported as
+      // accepted, and confirmShutdown never returned any result at all (it
+      // threw), so no success could have been reported either.
+      const job = JSON.parse(fs.readFileSync(activeJobFilePath(homeDir), "utf8"));
+      expect(job.state).toBe("shutting_down");
+
+      const lockDir = path.join(path.dirname(activeJobFilePath(homeDir)), "transition.lock");
+      expect(fs.existsSync(lockDir)).toBe(true);
+    } finally {
+      restore();
+      delete process.env.PAPERCLIP_DB_RESTORE_EXECUTION_ENABLED;
+    }
   });
 });

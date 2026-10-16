@@ -14,6 +14,13 @@ import {
   isPidAlive,
   spawnDisposableChild,
   createCleanupHandler,
+  parseNetstatPortOwnerPid,
+  parseWin32ProcessInfo,
+  isVerifiedDescendant,
+  verifyAndRecordRealRuntimePid,
+  confirmDisposableTeardown,
+  handleRuntimePidVerificationFailure,
+  runSupervisorTick,
 } from "./paperclip-disposable-uat-supervisor.mjs";
 
 const SCRIPT_PATH = fileURLToPath(new URL("./paperclip-disposable-uat-supervisor.mjs", import.meta.url));
@@ -366,4 +373,519 @@ test("removeMarkerIfMatches never removes a marker recording a different pid", (
   } finally {
     runCleanups();
   }
+});
+
+// --- Verified runtime pid resolution -------------------------------------
+
+test("parseNetstatPortOwnerPid finds the LISTENING pid for the exact local address and ignores other states/ports", () => {
+  const stdout = [
+    "  Proto  Local Address          Foreign Address        State           PID",
+    "  TCP    127.0.0.1:39100        0.0.0.0:0              TIME_WAIT       111",
+    "  TCP    127.0.0.1:39999        0.0.0.0:0              LISTENING       222",
+    "  TCP    127.0.0.1:39100        0.0.0.0:0              LISTENING       12800",
+  ].join("\r\n");
+  assert.equal(parseNetstatPortOwnerPid(stdout, 39100), 12800);
+});
+
+test("parseNetstatPortOwnerPid returns null when no LISTENING line matches the port", () => {
+  const stdout = "  TCP    127.0.0.1:39100        0.0.0.0:0              TIME_WAIT       111";
+  assert.equal(parseNetstatPortOwnerPid(stdout, 39100), null);
+  assert.equal(parseNetstatPortOwnerPid("", 39100), null);
+});
+
+test("parseWin32ProcessInfo parses 'parentPid|creationDate' and rejects malformed input", () => {
+  const parsed = parseWin32ProcessInfo("33016|2026-10-16T01:50:10.0000000+09:00");
+  assert.equal(parsed.parentPid, 33016);
+  assert.equal(Number.isNaN(parsed.creationEpochMs), false);
+
+  assert.equal(parseWin32ProcessInfo(""), null);
+  assert.equal(parseWin32ProcessInfo("not-a-valid-line"), null);
+  assert.equal(parseWin32ProcessInfo("0|2026-10-16T01:50:10.0000000+09:00"), null);
+  assert.equal(parseWin32ProcessInfo("33016|not-a-date"), null);
+});
+
+test("isVerifiedDescendant walks the parent chain to find the bootstrap pid, bounded by maxHops", async () => {
+  // Fake tree: 100 (bootstrap) -> 200 -> 300 (candidate)
+  const tree = { 300: 200, 200: 100 };
+  const getProcessInfoFn = async (pid) => {
+    const parentPid = tree[pid];
+    if (!parentPid) return null;
+    return { parentPid, creationEpochMs: Date.now() };
+  };
+
+  assert.equal(await isVerifiedDescendant({ candidatePid: 100, bootstrapPid: 100, getProcessInfoFn }), true);
+  assert.equal(await isVerifiedDescendant({ candidatePid: 300, bootstrapPid: 100, getProcessInfoFn }), true);
+  assert.equal(await isVerifiedDescendant({ candidatePid: 300, bootstrapPid: 999, getProcessInfoFn }), false);
+  assert.equal(
+    await isVerifiedDescendant({ candidatePid: 300, bootstrapPid: 100, getProcessInfoFn, maxHops: 1 }),
+    false,
+  );
+});
+
+test("verifyAndRecordRealRuntimePid records the verified descendant pid when identity checks pass", async () => {
+  const tempDir = createTempDir();
+  try {
+    const markerRuntimePath = path.join(tempDir, "logs", "control-plane-runtime.pid");
+    const bootstrapSpawnedAtMs = Date.now() - 10_000;
+
+    const result = await verifyAndRecordRealRuntimePid({
+      apiPort: 39100,
+      bootstrapPid: 100,
+      bootstrapSpawnedAtMs,
+      markerRuntimePath,
+      getPortOwnerPidFn: async () => 300,
+      getProcessInfoFn: async (pid) => {
+        if (pid === 300) return { parentPid: 200, creationEpochMs: Date.now() };
+        if (pid === 200) return { parentPid: 100, creationEpochMs: Date.now() };
+        return null;
+      },
+    });
+
+    assert.deepEqual(result, { ok: true, pid: 300 });
+    assert.equal(readMarkerFile(markerRuntimePath), 300);
+  } finally {
+    runCleanups();
+  }
+});
+
+test("verifyAndRecordRealRuntimePid refuses and does not write a marker when the port owner is not a descendant", async () => {
+  const tempDir = createTempDir();
+  try {
+    const markerRuntimePath = path.join(tempDir, "logs", "control-plane-runtime.pid");
+    writeMarkerFile(markerRuntimePath, 999); // pre-existing bootstrap-pid marker
+
+    const result = await verifyAndRecordRealRuntimePid({
+      apiPort: 39100,
+      bootstrapPid: 999,
+      bootstrapSpawnedAtMs: Date.now(),
+      markerRuntimePath,
+      getPortOwnerPidFn: async () => 555, // unrelated pid, not a descendant
+      getProcessInfoFn: async () => ({ parentPid: 1, creationEpochMs: Date.now() }),
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "port_owner_not_descendant_of_bootstrap");
+    assert.equal(readMarkerFile(markerRuntimePath), 999); // untouched
+  } finally {
+    runCleanups();
+  }
+});
+
+test("verifyAndRecordRealRuntimePid refuses when no process owns the port", async () => {
+  const tempDir = createTempDir();
+  try {
+    const markerRuntimePath = path.join(tempDir, "logs", "control-plane-runtime.pid");
+
+    const result = await verifyAndRecordRealRuntimePid({
+      apiPort: 39100,
+      bootstrapPid: 999,
+      bootstrapSpawnedAtMs: Date.now(),
+      markerRuntimePath,
+      getPortOwnerPidFn: async () => null,
+      getProcessInfoFn: async () => null,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "port_owner_not_found");
+    assert.equal(fs.existsSync(markerRuntimePath), false);
+  } finally {
+    runCleanups();
+  }
+});
+
+test("verifyAndRecordRealRuntimePid refuses a pid-reused process whose creation time predates this spawn", () => {
+  return (async () => {
+    const tempDir = createTempDir();
+    try {
+      const markerRuntimePath = path.join(tempDir, "logs", "control-plane-runtime.pid");
+      const bootstrapSpawnedAtMs = Date.now();
+
+      const result = await verifyAndRecordRealRuntimePid({
+        apiPort: 39100,
+        bootstrapPid: 300, // direct hit, no ancestry walk needed
+        bootstrapSpawnedAtMs,
+        markerRuntimePath,
+        getPortOwnerPidFn: async () => 300,
+        getProcessInfoFn: async () => ({ parentPid: 1, creationEpochMs: bootstrapSpawnedAtMs - 60_000 }),
+      });
+
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "candidate_predates_bootstrap_spawn");
+      assert.equal(fs.existsSync(markerRuntimePath), false);
+    } finally {
+      runCleanups();
+    }
+  })();
+});
+
+test("confirmDisposableTeardown resolves ok:true once the child is dead and both ports are free", async () => {
+  const tempDir = createTempDir();
+  try {
+    const child = spawnDisposableChild({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: tempDir,
+      env: { PATH: process.env.PATH },
+      markerRuntimePath: path.join(tempDir, "logs", "control-plane-runtime.pid"),
+      markerSupervisorPath: path.join(tempDir, "logs", "control-plane-supervisor.pid"),
+      supervisorPid: process.pid,
+    });
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    child.kill("SIGKILL");
+    await exited;
+
+    const result = await confirmDisposableTeardown({
+      childPid: child.pid,
+      apiPort: 48123,
+      dbPort: 48124,
+      maxAttempts: 3,
+      intervalMs: 20,
+    });
+
+    assert.equal(result.ok, true);
+  } finally {
+    runCleanups();
+  }
+});
+
+test("confirmDisposableTeardown reports ok:false (never escalates to another pid/port) when the tracked child never exits in time", async () => {
+  const tempDir = createTempDir();
+  try {
+    const child = spawnDisposableChild({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: tempDir,
+      env: { PATH: process.env.PATH },
+      markerRuntimePath: path.join(tempDir, "logs", "control-plane-runtime.pid"),
+      markerSupervisorPath: path.join(tempDir, "logs", "control-plane-supervisor.pid"),
+      supervisorPid: process.pid,
+    });
+    registerCleanup(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    });
+
+    const result = await confirmDisposableTeardown({
+      childPid: child.pid,
+      apiPort: 48125,
+      dbPort: 48126,
+      maxAttempts: 2,
+      intervalMs: 20,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.attempts, 2);
+    assert.equal(result.childAlive, true);
+  } finally {
+    runCleanups();
+  }
+});
+
+test("handleRuntimePidVerificationFailure tears the tracked child down via the real cleanup handler and confirms teardown", async () => {
+  const tempDir = createTempDir();
+  try {
+    const markerRuntimePath = path.join(tempDir, "logs", "control-plane-runtime.pid");
+    const markerSupervisorPath = path.join(tempDir, "logs", "control-plane-supervisor.pid");
+
+    const child = spawnDisposableChild({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: tempDir,
+      env: { PATH: process.env.PATH },
+      markerRuntimePath,
+      markerSupervisorPath,
+      supervisorPid: process.pid,
+    });
+
+    const cleanup = createCleanupHandler({
+      getChild: () => child,
+      markerRuntimePath,
+      markerSupervisorPath,
+      supervisorPid: process.pid,
+    });
+
+    const result = await handleRuntimePidVerificationFailure({
+      reason: "port_owner_not_descendant_of_bootstrap",
+      instanceId: "f03-uat-disposable",
+      childPid: child.pid,
+      apiPort: 48127,
+      dbPort: 48128,
+      cleanupFn: cleanup,
+      maxAttempts: 10,
+      intervalMs: 20,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(isPidAlive(child.pid), false);
+    assert.equal(fs.existsSync(markerRuntimePath), false);
+    assert.equal(fs.existsSync(markerSupervisorPath), false);
+  } finally {
+    runCleanups();
+  }
+});
+
+test("handleRuntimePidVerificationFailure reports an unconfirmed teardown honestly instead of touching any other pid/port", async () => {
+  const tempDir = createTempDir();
+  try {
+    const child = spawnDisposableChild({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: tempDir,
+      env: { PATH: process.env.PATH },
+      markerRuntimePath: path.join(tempDir, "logs", "control-plane-runtime.pid"),
+      markerSupervisorPath: path.join(tempDir, "logs", "control-plane-supervisor.pid"),
+      supervisorPid: process.pid,
+    });
+    registerCleanup(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    });
+
+    let noopCleanupCalls = 0;
+    const noopCleanupFn = () => {
+      noopCleanupCalls += 1;
+      // Deliberately does not touch the child -- simulates cleanup failing
+      // to actually terminate it, which must be reported, never papered
+      // over by widening the search to some other pid or port.
+    };
+
+    const result = await handleRuntimePidVerificationFailure({
+      reason: "candidate_predates_bootstrap_spawn",
+      instanceId: "f03-uat-disposable",
+      childPid: child.pid,
+      apiPort: 48129,
+      dbPort: 48130,
+      cleanupFn: noopCleanupFn,
+      maxAttempts: 2,
+      intervalMs: 20,
+    });
+
+    assert.equal(noopCleanupCalls, 1);
+    assert.equal(result.ok, false);
+    assert.equal(isPidAlive(child.pid), true);
+  } finally {
+    runCleanups();
+  }
+});
+
+test("runSupervisorTick catches a thrown error from spawnChildFn and reports tick-error instead of rejecting", async () => {
+  const state = {
+    child: { pid: 999999 },
+    bootstrapSpawnedAtMs: Date.now(),
+    verifiedRuntimePid: "already-verified",
+    attempts: 0,
+    nextAttemptAt: 0,
+  };
+  const deps = {
+    instanceId: "f03-uat-disposable",
+    apiPort: 39100,
+    dbPort: 39300,
+    markerRuntimePath: path.join(os.tmpdir(), "does-not-matter.pid"),
+    spawnChildFn: () => {
+      throw new Error("synthetic spawn failure");
+    },
+    apiReadyFn: async () => false,
+    dbReadyFn: async () => false,
+    portOpenFn: async () => false,
+    isPidAliveFn: () => false,
+    recoveryActionFn: () => "start",
+    verifyRuntimePidFn: async () => ({ ok: true, pid: 1 }),
+    handleVerificationFailureFn: async () => ({ ok: true }),
+    getPortOwnerPidFn: async () => null,
+    getProcessInfoFn: async () => null,
+    cleanupFn: () => {},
+  };
+
+  const result = await runSupervisorTick(state, deps);
+
+  assert.equal(result.outcome, "tick-error");
+  assert.ok(result.error instanceof Error);
+});
+
+test("runSupervisorTick logs manual-attention and does not attempt a restart", async () => {
+  let spawnCalls = 0;
+  const state = {
+    child: { pid: 999999 },
+    bootstrapSpawnedAtMs: Date.now(),
+    verifiedRuntimePid: "already-verified",
+    attempts: 0,
+    nextAttemptAt: 0,
+  };
+  const deps = {
+    instanceId: "f03-uat-disposable",
+    apiPort: 39100,
+    dbPort: 39300,
+    markerRuntimePath: path.join(os.tmpdir(), "does-not-matter.pid"),
+    spawnChildFn: () => {
+      spawnCalls += 1;
+      return { pid: 123 };
+    },
+    apiReadyFn: async () => false,
+    dbReadyFn: async () => false,
+    portOpenFn: async () => false,
+    isPidAliveFn: () => true,
+    recoveryActionFn: () => "manual-attention",
+    verifyRuntimePidFn: async () => ({ ok: true, pid: 1 }),
+    handleVerificationFailureFn: async () => ({ ok: true }),
+    getPortOwnerPidFn: async () => null,
+    getProcessInfoFn: async () => null,
+    cleanupFn: () => {},
+  };
+
+  const result = await runSupervisorTick(state, deps);
+
+  assert.equal(result.outcome, "manual-attention");
+  assert.equal(spawnCalls, 0);
+});
+
+test("spawnDisposableChild attaches an error listener so a synthetic 'error' event never crashes the process", () => {
+  const tempDir = createTempDir();
+  try {
+    const child = spawnDisposableChild({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: tempDir,
+      env: { PATH: process.env.PATH },
+      markerRuntimePath: path.join(tempDir, "logs", "control-plane-runtime.pid"),
+      markerSupervisorPath: path.join(tempDir, "logs", "control-plane-supervisor.pid"),
+      supervisorPid: process.pid,
+      instanceId: "f03-uat-disposable",
+    });
+    registerCleanup(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    });
+
+    assert.doesNotThrow(() => {
+      child.emit("error", new Error("synthetic spawn-level error"));
+    });
+  } finally {
+    runCleanups();
+  }
+});
+
+test("runSupervisorTick ignores a concurrent re-entrant call while one is already in-flight", async () => {
+  const state = {
+    child: { pid: 1 },
+    bootstrapSpawnedAtMs: Date.now(),
+    verifiedRuntimePid: "already-verified",
+    attempts: 0,
+    nextAttemptAt: 0,
+  };
+  let resolveApiReady;
+  const deps = {
+    instanceId: "f03-uat-disposable",
+    apiPort: 39100,
+    dbPort: 39300,
+    markerRuntimePath: path.join(os.tmpdir(), "does-not-matter.pid"),
+    spawnChildFn: () => ({ pid: 2 }),
+    apiReadyFn: () => new Promise((resolve) => { resolveApiReady = resolve; }),
+    dbReadyFn: async () => false,
+    portOpenFn: async () => false,
+    isPidAliveFn: () => true,
+    recoveryActionFn: () => "cooldown",
+    verifyRuntimePidFn: async () => ({ ok: true, pid: 1 }),
+    handleVerificationFailureFn: async () => ({ ok: true }),
+    getPortOwnerPidFn: async () => null,
+    getProcessInfoFn: async () => null,
+    cleanupFn: () => {},
+  };
+
+  const firstCallPromise = runSupervisorTick(state, deps);
+  assert.equal(state.tickInProgress, true);
+
+  const secondResult = await runSupervisorTick(state, deps);
+  assert.deepEqual(secondResult, { outcome: "skipped-reentrant" });
+
+  resolveApiReady(false);
+  const firstResult = await firstCallPromise;
+  assert.notEqual(firstResult.outcome, "skipped-reentrant");
+  assert.equal(state.tickInProgress, false);
+});
+
+test("runSupervisorTick releases the reentrancy guard after a thrown error", async () => {
+  const state = {
+    child: { pid: 1 },
+    bootstrapSpawnedAtMs: Date.now(),
+    verifiedRuntimePid: "already-verified",
+    attempts: 0,
+    nextAttemptAt: 0,
+  };
+  const throwingDeps = {
+    instanceId: "f03-uat-disposable",
+    apiPort: 39100,
+    dbPort: 39300,
+    markerRuntimePath: path.join(os.tmpdir(), "does-not-matter.pid"),
+    spawnChildFn: () => {
+      throw new Error("synthetic spawn failure");
+    },
+    apiReadyFn: async () => false,
+    dbReadyFn: async () => false,
+    portOpenFn: async () => false,
+    isPidAliveFn: () => false,
+    recoveryActionFn: () => "start",
+    verifyRuntimePidFn: async () => ({ ok: true, pid: 1 }),
+    handleVerificationFailureFn: async () => ({ ok: true }),
+    getPortOwnerPidFn: async () => null,
+    getProcessInfoFn: async () => null,
+    cleanupFn: () => {},
+  };
+
+  const firstResult = await runSupervisorTick(state, throwingDeps);
+  assert.equal(firstResult.outcome, "tick-error");
+  assert.equal(state.tickInProgress, false);
+
+  const okDeps = { ...throwingDeps, spawnChildFn: () => ({ pid: 2 }), recoveryActionFn: () => "cooldown" };
+  const secondResult = await runSupervisorTick(state, okDeps);
+  assert.notEqual(secondResult.outcome, "skipped-reentrant");
+});
+
+test("runSupervisorTick holds the guard through the full verification-failure teardown wait, then releases it", async () => {
+  const state = {
+    child: { pid: 1 },
+    bootstrapSpawnedAtMs: Date.now(),
+    verifiedRuntimePid: null,
+    attempts: 0,
+    nextAttemptAt: 0,
+  };
+  let guardHeldDuringTeardown = false;
+  const deps = {
+    instanceId: "f03-uat-disposable",
+    apiPort: 39100,
+    dbPort: 39300,
+    markerRuntimePath: path.join(os.tmpdir(), "does-not-matter.pid"),
+    spawnChildFn: () => ({ pid: 2 }),
+    apiReadyFn: async () => true,
+    dbReadyFn: async () => true,
+    portOpenFn: async () => false,
+    isPidAliveFn: () => true,
+    recoveryActionFn: () => "cooldown",
+    verifyRuntimePidFn: async () => ({ ok: false, reason: "port_owner_not_found" }),
+    handleVerificationFailureFn: async () => {
+      guardHeldDuringTeardown = state.tickInProgress === true;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { ok: true };
+    },
+    getPortOwnerPidFn: async () => null,
+    getProcessInfoFn: async () => null,
+    cleanupFn: () => {},
+  };
+
+  const result = await runSupervisorTick(state, deps);
+
+  assert.equal(result.outcome, "verification-failed");
+  assert.equal(guardHeldDuringTeardown, true);
+  assert.equal(state.tickInProgress, false);
+
+  const next = await runSupervisorTick(state, { ...deps, verifyRuntimePidFn: async () => ({ ok: true, pid: 99 }) });
+  assert.notEqual(next.outcome, "skipped-reentrant");
 });

@@ -20,7 +20,7 @@
 | P1 NEX-126 | VERIFIED/CLOSED; 보고된 커밋 `1fc11df`, 테스트 2/2 PASS | 유지 |
 | P2 모바일 UI | 에이전트 보고상 검증 완료; Vitest 33/33, Playwright 4/4 | 외부 모바일 E2E는 별도 |
 | P2 페어링·PWA·외부 접속 | 미완료/미검증 | UI·백엔드 경계 조사 후 승인 |
-| NEX-119 | 복구 POST 1회 CEO 승인; 실행 결과 미수신 | HTTP 결과, Atlas wakeup, 모델·로그·최종 상태 확인 |
+| NEX-119 | DONE (2026-10-21 Claude READ-ONLY 보고); 2차 자동 run `56495351-2624-4301-aa5b-b0a9cd91adb5` succeeded, `gpt-5.6-sol` | 부모 NEX-118 in_review 검토; 전체 모바일 E2E 완료로 간주 금지 |
 | NEX-121 | blocked (이전 보고) | 별도 승인 전 변경 금지 |
 | P3 전체 자동 업무분배 E2E | 미검증/미완료 | 전체 루프 실증 필요 |
 | 2D AI Office | 유휴 시 진행하도록 운영 변경; 현재 구현 체크포인트 미확인 | 기존 구현 READ-ONLY 확인 후 시작점 확정 |
@@ -29,15 +29,21 @@
 
 ## 현재 작업 체크포인트
 
-### Claude — NEX-119
-- 승인: 사전 검증된 recovery-actions/resolve POST 1회, 후속 READ-ONLY 확인.
-- 금지: NEX-121/다른 이슈 수동 변경, 추가 POST/수동 재시도, 코드·설정·문서·Git 수정.
-- 재개 지점: 실행 결과 보고 수신 후 실제 상태 검증. 실행 성공으로 미리 기록하지 않음.
+### Claude — NEX-119 완료 / NEX-118 검토 대기
+- NEX-119: 보고상 done, activeRecoveryAction=null, executionRunId=null. 자동 continuation run succeeded. 45/46 모바일 회귀검증 통과, 결함 1건(만료 승인 제외 후 '로딩 중...' 잔류). Work Product approved/healthy 보고됨. 개별 증거 원문 및 전체 E2E는 별도 검증 필요.
+- NEX-118: 보고상 in_review; CEO 검토 전 done 전환 금지. 다음 단계는 READ-ONLY로 Work Product·승인 게이트·부모 완료 조건·결함 영향 확인.
+- Atlas 1차 run의 '검증 가드 두 차례 거부'는 활동 로그에서 확인되지 않음. 과거 gpt-5.4 오류 문구 재사용 정황은 있으나 원인 추정이며 확정 금지.
+- 금지: NEX-121/다른 이슈 수동 변경, 추가 POST/수동 재시도, 코드·설정 변경. NEX-119 추가 자동 재개는 현재 done 조건상 예상되지 않음.
 
 ### Antigravity — P2/2D
 - P2 모바일 `AIOfficeMobileSummary.tsx` Sheet 문제 수정 검증 보고 수신.
 - 2D AI Office의 최종 수정 파일, 완료 범위, 다음 재개 위치는 아직 미확인.
 - 재개 지점: 기존 기록/코드 READ-ONLY 감사 → 중복 제거 → 첫 구현 단위와 수정 파일 제안 → CEO 승인.
+
+### 2026-10-21 — GitHub Actions 점검
+- tracker 최초 커밋 `512d7b6`의 push로 Release 및 Docker 워크플로우가 실행되어 실패함. Refresh Lockfile은 성공.
+- Release/Docker 빌드: `@paperclipai/adapter-antigravity-local` 모듈 해석 실패(TS2307). Release UI typecheck: `OrgUnitStatus`, `orgUnitId` 타입 오류. 원인 수정 미실시. 해당 워크플로우가 문서 변경에도 자동 실행됨에 유의.
+- Actions run: Release `39480322116`, Docker `39480322033`. 로컬 서버 장애 여부와는 별개.
 
 ## 후속 기록 템플릿
 

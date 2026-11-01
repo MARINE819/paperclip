@@ -1,0 +1,10 @@
+{
+  "approvedPaths": [
+    "path/to/first-approved-file.ts",
+    "path/to/second-approved-file.test.ts"
+  ],
+  "verifyProfile": "git-save-self-test",
+  "commitMessage": "feat: describe the approved change",
+  "requestedBy": "JARVIS",
+  "reason": "Explain which approved task is complete and why these exact files belong to it."
+}

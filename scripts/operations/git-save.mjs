@@ -57,6 +57,7 @@ import { fileURLToPath } from "node:url";
 // fails validation before any git command runs.
 export const ALLOWED_BRANCH = "master";
 export const ALLOWED_REMOTES = ["origin"];
+export const ALLOWED_REMOTE_URLS = ["https://github.com/MARINE819/paperclip.git"];
 
 // verifyProfile selects one of these hardcoded, code-reviewed command lists.
 // A manifest can never supply its own command/args/cwd -- only a profile
@@ -135,7 +136,7 @@ export function validateManifest(manifest, { repoRoot }) {
   if (!manifest || typeof manifest !== "object") {
     return ["manifest must be a JSON object"];
   }
-  if (manifest.version !== 1) errors.push("manifest.version must be exactly 1");
+  if (manifest.version !== 2) errors.push("manifest.version must be exactly 2");
   if (typeof manifest.expectedRepoRoot !== "string" || !manifest.expectedRepoRoot.trim()) {
     errors.push("manifest.expectedRepoRoot is required");
   } else if (normalizePath(manifest.expectedRepoRoot) !== normalizePath(repoRoot)) {
@@ -157,6 +158,9 @@ export function validateManifest(manifest, { repoRoot }) {
   }
   if (typeof manifest.expectedRemoteHeadBefore !== "string" || !/^[0-9a-f]{40}$/i.test(manifest.expectedRemoteHeadBefore)) {
     errors.push("manifest.expectedRemoteHeadBefore is required and must be a full 40-char hex commit sha (no abbreviations)");
+  }
+  if (typeof manifest.expectedApprovedTree !== "string" || !/^[0-9a-f]{40}$/i.test(manifest.expectedApprovedTree)) {
+    errors.push("manifest.expectedApprovedTree is required and must be a full 40-char hex tree oid");
   }
   if (!Array.isArray(manifest.approvedPaths) || manifest.approvedPaths.length === 0) {
     errors.push("manifest.approvedPaths must be a non-empty array");
@@ -186,6 +190,12 @@ export function validateManifest(manifest, { repoRoot }) {
     errors.push("manifest.commitMessage is required and must be non-empty");
   } else if (manifest.commitMessage.length > 5000) {
     errors.push("manifest.commitMessage is implausibly long (>5000 chars)");
+  }
+  if (typeof manifest.requestedBy !== "string" || !manifest.requestedBy.trim()) {
+    errors.push("manifest.requestedBy is required and must be non-empty");
+  }
+  if (typeof manifest.reason !== "string" || !manifest.reason.trim()) {
+    errors.push("manifest.reason is required and must be non-empty");
   }
   return errors;
 }
@@ -295,7 +305,10 @@ export function readLiveRemoteHead(repoRoot, remote, branch) {
   try {
     output = execFileSync(
       "git",
-      ["ls-remote", "--exit-code", "--refs", remote, `refs/heads/${branch}`],
+      // The default Windows Schannel backend can fail before a public read
+      // with SEC_E_NO_CREDENTIALS. OpenSSL keeps TLS certificate verification
+      // while avoiding that Windows client-credential failure.
+      ["-c", "http.sslBackend=openssl", "ls-remote", "--exit-code", "--refs", remote, `refs/heads/${branch}`],
       { cwd: repoRoot, encoding: "utf8", stdio: "pipe" },
     );
   } catch (err) {
@@ -661,6 +674,13 @@ async function main() {
       fail("dry-run preview", `failed to build preview: ${err.message}`);
       return;
     }
+    if (preview.treeOid !== manifest.expectedApprovedTree) {
+      fail(
+        "dry-run approved-content binding",
+        `approved content changed after the request was prepared. current tree ${preview.treeOid}, approved tree ${manifest.expectedApprovedTree}. Prepare a new request and obtain CEO approval again.`,
+      );
+      return;
+    }
     console.log(preview.diff);
     console.log(
       `[git-save] DRY RUN complete. Would commit ${manifest.approvedPaths.length} file(s) (tree ${preview.treeOid}) and push to ${manifest.remote}/${ALLOWED_BRANCH}.`,
@@ -672,6 +692,13 @@ async function main() {
   // A/B: compute the approved tree OID in full object-store isolation first.
   const isolatedPreview = buildIsolatedApprovedPreview(repoRoot, manifest.approvedPaths);
   const approvedTreeOid = isolatedPreview.treeOid;
+  if (approvedTreeOid !== manifest.expectedApprovedTree) {
+    fail(
+      "scope gate: approved-content binding",
+      `approved content changed after the request was prepared. current tree ${approvedTreeOid}, approved tree ${manifest.expectedApprovedTree}. Nothing was staged. Prepare a new request and obtain CEO approval again.`,
+    );
+    return;
+  }
 
   // C: stage for real.
   git(["add", "--", ...literalApprovedPaths], { cwd: repoRoot });
@@ -701,6 +728,9 @@ async function main() {
   console.log(`[git-save] scope gate passed -- exactly ${stagedAfter.length} approved file(s) staged, tree ${realStagedTreeOid}.`);
   console.log("\n[git-save] full staged diff:\n");
   console.log(git(["-c", "core.quotePath=false", "diff", "--cached"], { cwd: repoRoot }));
+  console.log(`\n[git-save] requested by: ${manifest.requestedBy}`);
+  console.log(`[git-save] reason: ${manifest.reason}`);
+  console.log(`[git-save] approved tree: ${manifest.expectedApprovedTree}`);
 
   const confirmed = await confirmOrAbort(
     '\nType "SAVE" (exact case) and press Enter to commit and push, or anything else to cancel: ',

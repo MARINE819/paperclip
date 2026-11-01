@@ -23,6 +23,7 @@ import {
   validateApprovedPathOnDisk,
   validateManifest,
 } from "./git-save.mjs";
+import { parsePrepareArgs, validatePrepareRequest } from "./git-save-prepare.mjs";
 
 const SCRIPT_PATH = fileURLToPath(new URL("./git-save.mjs", import.meta.url));
 
@@ -61,16 +62,19 @@ function validManifest(repoRoot, overrides = {}) {
   const head = git(["rev-parse", "HEAD"], repoRoot);
   const remoteHead = git(["rev-parse", "origin/master"], repoRoot);
   return {
-    version: 1,
+    version: 2,
     expectedRepoRoot: repoRoot,
     expectedRemoteUrl: git(["remote", "get-url", "origin"], repoRoot),
     remote: "origin",
     branch: "master",
     expectedHeadBefore: head,
     expectedRemoteHeadBefore: remoteHead,
+    expectedApprovedTree: "0".repeat(40),
     approvedPaths: ["new-file.txt"],
     verifyProfile: "git-save-self-test",
     commitMessage: "test commit",
+    requestedBy: "test-ai-employee",
+    reason: "test request",
     ...overrides,
   };
 }
@@ -294,6 +298,66 @@ test("validateManifest: rejects an abbreviated (short) expectedRemoteHeadBefore"
   } finally {
     cleanupDirs(localDir, remoteDir);
   }
+});
+
+test("validateManifest: rejects a missing expectedApprovedTree", () => {
+  const { localDir, remoteDir } = initThrowawayRepoWithRemote();
+  try {
+    const manifest = validManifest(localDir);
+    delete manifest.expectedApprovedTree;
+    const errors = validateManifest(manifest, { repoRoot: localDir });
+    assert.ok(errors.some((e) => e.includes("expectedApprovedTree")));
+  } finally {
+    cleanupDirs(localDir, remoteDir);
+  }
+});
+
+test("validateManifest: requires requestedBy and reason", () => {
+  const { localDir, remoteDir } = initThrowawayRepoWithRemote();
+  try {
+    const manifest = validManifest(localDir, { requestedBy: "", reason: "" });
+    const errors = validateManifest(manifest, { repoRoot: localDir });
+    assert.ok(errors.some((e) => e.includes("requestedBy")));
+    assert.ok(errors.some((e) => e.includes("reason")));
+  } finally {
+    cleanupDirs(localDir, remoteDir);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// git-save-prepare request validation
+// ---------------------------------------------------------------------------
+
+test("parsePrepareArgs: reads request and output paths", () => {
+  const result = parsePrepareArgs(["--request", "request.json", "--output", "manifest.json"]);
+  assert.equal(result.requestPath, "request.json");
+  assert.equal(result.outputPath, "manifest.json");
+});
+
+test("validatePrepareRequest: accepts an exact bounded request", () => {
+  const request = {
+    approvedPaths: ["src/example.ts"],
+    verifyProfile: "git-save-self-test",
+    commitMessage: "feat: example",
+    requestedBy: "JARVIS",
+    reason: "approved task complete",
+  };
+  assert.deepEqual(validatePrepareRequest(request, { repoRoot: "C:/fake/repo" }), []);
+});
+
+test("validatePrepareRequest: rejects duplicate or unsafe paths and missing approval metadata", () => {
+  const errors = validatePrepareRequest({
+    approvedPaths: ["src/example.ts", "SRC/example.ts", "../outside.txt"],
+    verifyProfile: "unknown",
+    commitMessage: "",
+    requestedBy: "",
+    reason: "",
+  }, { repoRoot: "C:/fake/repo" });
+  assert.ok(errors.some((e) => e.includes("same file")));
+  assert.ok(errors.some((e) => e.includes("unsafe")));
+  assert.ok(errors.some((e) => e.includes("verifyProfile")));
+  assert.ok(errors.some((e) => e.includes("requestedBy")));
+  assert.ok(errors.some((e) => e.includes("reason")));
 });
 
 // ---------------------------------------------------------------------------

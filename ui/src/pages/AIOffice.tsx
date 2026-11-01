@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { IssueComment } from "@paperclipai/shared";
-import { Bot, Building2, Coffee, DoorOpen, ShieldAlert, Sofa, Sprout, Users } from "lucide-react";
 import { JarvisNeuralCommandInterface } from "@/components/neural/JarvisNeuralCommandInterface";
 import { agentsApi } from "@/api/agents";
 import { heartbeatsApi } from "@/api/heartbeats";
@@ -15,7 +14,7 @@ import { knowledgeApi } from "@/api/knowledge";
 import { describeApiError } from "@/api/client";
 import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
-import { useCompanyLiveEvent } from "@/context/LiveUpdatesProvider";
+import { useCompanyLiveEvent, useLiveUpdatesConnectionStatus } from "@/context/LiveUpdatesProvider";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
@@ -41,17 +40,19 @@ import { deriveAgentCondition } from "@/components/AIOfficeControlTower";
 import { AIOfficeMobileSummary } from "@/components/AIOfficeMobileSummary";
 import { AIOfficeJarvisTaskInstruction } from "@/components/AIOfficeJarvisTaskInstruction";
 import { AIOfficeCeoControlRail } from "@/components/AIOfficeCeoControlRail";
+import { DELEGATION_CHAIN_ISSUE_LIMIT } from "@/components/AIOfficeDelegationChain";
+import {
+  AIOfficeWorkspaceSheet,
+  type AIOfficeWorkspaceTarget,
+} from "@/components/AIOfficeWorkspaceSheet";
+import { useLocation } from "@/lib/router";
+import { queryKeys } from "@/lib/queryKeys";
 import {
   AgentDetailSheet,
-  AmenityTile,
   computeSeatState,
-  EmptyRoomNote,
-  EmptySeat,
-  RoomBox,
-  SeatBadge,
-  Workstation,
   type AgentDetailInfo,
 } from "@/components/AIOfficeFloor";
+import { TopDownOfficeCanvas } from "@/components/office-2d/TopDownOfficeCanvas";
 
 /**
  * NEXORA Master 1차 확정 부서 Room — fixed set, fixed order. `orgUnitName` is
@@ -104,36 +105,32 @@ function StatValue({ state, value }: { state: QueryState; value: number }) {
 
 export type AIOfficeViewMode = "floor" | "summary" | "neural";
 
+function resolveViewModeFromLocation(defaultMode: AIOfficeViewMode): AIOfficeViewMode {
+  if (typeof window !== "undefined" && window.location) {
+    const sp = new URLSearchParams(window.location.search);
+    const view = sp.get("view");
+    if (view === "neural") return "neural";
+    if (view === "summary") return "summary";
+    if (view === "floor") return "floor";
+  }
+  return defaultMode;
+}
+
 export function useAIOfficeViewMode(
   defaultMode: AIOfficeViewMode = "floor",
 ): [AIOfficeViewMode, (mode: AIOfficeViewMode) => void] {
-  const [mode, setModeState] = useState<AIOfficeViewMode>(() => {
-    if (typeof window !== "undefined" && window.location) {
-      const sp = new URLSearchParams(window.location.search);
-      const view = sp.get("view");
-      if (view === "neural") return "neural";
-      if (view === "summary") return "summary";
-      return defaultMode;
-    }
-    return defaultMode;
-  });
+  const [mode, setModeState] = useState<AIOfficeViewMode>(() =>
+    resolveViewModeFromLocation(defaultMode),
+  );
 
   useEffect(() => {
     if (typeof window === "undefined") return;
     const handlePopState = () => {
-      const sp = new URLSearchParams(window.location.search);
-      const view = sp.get("view");
-      if (view === "neural") {
-        setModeState("neural");
-      } else if (view === "summary") {
-        setModeState("summary");
-      } else {
-        setModeState("floor");
-      }
+      setModeState(resolveViewModeFromLocation(defaultMode));
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
-  }, []);
+  }, [defaultMode]);
 
   const setMode = useCallback((newMode: AIOfficeViewMode) => {
     setModeState(newMode);
@@ -155,14 +152,21 @@ export function useAIOfficeViewMode(
 
 export function AIOffice() {
   const { selectedCompanyId } = useCompany();
+  const location = useLocation();
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
   const [emergencyStopConfirmOpen, setEmergencyStopConfirmOpen] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedWorkspace, setSelectedWorkspace] = useState<AIOfficeWorkspaceTarget | null>(null);
+  const handledFocusRef = useRef<string | null>(null);
   const [controlCenterTab, setControlCenterTab] = useControlCenterTab("sre");
   const [viewMode, setViewMode] = useAIOfficeViewMode("floor");
   const [voiceState, setVoiceState] = useState<VoiceBarState>("idle");
+  const isConnected = useLiveUpdatesConnectionStatus();
 
+  // heartbeat.run.progress is already handled globally by LiveUpdatesProvider
+  // (invalidateHeartbeatProgressQueries + event-sourced liveRuns patching) —
+  // only plugin.ui.updated has no provider-side coverage.
   useCompanyLiveEvent(
     useCallback(
       (event: any) => {
@@ -171,19 +175,13 @@ export function AIOffice() {
             ? event
             : event?.type ?? event?.event;
 
-        if (eventType === "heartbeat.run.progress") {
-          if (selectedCompanyId) {
-            queryClient.invalidateQueries({
-              queryKey: ["ai-office-2d-live-runs", selectedCompanyId],
-            });
-          }
-        } else if (eventType === "plugin.ui.updated") {
+        if (eventType === "plugin.ui.updated") {
           queryClient.invalidateQueries({
-            queryKey: ["ai-office-2d-status"],
+            queryKey: queryKeys.instance.aiOfficeStatus,
           });
         }
       },
-      [queryClient, selectedCompanyId],
+      [queryClient],
     ),
   );
 
@@ -191,98 +189,125 @@ export function AIOffice() {
     setBreadcrumbs([{ label: "AI Office" }]);
   }, [setBreadcrumbs]);
 
+  const isSummaryView = viewMode === "summary";
+  const isFloorView = viewMode === "floor";
+  const isNeuralView = viewMode === "neural";
+
   const agentsQuery = useQuery({
-    queryKey: ["ai-office-2d-agents", selectedCompanyId],
+    queryKey: queryKeys.agents.list(selectedCompanyId!),
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
-    refetchInterval: 15_000,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
   const liveRunsQuery = useQuery({
-    queryKey: ["ai-office-2d-live-runs", selectedCompanyId],
+    queryKey: queryKeys.liveRuns(selectedCompanyId!),
     queryFn: () => heartbeatsApi.liveRunsForCompany(selectedCompanyId!),
     enabled: !!selectedCompanyId,
-    refetchInterval: 15_000,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
   const pendingApprovalsQuery = useQuery({
-    queryKey: ["ai-office-2d-approvals-pending", selectedCompanyId],
+    queryKey: queryKeys.approvals.list(selectedCompanyId!, "pending"),
     queryFn: () => approvalsApi.list(selectedCompanyId!, "pending"),
     enabled: !!selectedCompanyId,
-    refetchInterval: 15_000,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
   const revisionRequestedApprovalsQuery = useQuery({
-    queryKey: ["ai-office-2d-approvals-revision-requested", selectedCompanyId],
+    queryKey: queryKeys.approvals.list(selectedCompanyId!, "revision_requested"),
     queryFn: () => approvalsApi.list(selectedCompanyId!, "revision_requested"),
     enabled: !!selectedCompanyId,
-    refetchInterval: 15_000,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
   const inReviewIssuesQuery = useQuery({
-    queryKey: ["ai-office-2d-issues-in-review", selectedCompanyId],
+    queryKey: queryKeys.issues.listByStatus(selectedCompanyId!, { status: "in_review" }),
     queryFn: () => issuesApi.list(selectedCompanyId!, { status: "in_review" }),
     enabled: !!selectedCompanyId,
-    refetchInterval: 15_000,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
   const completedIssuesQuery = useQuery({
-    queryKey: ["ai-office-2d-issues-completed", selectedCompanyId],
+    queryKey: queryKeys.issues.listByStatus(selectedCompanyId!, {
+      status: "done",
+      sortField: "updated",
+      sortDir: "desc",
+    }),
     queryFn: () => issuesApi.list(selectedCompanyId!, {
       status: "done",
       sortField: "updated",
       sortDir: "desc",
     }),
-    enabled: !!selectedCompanyId,
-    refetchInterval: 30_000,
+    enabled: !!selectedCompanyId && !isNeuralView,
+    refetchInterval: isConnected ? false : 60_000,
+  });
+
+  const allIssuesQuery = useQuery({
+    queryKey: queryKeys.issues.listDelegationChain(selectedCompanyId!, DELEGATION_CHAIN_ISSUE_LIMIT),
+    queryFn: async () => {
+      if (typeof issuesApi?.list !== "function") return [];
+      const res = await issuesApi.list(selectedCompanyId!, {
+        limit: DELEGATION_CHAIN_ISSUE_LIMIT,
+      });
+      return Array.isArray(res) ? res : [];
+    },
+    enabled: !!selectedCompanyId && !isNeuralView,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
   const orgUnitsQuery = useQuery({
-    queryKey: ["ai-office-2d-org-units", selectedCompanyId],
+    queryKey: queryKeys.agents.orgUnitsStatus(selectedCompanyId!),
     queryFn: () => agentsApi.orgUnitsStatus(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
-    refetchInterval: 15_000,
+    enabled: !!selectedCompanyId && !isSummaryView,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
+  // No realtime event backs instance-wide AI Office status — keeps polling
+  // unconditionally, independent of socket connection state.
   const statusQuery = useQuery({
-    queryKey: ["ai-office-2d-status"],
+    queryKey: queryKeys.instance.aiOfficeStatus,
     queryFn: aiOfficeApi.getStatus,
+    enabled: isFloorView,
     refetchInterval: 15_000,
   });
 
   const costByAgentModelQuery = useQuery({
-    queryKey: ["ai-office-2d-cost-by-agent", selectedCompanyId],
+    queryKey: queryKeys.costByAgentModel(selectedCompanyId!),
     queryFn: () => costsApi.byAgentModel(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
-    refetchInterval: 30_000,
+    enabled: !!selectedCompanyId && (!isNeuralView || Boolean(selectedAgentId)),
+    refetchInterval: isConnected ? false : 60_000,
   });
 
   const costByProviderQuery = useQuery({
-    queryKey: ["ai-office-2d-cost-by-provider", selectedCompanyId],
+    queryKey: queryKeys.usageByProvider(selectedCompanyId!),
     queryFn: () => costsApi.byProvider(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
-    refetchInterval: 30_000,
+    enabled: !!selectedCompanyId && isFloorView,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
+  // usageQuotaWindows is intentionally excluded from realtime invalidation
+  // (external provider poll, unrelated to internal events) — keeps its own
+  // independent timer regardless of socket connection state.
   const quotaWindowsQuery = useQuery({
-    queryKey: ["ai-office-2d-quota", selectedCompanyId],
+    queryKey: queryKeys.usageQuotaWindows(selectedCompanyId!),
     queryFn: () => costsApi.quotaWindows(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
+    enabled: !!selectedCompanyId && isFloorView,
     refetchInterval: 30_000,
   });
 
   const dashboardQuery = useQuery({
-    queryKey: ["ai-office-dashboard-summary", selectedCompanyId],
+    queryKey: queryKeys.dashboard(selectedCompanyId!),
     queryFn: () => dashboardApi.summary(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
-    refetchInterval: 30_000,
+    enabled: !!selectedCompanyId && !isFloorView,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
   const knowledgeQuery = useQuery({
-    queryKey: ["ai-office-knowledge-records", selectedCompanyId],
+    queryKey: queryKeys.knowledge.list(selectedCompanyId!, 500),
     queryFn: () => knowledgeApi.listKnowledgeRecords(selectedCompanyId!, { limit: 500 }),
-    enabled: !!selectedCompanyId,
-    refetchInterval: 30_000,
+    enabled: !!selectedCompanyId && isNeuralView,
+    refetchInterval: isConnected ? false : 60_000,
   });
 
   const emergencyPauseMutation = useMutation({
@@ -309,6 +334,7 @@ export function AIOffice() {
   const pendingApprovalsState = describeQueryState(pendingApprovalsCombined);
   const inReviewIssuesState = describeQueryState(inReviewIssuesQuery);
   const completedIssuesState = describeQueryState(completedIssuesQuery);
+  const allIssuesState = describeQueryState(allIssuesQuery);
 
   // The office floor (leadership + department rooms + 기타/미배정) needs both
   // agents and org units to be genuinely resolved before it can tell "no
@@ -342,49 +368,144 @@ export function AIOffice() {
   const jarvis = agents.find((agent) => agent.name === "JARVIS");
   const atlas = agents.find((agent) => agent.name === "Atlas");
 
-  // N+1 Optimization: candidate pre-filtering for root parent issues assigned to JARVIS (in-review + recent completed)
+  const delegatedParentIssueIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const issue of allIssuesQuery.data ?? []) {
+      if (issue.parentId) {
+        ids.add(issue.parentId);
+      }
+    }
+    return ids;
+  }, [allIssuesQuery.data]);
+
+  // N+1 Optimization: candidate pre-filtering for root/orchestrator parent issues (JARVIS, Atlas, or delegated parents)
   const jarvisReportCandidates = useMemo(() => {
-    if (!jarvis) return [];
+    if (isNeuralView) return [];
+    if (!jarvis && !atlas && delegatedParentIssueIds.size === 0) return [];
     const inReview = inReviewIssuesQuery.data ?? [];
-    const completed = (completedIssuesQuery.data ?? []).slice(0, 5);
-    const combined = [...inReview, ...completed];
+    const completed = (completedIssuesQuery.data ?? []).slice(0, 10);
+    const delegatedFromAll = (allIssuesQuery.data ?? []).filter(
+      (issue) =>
+        (issue.status === "in_review" || issue.status === "done") &&
+        delegatedParentIssueIds.has(issue.id),
+    );
+    const combined = [...inReview, ...completed, ...delegatedFromAll];
     const seen = new Set<string>();
     return combined.filter((issue) => {
-      if (issue.parentId !== null || issue.assigneeAgentId !== jarvis.id) return false;
+      const isRootJarvis = issue.parentId === null && Boolean(jarvis && issue.assigneeAgentId === jarvis.id);
+      const isRootAtlas = issue.parentId === null && Boolean(atlas && issue.assigneeAgentId === atlas.id);
+      const isRootDelegatedParent = issue.parentId === null && delegatedParentIssueIds.has(issue.id);
+      const isAtlasDelegatedParent =
+        Boolean(atlas && issue.assigneeAgentId === atlas.id) && delegatedParentIssueIds.has(issue.id);
+
+      if (!isRootJarvis && !isRootAtlas && !isRootDelegatedParent && !isAtlasDelegatedParent) {
+        return false;
+      }
       if (seen.has(issue.id)) return false;
       seen.add(issue.id);
       return true;
     });
-  }, [inReviewIssuesQuery.data, completedIssuesQuery.data, jarvis]);
+  }, [isNeuralView, inReviewIssuesQuery.data, completedIssuesQuery.data, allIssuesQuery.data, jarvis, atlas, delegatedParentIssueIds]);
 
   const jarvisReportCommentQueries = useQueries({
     queries: jarvisReportCandidates.map((issue) => ({
-      queryKey: ["ai-office-jarvis-report-comments", issue.id],
-      queryFn: () => issuesApi.listComments(issue.id, { order: "desc", limit: 5 }),
+      queryKey: queryKeys.issues.reportComments(issue.id, { order: "desc", limit: 10 }),
+      queryFn: () => issuesApi.listComments(issue.id, { order: "desc", limit: 10 }),
+      enabled: !isNeuralView && Boolean(issue.id),
       staleTime: 15_000,
       retry: false,
     })),
   });
 
-  // Source of Truth: ONLY comment.metadata?.authorizationReason === "canonical_jarvis_parent_report"
+  // Source of Truth: canonical JARVIS parent report OR verified JARVIS/Atlas completion/synthesis report comment (never issue.description)
   const jarvisReportCommentByIssueId = useMemo(() => {
     const map = new Map<string, IssueComment>();
+    const orchestratorIds = new Set<string>();
+    if (jarvis?.id) orchestratorIds.add(jarvis.id);
+    if (atlas?.id) orchestratorIds.add(atlas.id);
+
     jarvisReportCommentQueries.forEach((q, idx) => {
       const candidate = jarvisReportCandidates[idx];
       if (!candidate || !q.data || !Array.isArray(q.data)) return;
-      const reportComment = q.data.find(
+
+      const canonicalComment = q.data.find(
         (comment) =>
-          comment.metadata?.authorizationReason === "canonical_jarvis_parent_report" ||
-          (comment.metadata?.sections as Array<{ title?: string | null }> | undefined)?.some(
-            (section) => section?.title === "JARVIS parent report",
-          ),
+          Boolean(comment.body?.trim()) &&
+          (comment.metadata?.authorizationReason === "canonical_jarvis_parent_report" ||
+            (comment.metadata?.sections as Array<{ title?: string | null }> | undefined)?.some(
+              (section) =>
+                typeof section?.title === "string" &&
+                /jarvis parent report|atlas.*report|최종\s*보고|통합\s*보고|완료\s*보고/i.test(
+                  section.title,
+                ),
+            )),
       );
-      if (reportComment) {
-        map.set(candidate.id, reportComment);
+      if (canonicalComment) {
+        map.set(candidate.id, canonicalComment);
+        return;
+      }
+
+      const verifiedOrchestratorReport = q.data.find((comment) => {
+        const body = comment.body?.trim() ?? "";
+        if (!body) return false;
+        if (candidate.description?.trim() && body === candidate.description.trim()) {
+          return false;
+        }
+        const isOrchestratorAuthor =
+          (comment.authorAgentId && orchestratorIds.has(comment.authorAgentId)) ||
+          (candidate.assigneeAgentId &&
+            comment.authorAgentId === candidate.assigneeAgentId &&
+            orchestratorIds.has(candidate.assigneeAgentId));
+        if (!isOrchestratorAuthor) return false;
+
+        return /(?:최종\s*보고|통합\s*보고|완료\s*보고|결과\s*보고|종합\s*보고|작업\s*완료|업무\s*완료|산출물|검증\s*결과|이행\s*결과|final\s*report|completion\s*report|synthesis\s*report)/i.test(
+          body,
+        );
+      });
+
+      if (verifiedOrchestratorReport) {
+        map.set(candidate.id, verifiedOrchestratorReport);
       }
     });
     return map;
-  }, [jarvisReportCommentQueries, jarvisReportCandidates]);
+  }, [jarvisReportCommentQueries, jarvisReportCandidates, jarvis, atlas]);
+
+  const mobileConnectionErrorMessage = useMemo(() => {
+    const errors: string[] = [];
+    if (agentsState.kind === "error") errors.push(`AI 직원: ${agentsState.message}`);
+    if (liveRunsState.kind === "error") errors.push(`실시간 실행: ${liveRunsState.message}`);
+    if (pendingApprovalsState.kind === "error") errors.push(`승인 대기: ${pendingApprovalsState.message}`);
+    if (inReviewIssuesState.kind === "error") errors.push(`검토 대기: ${inReviewIssuesState.message}`);
+    if (allIssuesState.kind === "error") errors.push(`업무 목록: ${allIssuesState.message}`);
+    return errors.length > 0 ? errors.join(" · ") : null;
+  }, [agentsState, liveRunsState, pendingApprovalsState, inReviewIssuesState, allIssuesState]);
+
+  const isMobileCoreLoading =
+    agentsQuery.isLoading ||
+    liveRunsQuery.isLoading ||
+    pendingApprovalsCombined.isLoading ||
+    inReviewIssuesQuery.isLoading ||
+    Boolean(allIssuesQuery.isLoading);
+
+  const handleMobileRefresh = useCallback(() => {
+    void agentsQuery.refetch();
+    void liveRunsQuery.refetch();
+    void pendingApprovalsQuery.refetch();
+    void revisionRequestedApprovalsQuery.refetch();
+    void inReviewIssuesQuery.refetch();
+    void completedIssuesQuery.refetch();
+    void allIssuesQuery.refetch();
+    void dashboardQuery.refetch();
+  }, [
+    agentsQuery,
+    liveRunsQuery,
+    pendingApprovalsQuery,
+    revisionRequestedApprovalsQuery,
+    inReviewIssuesQuery,
+    completedIssuesQuery,
+    allIssuesQuery,
+    dashboardQuery,
+  ]);
 
   const mappedOrgUnitNames = new Set(
     DEPARTMENT_ROOMS.map((room) => room.orgUnitName).filter((name): name is string => !!name),
@@ -468,38 +589,20 @@ export function AIOffice() {
   const selectedAgent = agents.find((agent) => agent.id === selectedAgentId) ?? null;
   const selectedAgentDetail = selectedAgent ? agentDetailFor(selectedAgent) : null;
 
-  function renderRoom(room: (typeof DEPARTMENT_ROOMS)[number]) {
-    const orgUnitId = room.orgUnitName ? orgUnitIdByName.get(room.orgUnitName) : undefined;
-    const deptAgents = orgUnitId ? agents.filter((agent) => agent.orgUnitId === orgUnitId) : [];
-    const isUnmatched = !room.orgUnitName;
-
-    return (
-      <RoomBox key={room.label} label={room.label} icon={DoorOpen} muted={isUnmatched}>
-        {isUnmatched ? (
-          <EmptyRoomNote note="NEXORA 조직 확정 부서 — 아직 실제 org_unit 데이터 없음" />
-        ) : deptAgents.length === 0 ? (
-          <EmptyRoomNote note="배정 대기 (배정된 AI 직원 없음)" />
-        ) : (
-          deptAgents.map((agent) => (
-            <Workstation
-              key={agent.id}
-              name={agent.name}
-              role={agent.title ?? agent.role}
-              liveRun={liveRunByAgentId.get(agent.id)}
-              state={computeSeatState(
-                agent,
-                liveRunByAgentId.has(agent.id),
-                pendingApprovalAgentIds.has(agent.id),
-                now,
-                inReviewAgentIds.has(agent.id),
-              )}
-              onClick={() => setSelectedAgentId(agent.id)}
-            />
-          ))
-        )}
-      </RoomBox>
-    );
-  }
+  useEffect(() => {
+    const focus = new URLSearchParams(location.search).get("focus");
+    if (!focus) {
+      handledFocusRef.current = null;
+      return;
+    }
+    if (handledFocusRef.current === focus) return;
+    const focusAgent = focus === "jarvis" ? jarvis : focus === "atlas" ? atlas : null;
+    if (!focusAgent) return;
+    handledFocusRef.current = focus;
+    if (viewMode !== "floor") setViewMode("floor");
+    setSelectedWorkspace(null);
+    setSelectedAgentId(focusAgent.id);
+  }, [location.search, jarvis, atlas, viewMode, setViewMode]);
 
   return (
     <div className="space-y-6">
@@ -625,6 +728,7 @@ export function AIOffice() {
         />
       ) : viewMode === "summary" ? (
         <AIOfficeMobileSummary
+          companyId={selectedCompanyId}
           agents={agents}
           liveRuns={liveRunsQuery.data ?? []}
           pendingApprovals={allPendingApprovals}
@@ -634,6 +738,12 @@ export function AIOffice() {
           onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
           inReviewIssues={inReviewIssuesQuery.data ?? []}
           completedIssues={completedIssuesQuery.data ?? []}
+          allIssues={allIssuesQuery.data}
+          isIssuesLoading={allIssuesQuery.isLoading}
+          issuesErrorMessage={allIssuesState.kind === "error" ? allIssuesState.message : null}
+          isCoreLoading={isMobileCoreLoading}
+          connectionErrorMessage={mobileConnectionErrorMessage}
+          onRetryConnection={handleMobileRefresh}
           jarvisReportComments={jarvisReportCommentByIssueId}
         />
       ) : (
@@ -659,113 +769,26 @@ export function AIOffice() {
               {agentsState.kind === "empty" ? "에이전트 데이터 없음" : "조직 데이터 없음"}
             </div>
           ) : (
-            <>
-          {/* 경영진 + 비서실 */}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <RoomBox label="CEO실" icon={Users}>
-              <div className="flex w-40 flex-col items-center gap-1 rounded-md border bg-card p-2 text-center text-xs">
-                <span className="font-medium">서대곤</span>
-                <span className="text-muted-foreground">CEO</span>
-                <SeatBadge state="idle" />
-                <span className="text-muted-foreground">인간 CEO 고정 조직 자리</span>
-              </div>
-            </RoomBox>
-
-            <RoomBox label="JARVIS 워크스테이션" icon={Bot}>
-              {jarvis ? (
-                <Workstation
-                  name={jarvis.name}
-                  role="CTO / Orchestrator"
-                  liveRun={liveRunByAgentId.get(jarvis.id)}
-                  state={computeSeatState(
-                    jarvis,
-                    liveRunByAgentId.has(jarvis.id),
-                    pendingApprovalAgentIds.has(jarvis.id),
-                    now,
-                    inReviewAgentIds.has(jarvis.id),
-                  )}
-                  onClick={() => setSelectedAgentId(jarvis.id)}
-                />
-              ) : (
-                <EmptySeat caption="DB에서 JARVIS 에이전트를 찾을 수 없습니다." />
-              )}
-            </RoomBox>
-
-            <RoomBox label="COO석" icon={Users} muted={!atlas}>
-              {atlas ? (
-                <Workstation
-                  name={atlas.name}
-                  role="COO"
-                  liveRun={liveRunByAgentId.get(atlas.id)}
-                  state={computeSeatState(
-                    atlas,
-                    liveRunByAgentId.has(atlas.id),
-                    pendingApprovalAgentIds.has(atlas.id),
-                    now,
-                    inReviewAgentIds.has(atlas.id),
-                  )}
-                  onClick={() => setSelectedAgentId(atlas.id)}
-                />
-              ) : (
-                <EmptySeat caption="공석 — 아직 Atlas 에이전트가 생성되지 않았습니다." />
-              )}
-            </RoomBox>
-
-            {renderRoom(SECRETARIAT_ROOM)}
-          </div>
-
-          {/* Master 1차 확정 부서 8개 */}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            {DEPARTMENT_ROOMS.slice(1).map((room) => renderRoom(room))}
-          </div>
-
-          {/* 최소 공간 표현 — 장식/시설물. 조직 Room(RoomBox)과 달리 헤더가 없는
-              별도 AmenityTile로 렌더해 "조직처럼 보이는" 문제를 구조적으로 차단. */}
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <AmenityTile icon={Sofa} label="회의실" />
-            <AmenityTile icon={Coffee} label="라운지" />
-            <AmenityTile icon={Sprout} />
-            <AmenityTile icon={Sprout} />
-          </div>
-
-          {/* 기타 / 미배정 조직 — 실제 DB에는 있으나 Master 1차 8개 부서에는 없는 org_unit */}
-          {otherOrgUnits.length > 0 ? (
-            <div className="space-y-2 border-t pt-4">
-              <h2 className="text-sm font-medium text-muted-foreground">
-                기타 / 미배정 조직 (Master 1차 정식 부서 아님 — 실제 데이터만 표시)
-              </h2>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                {otherOrgUnits.map((unit) => {
-                  const unitAgents = agents.filter((agent) => agent.orgUnitId === unit.orgUnitId);
-                  return (
-                    <RoomBox key={unit.orgUnitId} label={unit.name} icon={Building2} muted>
-                      {unitAgents.length === 0 ? (
-                        <EmptyRoomNote note="배정된 AI 직원 없음" />
-                      ) : (
-                        unitAgents.map((agent) => (
-                          <Workstation
-                            key={agent.id}
-                            name={agent.name}
-                            role={agent.title ?? agent.role}
-                            liveRun={liveRunByAgentId.get(agent.id)}
-                            state={computeSeatState(
-                              agent,
-                              liveRunByAgentId.has(agent.id),
-                              pendingApprovalAgentIds.has(agent.id),
-                              now,
-                              inReviewAgentIds.has(agent.id),
-                            )}
-                            onClick={() => setSelectedAgentId(agent.id)}
-                          />
-                        ))
-                      )}
-                    </RoomBox>
-                  );
-                })}
-              </div>
-            </div>
-          ) : null}
-            </>
+            <TopDownOfficeCanvas
+              agents={agents}
+              orgUnits={orgUnitsQuery.data ?? []}
+              departmentRooms={DEPARTMENT_ROOMS}
+              secretariatRoom={SECRETARIAT_ROOM}
+              otherOrgUnits={otherOrgUnits}
+              jarvis={jarvis}
+              atlas={atlas}
+              liveRunByAgentId={liveRunByAgentId}
+              pendingApprovalAgentIds={pendingApprovalAgentIds}
+              inReviewAgentIds={inReviewAgentIds}
+              orgUnitIdByName={orgUnitIdByName}
+              allIssues={allIssuesQuery.data}
+              completedIssues={completedIssuesQuery.data}
+              pendingApprovalCount={allPendingApprovals.length}
+              voiceState={voiceState}
+              now={now}
+              onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
+              onSelectWorkspace={(target) => setSelectedWorkspace(target)}
+            />
           )}
         </div>
 
@@ -785,6 +808,10 @@ export function AIOffice() {
           isAgentsLoading={agentsState.kind === "loading" || liveRunsState.kind === "loading"}
           agentsErrorMessage={agentsState.kind === "error" ? agentsState.message : null}
           agents={agents}
+          allIssues={allIssuesQuery.data}
+          isIssuesLoading={allIssuesQuery.isLoading}
+          issuesErrorMessage={allIssuesState.kind === "error" ? allIssuesState.message : null}
+          liveRuns={liveRunsQuery.data ?? []}
           jarvisReportCommentByIssueId={jarvisReportCommentByIssueId}
           onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
         />
@@ -1004,6 +1031,15 @@ export function AIOffice() {
       </AlertDialog>
 
       <AgentDetailSheet agent={selectedAgentDetail} onOpenChange={(open) => { if (!open) setSelectedAgentId(null); }} />
+
+      <AIOfficeWorkspaceSheet
+        target={selectedWorkspace}
+        agents={agents}
+        issues={allIssuesQuery.data ?? [...(inReviewIssuesQuery.data ?? []), ...(completedIssuesQuery.data ?? [])]}
+        approvals={allPendingApprovals}
+        onOpenChange={(open) => { if (!open) setSelectedWorkspace(null); }}
+        onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
+      />
 
       {/* Voice 진입 */}
       <Card>

@@ -116,7 +116,7 @@ function OpsStat({ label, value }: { label: string; value: number }) {
   return (
     <div className="rounded-lg border p-2 text-center">
       <div className="text-lg font-semibold">{value}</div>
-      <div className="text-[11px] text-muted-foreground">{label}</div>
+      <div className="text-(length:--text-micro) text-muted-foreground">{label}</div>
     </div>
   );
 }

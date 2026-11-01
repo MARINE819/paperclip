@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import {
   Clock,
   ExternalLink,
@@ -26,6 +26,8 @@ import { deriveAgentCondition } from "@/components/AIOfficeControlTower";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { evalsApi, type EvalRunStatus } from "@/api/evals";
 import { cn, formatCents } from "@/lib/utils";
+import { PixelAgentSprite } from "@/components/office-2d/PixelAgentSprite";
+import type { AgentBehaviorKind } from "@/components/office-2d/officeLayoutEngine";
 
 /**
  * Presentational layer for the AI Office 2D floor — every visual state here
@@ -78,7 +80,7 @@ export function computeSeatState(
 export function SeatBadge({ state }: { state: SeatState }) {
   return (
     <span
-      className="status-chip inline-flex w-fit items-center rounded-full border px-2 py-0.5 text-[11px] font-medium leading-none whitespace-nowrap"
+      className="status-chip inline-flex w-fit items-center rounded-full border px-2 py-0.5 text-(length:--text-micro) font-medium leading-none whitespace-nowrap"
       style={{ "--sc": `var(${SEAT_STATE_VAR[state]})` } as CSSProperties}
     >
       {SEAT_STATE_LABEL[state]}
@@ -93,65 +95,91 @@ export function SeatBadge({ state }: { state: SeatState }) {
  * piece stays independently testable and reusable (e.g. for a future
  * roster view that has no desk at all).
  */
-export function MiniAgentFigure({ state }: { state: SeatState }) {
-  const isBlocked = state === "blocked-error";
-  const isDimmed = state === "offline" || state === "unlinked";
-
+export function MiniAgentFigure({
+  state,
+  name = "Agent",
+  agentId,
+  role,
+  behavior,
+  voiceActive,
+}: {
+  state: SeatState;
+  name?: string;
+  agentId?: string;
+  role?: string;
+  behavior?: AgentBehaviorKind;
+  voiceActive?: boolean;
+}) {
   return (
-    <div
-      data-part="agent"
-      data-seat-state={state}
-      className={cn("flex flex-col items-center", isDimmed && "opacity-40 grayscale")}
-    >
-      <div
-        aria-hidden="true"
-        className={cn("relative h-6 w-6 rounded-full border border-border", isBlocked && "hb-blink")}
-        style={{
-          backgroundColor: isBlocked
-            ? "var(--status-agent-error)"
-            : state === "in-review"
-              ? "var(--status-task-in_review)"
-              : "var(--status-agent-idle)",
-        }}
-      >
-        {state === "approval-waiting" ? (
-          <Clock
-            aria-hidden="true"
-            className="absolute -right-2.5 -top-2.5 h-4 w-4 rounded-full border border-border bg-background p-0.5"
-            style={{ color: "var(--status-agent-paused)" }}
-          />
-        ) : null}
-      </div>
-      <div aria-hidden="true" className="h-6 w-8 rounded-t-full bg-muted-foreground/40" />
-    </div>
+    <PixelAgentSprite
+      name={name}
+      agentId={agentId}
+      role={role}
+      state={state}
+      behavior={behavior}
+      voiceActive={voiceActive}
+    />
   );
 }
 
-/** A department/leadership Room — a floor area, not a card. */
+/** A department/leadership Room — a top-down 2D pixel office room area, not a plain card. */
 export function RoomBox({
   label,
   icon: Icon,
   muted,
+  seatCountBadge,
+  isExpanded,
+  onOpen,
   children,
 }: {
   label: string;
   icon: LucideIcon;
   muted?: boolean;
+  seatCountBadge?: string;
+  isExpanded?: boolean;
+  onOpen?: () => void;
   children: React.ReactNode;
 }) {
   return (
     <div
       data-room-type="department"
+      data-room-expanded={isExpanded ? "true" : undefined}
       className={cn(
-        "flex min-h-32 flex-col gap-2 rounded-md border border-border/40 bg-muted/10 p-3",
-        muted && "border-dashed bg-transparent opacity-70",
+        "relative flex min-h-32 flex-col gap-2 rounded-md border-2 border-border/60 bg-muted/15 p-3 shadow-xs",
+        muted && "border-dashed border-border/40 bg-transparent opacity-70",
+        isExpanded && "sm:col-span-2",
       )}
     >
-      <div className="flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
-        <Icon className="h-3.5 w-3.5 shrink-0" />
-        <span className="truncate">{label}</span>
+      {/* Top-down room doorway marker */}
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute -top-0.5 right-4 h-1 w-6 rounded-full bg-background"
+      />
+      <div className="flex items-center justify-between gap-1 border-b border-border/40 pb-1">
+        {onOpen ? (
+          <button
+            type="button"
+            onClick={onOpen}
+            className="flex min-h-9 items-center gap-1 rounded-md text-left text-xs font-medium text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+            data-testid={`ai-office-room-open-${label}`}
+            aria-label={`${label} 업무 카드 열기`}
+          >
+            <Icon className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate">{label}</span>
+          </button>
+        ) : (
+          <div className="flex items-center gap-1 text-(length:--text-micro) font-medium text-muted-foreground">
+            <Icon className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate">{label}</span>
+          </div>
+        )}
+        {seatCountBadge ? (
+          <span className="rounded-full border border-border/60 bg-background/80 px-2 py-0.5 text-(length:--text-nano) font-medium text-muted-foreground">
+            {seatCountBadge}
+          </span>
+        ) : null}
       </div>
-      <div className="flex flex-1 flex-wrap content-start items-end gap-3">{children}</div>
+      <div className="flex flex-1 flex-wrap content-start items-end gap-3 pt-1">{children}</div>
     </div>
   );
 }
@@ -169,16 +197,19 @@ export function AmenityTile({ icon: Icon, label }: { icon: LucideIcon; label?: s
       className="flex min-h-24 flex-col items-center justify-center gap-1 rounded-lg border border-dashed bg-muted/10 p-3"
     >
       <Icon className="h-5 w-5 text-muted-foreground/70" aria-hidden="true" />
-      {label ? <span className="text-[10px] text-muted-foreground">{label}</span> : null}
+      {label ? <span className="text-(length:--text-nano) text-muted-foreground">{label}</span> : null}
     </div>
   );
 }
 
 export interface WorkstationProps {
+  agentId?: string;
   name: string;
   role: string;
   liveRun: LiveRunForIssue | undefined;
   state: SeatState;
+  behavior?: AgentBehaviorKind;
+  voiceActive?: boolean;
   onClick: () => void;
 }
 
@@ -189,7 +220,16 @@ export interface WorkstationProps {
  * so a row of these reads as "people at desks on a floor", not "a grid of
  * cards". Click opens the (data-only) detail Sheet.
  */
-export function Workstation({ name, role: _role, liveRun: _liveRun, state, onClick }: WorkstationProps) {
+export function Workstation({
+  agentId,
+  name,
+  role,
+  liveRun: _liveRun,
+  state,
+  behavior,
+  voiceActive,
+  onClick,
+}: WorkstationProps) {
   const isDimmed = state === "offline" || state === "unlinked";
   const isMonitorOn = state === "working";
   const isBlocked = state === "blocked-error";
@@ -198,8 +238,10 @@ export function Workstation({ name, role: _role, liveRun: _liveRun, state, onCli
     <button
       type="button"
       onClick={onClick}
+      data-agent-id={agentId}
+      data-agent-behavior={behavior ?? state}
       className={cn(
-        "flex w-36 flex-col items-center gap-0 bg-transparent text-[10px] leading-tight",
+        "flex w-36 flex-col items-center gap-0 bg-transparent text-(length:--text-nano) leading-tight",
         isDimmed && "opacity-40 grayscale",
       )}
     >
@@ -208,7 +250,7 @@ export function Workstation({ name, role: _role, liveRun: _liveRun, state, onCli
           data-part="monitor"
           aria-hidden="true"
           className={cn(
-            "h-6 w-10 rounded-[4px] border border-border",
+            "h-6 w-10 rounded-(--rad-4) border border-border",
             isMonitorOn && "hb-pulse border-transparent",
           )}
           style={isMonitorOn ? { backgroundColor: "var(--status-agent-running)" } : undefined}
@@ -223,7 +265,14 @@ export function Workstation({ name, role: _role, liveRun: _liveRun, state, onCli
       </div>
       <div data-part="monitor-stand" aria-hidden="true" className="h-1.5 w-1.5 bg-border" />
       <div data-part="desk" aria-hidden="true" className="h-2 w-28 rounded-sm bg-muted-foreground/50" />
-      <MiniAgentFigure state={state} />
+      <MiniAgentFigure
+        state={state}
+        name={name}
+        agentId={agentId}
+        role={role}
+        behavior={behavior}
+        voiceActive={voiceActive}
+      />
       <div data-part="chair" aria-hidden="true" className="-mt-1 h-3 w-14 rounded-b-full bg-border/70" />
       <span className="mt-1.5 w-full truncate text-center font-medium">{name}</span>
       <SeatBadge state={state} />
@@ -234,7 +283,7 @@ export function Workstation({ name, role: _role, liveRun: _liveRun, state, onCli
 /** A room that exists but currently has no assigned/matched staff. */
 export function EmptyRoomNote({ note }: { note: string }) {
   return (
-    <div className="flex w-36 flex-col items-center gap-1 text-center text-[10px] opacity-60">
+    <div className="flex w-36 flex-col items-center gap-1 text-center text-(length:--text-nano) opacity-60">
       <SeatBadge state="unlinked" />
       <span className="text-muted-foreground">{note}</span>
     </div>
@@ -249,8 +298,8 @@ export function EmptyRoomNote({ note }: { note: string }) {
  */
 export function EmptySeat({ caption }: { caption: string }) {
   return (
-    <div className="flex w-36 flex-col items-center gap-0 text-[10px] leading-tight opacity-50">
-      <div data-part="monitor" aria-hidden="true" className="h-6 w-10 rounded-[4px] border border-dashed border-border" />
+    <div className="flex w-36 flex-col items-center gap-0 text-(length:--text-nano) leading-tight opacity-50">
+      <div data-part="monitor" aria-hidden="true" className="h-6 w-10 rounded-(--rad-4) border border-dashed border-border" />
       <div data-part="monitor-stand" aria-hidden="true" className="h-1.5 w-1.5 bg-border/70" />
       <div data-part="desk" aria-hidden="true" className="h-2 w-28 rounded-sm bg-muted-foreground/30" />
       <div data-part="chair" aria-hidden="true" className="mt-1 h-3 w-14 rounded-b-full border border-dashed border-border" />
@@ -631,9 +680,15 @@ export function AgentDetailSheet({
   agent: AgentDetailInfo | null;
   onOpenChange: (open: boolean) => void;
 }) {
+  const isMobile = useMobileSheet();
+
   return (
     <Sheet open={agent !== null} onOpenChange={onOpenChange}>
-      <SheetContent>
+      <SheetContent
+        side={isMobile ? "bottom" : "right"}
+        className={isMobile ? "max-h-5/6 overflow-y-auto rounded-t-xl" : "overflow-y-auto"}
+        data-testid="ai-office-agent-detail-sheet"
+      >
         {agent ? (
           <>
             <SheetHeader>
@@ -780,4 +835,25 @@ export function AgentDetailSheet({
       </SheetContent>
     </Sheet>
   );
+}
+
+function useMobileSheet(): boolean {
+  const query = "(max-width: 767px)";
+  const [isMobile, setIsMobile] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return typeof window.matchMedia === "function"
+      ? window.matchMedia(query).matches
+      : window.innerWidth < 768;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(query);
+    const update = () => setIsMobile(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  return isMobile;
 }

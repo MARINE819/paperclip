@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - master
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.mdx"
   schedule:
     # Nightly cut at 09:00 UTC, after the workday's merges have settled.
     - cron: "0 9 * * *"

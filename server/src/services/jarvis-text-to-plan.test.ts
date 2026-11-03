@@ -76,6 +76,59 @@ describe("buildMinimalDelegationPlanFromText", () => {
     expect(result.plan!.tasks[0]!.instructions).toBe(longText);
   });
 
+  it("SYNC-02: classifies the exact CEO command 저장하자 as coordination, not the generic keyword scan", () => {
+    const result = buildMinimalDelegationPlanFromText("저장하자");
+    expect(result.ok).toBe(true);
+    expect(result.plan!.taskClass).toBe("coordination");
+  });
+
+  it("SYNC-02: tolerates trailing punctuation on the exact command (still the same command)", () => {
+    expect(buildMinimalDelegationPlanFromText("저장하자!").plan!.taskClass).toBe("coordination");
+    expect(buildMinimalDelegationPlanFromText("저장하자.").plan!.taskClass).toBe("coordination");
+    expect(buildMinimalDelegationPlanFromText("  저장하자  ").plan!.taskClass).toBe("coordination");
+  });
+
+  it("SYNC-02: the generated plan's acceptance criteria encode every required safety condition", () => {
+    const result = buildMinimalDelegationPlanFromText("저장하자");
+    const criteria = result.plan!.acceptanceCriteria.join(" ");
+    expect(criteria).toContain("당일 완료·검증된 작업만");
+    expect(criteria).toContain("제외");
+    expect(criteria).toContain("CEO에게 보고");
+    expect(criteria).toContain("git add/commit/push");
+
+    const instructions = result.plan!.tasks[0]!.instructions;
+    expect(instructions).toContain("모든 NEXORA 에이전트와 CLI");
+    expect(instructions).toContain("파일 수정 시각만으로");
+    expect(instructions).toContain("대문자 SAVE");
+  });
+
+  it("SYNC-02: does not misclassify a similar but different instruction as the daily save command", () => {
+    // Only the exact command triggers the special coordination plan --
+    // anything else (even text that mentions "저장") falls through to the
+    // ordinary generic-instruction path unchanged.
+    expect(buildMinimalDelegationPlanFromText("저장소를 백업하자").plan!.taskClass).not.toBe("coordination");
+    expect(buildMinimalDelegationPlanFromText("이 파일을 저장하자").plan!.taskClass).not.toBe("coordination");
+    expect(buildMinimalDelegationPlanFromText("오늘 작업을 저장해줘").plan!.taskClass).not.toBe("coordination");
+    expect(buildMinimalDelegationPlanFromText("Let's save the file").plan!.taskClass).not.toBe("coordination");
+  });
+
+  it("SYNC-02: passes the existing, unmodified validateDelegationPlan", () => {
+    const result = buildMinimalDelegationPlanFromText("저장하자");
+    const validation = validateDelegationPlan({
+      version: JARVIS_DELEGATION_PLAN_SCHEMA_VERSION,
+      parentIssueId: "issue-real-parent-1",
+      objective: result.plan!.objective,
+      constraints: result.plan!.constraints ?? [],
+      acceptanceCriteria: result.plan!.acceptanceCriteria,
+      evidenceRequirements: result.plan!.evidenceRequirements,
+      reviewRequired: result.plan!.reviewRequired ?? false,
+      taskClass: result.plan!.taskClass,
+      tasks: result.plan!.tasks,
+      memoryRefs: result.plan!.memoryRefs ?? [],
+    });
+    expect(validation.ok).toBe(true);
+  });
+
   it("does not break selectDeterministicSpecialist's existing contract: an empty requiredCapabilities array excludes no one on capability grounds", () => {
     const result = buildMinimalDelegationPlanFromText("Do something useful");
     const candidates: JarvisSelectableAgent[] = [

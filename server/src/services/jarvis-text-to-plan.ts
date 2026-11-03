@@ -54,6 +54,20 @@ function classifyTaskClass(normalizedText: string): DelegationTaskClass {
   return "development";
 }
 
+// SYNC-02 (NEXORA Control Center): the CEO's exact Korean phrase "저장하자"
+// is a dedicated daily GitHub-save coordination command, not an ordinary
+// development instruction -- it must never fall through to classifyTaskClass's
+// generic keyword scan or get a fabricated, task-specific acceptance
+// criterion. Matched on the trimmed command only, with trailing punctuation
+// stripped (a CEO typing "저장하자!" or "저장하자." means the same exact
+// command) -- deliberately narrow: no synonyms, no fuzzy matching, so an
+// unrelated instruction that happens to mention "저장" is never misclassified.
+export const DAILY_GITHUB_SAVE_COMMAND_RE = /^저장하자[!.?~]*$/;
+
+export function isDailyGithubSaveCommand(normalizedText: string): boolean {
+  return DAILY_GITHUB_SAVE_COMMAND_RE.test(normalizedText.trim());
+}
+
 const REVIEW_KEYWORDS: readonly string[] = [
   "code review",
   "code-review",
@@ -117,6 +131,61 @@ export function buildMinimalDelegationPlanFromText(
 
   const normalized = trimmed.toLowerCase();
   const reviewRequired = options?.reviewRequired ?? detectReviewRequired(normalized);
+
+  // SYNC-02: the daily save command gets its own fixed, honest plan content
+  // instead of classifyTaskClass's generic keyword scan and the generic
+  // single-line acceptance criterion -- the safety conditions below are the
+  // actual job, not a fabricated specific claim about unrelated code.
+  if (isDailyGithubSaveCommand(trimmed)) {
+    const instructions = [
+      "한국 시간 기준 당일 NEXORA의 모든 에이전트와 CLI가 완료하고 검증한 작업 전체를 읽기 전용으로 조사하여 GitHub 저장 후보로 정리한다.",
+      "당일 완료되고 실제로 검증된 작업만 후보로 선정한다.",
+      "조사 범위에는 모든 NEXORA 에이전트와 CLI 작업을 포함한다.",
+      "진행 중, 미완료, 테스트 실패, 검증 미실행, 담당자 불명확, 충돌 중인 파일은 후보에서 제외한다.",
+      "파일 수정 시각만으로 담당자나 완료 여부를 확정하지 않는다.",
+      "포함 대상, 제외 대상, 확인이 필요한 대상을 CEO에게 먼저 보고한다.",
+      "git add, commit, push, force push를 포함한 어떤 Git 변경도 직접 실행하지 않는다 — 저장 준비(manifest 작성)까지만 수행한다.",
+      "실제 저장은 기존 Git Save Gate를 통해 CEO가 변경 내용을 확인하고 대문자 SAVE를 입력한 경우에만 실행된다.",
+    ].join(" ");
+    const dailySavePlan: SubmitToJarvisPlanInput = {
+      objective: trimmed,
+      acceptanceCriteria: [
+        "당일 완료·검증된 작업만 GitHub 저장 후보로 선정되고, 진행 중/미완료/테스트 실패/검증 미실행/담당 불명확/충돌 파일은 전부 제외된다.",
+        "포함 대상·제외 대상·확인 필요 대상이 CEO에게 보고된다.",
+        "git add/commit/push 등 실제 Git 변경은 수행되지 않고, Git Save Gate 저장 준비(manifest)까지만 수행된다.",
+      ],
+      evidenceRequirements: ["work_product"],
+      reviewRequired,
+      taskClass: "coordination",
+      tasks: [
+        {
+          title: deriveTaskTitle("저장하자 — 일일 GitHub 저장 후보 조사 및 보고"),
+          instructions,
+          requiredCapabilities: [],
+          dependencies: [],
+          riskHints: ["git_mutation", "cross_agent_ownership"],
+        },
+      ],
+    };
+
+    const dailySaveValidation = validateDelegationPlan({
+      version: JARVIS_DELEGATION_PLAN_SCHEMA_VERSION,
+      parentIssueId: "pending",
+      objective: dailySavePlan.objective,
+      constraints: [],
+      acceptanceCriteria: dailySavePlan.acceptanceCriteria,
+      evidenceRequirements: dailySavePlan.evidenceRequirements,
+      reviewRequired,
+      taskClass: dailySavePlan.taskClass,
+      tasks: dailySavePlan.tasks,
+      memoryRefs: [],
+    });
+    if (!dailySaveValidation.ok) {
+      return { ok: false, plan: null, errors: dailySaveValidation.errors };
+    }
+    return { ok: true, plan: dailySavePlan, errors: [] };
+  }
+
   const taskClass = classifyTaskClass(normalized);
   const plan: SubmitToJarvisPlanInput = {
     objective: trimmed,

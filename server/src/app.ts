@@ -126,6 +126,17 @@ import { createMemoryCandidateReconcilerScheduler } from "./services/memory-cand
 import { reconcileKnowledgeAutoSave } from "./services/knowledge-auto-save-reconciler.js";
 import { resolveKnowledgeAutoSaveConfig } from "./services/knowledge-auto-save-config.js";
 import { createKnowledgeAutoSaveScheduler } from "./services/knowledge-auto-save-scheduler.js";
+import { resolveGitSaveDailyReminderConfig } from "./services/git-save-daily-reminder-config.js";
+import {
+  createGitSaveDailyReminderScheduler,
+  runGitSaveDailyReminderTick,
+} from "./services/git-save-daily-reminder-scheduler.js";
+import { resolveGitSaveIdleReminderConfig } from "./services/git-save-idle-reminder-config.js";
+import {
+  createGitSaveIdleReminderScheduler,
+  runGitSaveIdleReminderTick,
+} from "./services/git-save-idle-reminder-scheduler.js";
+import { REPO_ROOT } from "./services/plugin-loader.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
@@ -961,6 +972,40 @@ export async function createApp(
   if (knowledgeAutoSaveConfig.enabled) {
     knowledgeAutoSaveScheduler.start();
   }
+  // SYNC-02: unattended 21:00 KST daily Git-save reminder. Same reused
+  // scheduler factory as the two reconcilers above (setInterval + `.unref()`
+  // + startup-once + single-flight + swallow-and-log). Disabled by default
+  // (PAPERCLIP_SYNC02_DAILY_REMINDER_ENABLED) -- the tick itself only acts
+  // during the KST 21:00 hour, and the once-per-day guarantee plus restart
+  // safety are already enforced by generateDailyGitSaveReportAndApproval's
+  // own DB-backed dedup check (jarvis-daily-save-report.ts), reused
+  // unchanged here. Never touches routes/issues.ts, Atlas, or heartbeat.ts.
+  const gitSaveDailyReminderConfig = resolveGitSaveDailyReminderConfig();
+  const gitSaveDailyReminderScheduler = createGitSaveDailyReminderScheduler({
+    reconcile: () => runGitSaveDailyReminderTick({ db, repoRoot: REPO_ROOT }),
+    intervalMs: gitSaveDailyReminderConfig.intervalMs,
+    logger,
+  });
+  if (gitSaveDailyReminderConfig.enabled) {
+    gitSaveDailyReminderScheduler.start();
+  }
+  // SYNC-02 Stage A: unattended idle-triggered (30-minute company-wide
+  // inactivity) Git-save reminder. Same reused scheduler factory as the
+  // daily reminder directly above. Disabled by default
+  // (PAPERCLIP_SYNC02_IDLE_REMINDER_ENABLED) -- dedup/advisory-lock/
+  // final-re-check safety all live in jarvis-daily-save-report.ts and
+  // jarvis-idle-activity-detector.ts, reused unchanged here. Never touches
+  // routes/issues.ts, Atlas, or heartbeat.ts, and operates independently of
+  // the 21:00 daily reminder (separate source value, separate dedup key).
+  const gitSaveIdleReminderConfig = resolveGitSaveIdleReminderConfig();
+  const gitSaveIdleReminderScheduler = createGitSaveIdleReminderScheduler({
+    reconcile: () => runGitSaveIdleReminderTick({ db, repoRoot: REPO_ROOT }),
+    intervalMs: gitSaveIdleReminderConfig.intervalMs,
+    logger,
+  });
+  if (gitSaveIdleReminderConfig.enabled) {
+    gitSaveIdleReminderScheduler.start();
+  }
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
@@ -1034,6 +1079,8 @@ export async function createApp(
       }
       await memoryCandidateReconcilerScheduler.stop();
       await knowledgeAutoSaveScheduler.stop();
+      await gitSaveDailyReminderScheduler.stop();
+      await gitSaveIdleReminderScheduler.stop();
       devWatcher?.close();
       viteHtmlRenderer?.dispose();
       void viteDevServer?.close().catch(() => undefined);

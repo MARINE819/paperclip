@@ -182,6 +182,26 @@ function BoardApprovalPayloadContent({ payload }: { payload: Record<string, unkn
   const recommendedAction = firstNonEmptyString(payload.recommendedAction);
   const nextActionOnApproval = firstNonEmptyString(payload.nextActionOnApproval);
   const proposedComment = firstNonEmptyString(payload.proposedComment);
+  const reportMarkdown = firstNonEmptyString(payload.reportMarkdown);
+
+  // SYNC-02: SAVE_CANDIDATE/NEEDS_REVIEW/EXCLUDED counts from the daily
+  // Git-save report. Checked with `typeof === "number"` (not a truthy
+  // check) so a real 0 still renders instead of being treated as absent.
+  const summaryCounts = payload.summaryCounts as Record<string, unknown> | undefined;
+  const saveCandidateCount =
+    typeof summaryCounts?.saveCandidateCount === "number" ? summaryCounts.saveCandidateCount : null;
+  const needsReviewCount =
+    typeof summaryCounts?.needsReviewCount === "number" ? summaryCounts.needsReviewCount : null;
+  const excludedCount =
+    typeof summaryCounts?.excludedCount === "number" ? summaryCounts.excludedCount : null;
+  const hasSaveCandidateSummary =
+    saveCandidateCount !== null || needsReviewCount !== null || excludedCount !== null;
+
+  // Whether the collector judged the candidates ready for a Git Save Gate
+  // manifest -- a read-only report field, never an authorization. The
+  // actual commit/push still only ever happens when the CEO types SAVE in
+  // the separate Git Save Gate terminal flow.
+  const readyForPrepare = typeof payload.readyForPrepare === "boolean" ? payload.readyForPrepare : null;
 
   return (
     <div className="mt-4 space-y-3.5 text-sm">
@@ -211,6 +231,28 @@ function BoardApprovalPayloadContent({ payload }: { payload: Record<string, unkn
           <MarkdownBody className="mt-1 leading-6 text-foreground">{nextActionOnApproval}</MarkdownBody>
         </div>
       )}
+      {hasSaveCandidateSummary && (
+        <div className="rounded-lg border border-border/60 bg-background/60 px-3.5 py-3">
+          <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">
+            Save candidates
+          </p>
+          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-sm text-foreground">
+            {saveCandidateCount !== null && <span>SAVE_CANDIDATE: {saveCandidateCount}</span>}
+            {needsReviewCount !== null && <span>NEEDS_REVIEW: {needsReviewCount}</span>}
+            {excludedCount !== null && <span>EXCLUDED: {excludedCount}</span>}
+          </div>
+        </div>
+      )}
+      {readyForPrepare !== null && (
+        <div className="rounded-lg border border-border/60 bg-background/60 px-3.5 py-3">
+          <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">
+            Save readiness
+          </p>
+          <p className="mt-1 text-sm text-foreground">
+            {readyForPrepare ? "저장 준비 가능" : "저장 준비 불가"}
+          </p>
+        </div>
+      )}
       {risks.length > 0 && (
         <div className="space-y-1.5">
           <p className="text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">Risks</p>
@@ -233,6 +275,16 @@ function BoardApprovalPayloadContent({ payload }: { payload: Record<string, unkn
             {proposedComment}
           </pre>
         </div>
+      )}
+      {reportMarkdown && (
+        <details className="rounded-lg border border-border/60 bg-background/60 px-3.5 py-3">
+          <summary className="cursor-pointer text-(length:--text-micro) font-medium uppercase tracking-(--tracking-label) text-muted-foreground">
+            Full report
+          </summary>
+          <div className="mt-2">
+            <MarkdownBody className="leading-6 text-foreground/90">{reportMarkdown}</MarkdownBody>
+          </div>
+        </details>
       )}
     </div>
   );

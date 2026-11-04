@@ -209,4 +209,226 @@ describe("ApprovalPayloadRenderer", () => {
       root.unmount();
     });
   });
+
+  it("shows SAVE_CANDIDATE/NEEDS_REVIEW/EXCLUDED counts from summaryCounts", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <ThemeProvider>
+          <ApprovalPayloadRenderer
+            type="request_board_approval"
+            payload={{
+              title: "SYNC-02 daily report",
+              summaryCounts: { saveCandidateCount: 5, needsReviewCount: 2, excludedCount: 1 },
+            }}
+          />
+        </ThemeProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("SAVE_CANDIDATE: 5");
+    expect(container.textContent).toContain("NEEDS_REVIEW: 2");
+    expect(container.textContent).toContain("EXCLUDED: 1");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("still shows a count of 0 instead of hiding it", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <ThemeProvider>
+          <ApprovalPayloadRenderer
+            type="request_board_approval"
+            payload={{
+              title: "SYNC-02 daily report",
+              summaryCounts: { saveCandidateCount: 0, needsReviewCount: 0, excludedCount: 0 },
+            }}
+          />
+        </ThemeProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("SAVE_CANDIDATE: 0");
+    expect(container.textContent).toContain("NEEDS_REVIEW: 0");
+    expect(container.textContent).toContain("EXCLUDED: 0");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("shows save readiness as 저장 준비 가능 when readyForPrepare is true", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <ThemeProvider>
+          <ApprovalPayloadRenderer
+            type="request_board_approval"
+            payload={{ title: "SYNC-02 daily report", readyForPrepare: true }}
+          />
+        </ThemeProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("저장 준비 가능");
+    expect(container.textContent).not.toContain("저장 준비 불가");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("shows save readiness as 저장 준비 불가 when readyForPrepare is false", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <ThemeProvider>
+          <ApprovalPayloadRenderer
+            type="request_board_approval"
+            payload={{ title: "SYNC-02 daily report", readyForPrepare: false }}
+          />
+        </ThemeProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("저장 준비 불가");
+    expect(container.textContent).not.toContain("저장 준비 가능");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("renders the full report inside a <details> that is closed by default", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <ThemeProvider>
+          <ApprovalPayloadRenderer
+            type="request_board_approval"
+            payload={{
+              title: "SYNC-02 daily report",
+              reportMarkdown: "# Full Report\n\nSAVE_CANDIDATE list here.",
+            }}
+          />
+        </ThemeProvider>,
+      );
+    });
+
+    const details = container.querySelector("details");
+    expect(details).not.toBeNull();
+    expect(details?.open).toBeFalsy();
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  // jsdom does not reliably implement the native browser toggle-on-click
+  // behavior for <details>/<summary> (a user click in a real browser flips
+  // `.open`, but jsdom's click simulation does not consistently reproduce
+  // this). This test verifies the fallback explicitly allowed by the task:
+  // opening/closing via the `open` DOM property directly, and confirming
+  // the component's own rendering reacts correctly to that state.
+  it("exposes the markdown-rendered report once open is set, and the <details> element reports closed again once reset (open-property-level check)", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <ThemeProvider>
+          <ApprovalPayloadRenderer
+            type="request_board_approval"
+            payload={{ title: "SYNC-02 daily report", reportMarkdown: "**bold report body**" }}
+          />
+        </ThemeProvider>,
+      );
+    });
+
+    const details = container.querySelector("details") as HTMLDetailsElement;
+    expect(details.open).toBeFalsy();
+
+    act(() => {
+      details.open = true;
+    });
+    expect(details.open).toBe(true);
+    const markdownBody = details.querySelector(".paperclip-markdown");
+    expect(markdownBody).not.toBeNull();
+    expect(markdownBody?.querySelector("strong")?.textContent).toBe("bold report body");
+
+    act(() => {
+      details.open = false;
+    });
+    expect(details.open).toBe(false);
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("renders a pre-existing approval with no SYNC-02 fields exactly as before (no empty sections)", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <ThemeProvider>
+          <ApprovalPayloadRenderer
+            type="request_board_approval"
+            payload={{
+              title: "Reply with an ASCII frog",
+              summary: "Board asked for approval before posting the frog.",
+            }}
+          />
+        </ThemeProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("Reply with an ASCII frog");
+    expect(container.textContent).not.toContain("Save candidates");
+    expect(container.textContent).not.toContain("Save readiness");
+    expect(container.textContent).not.toContain("Full report");
+    expect(container.querySelector("details")).toBeNull();
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("does not leak SYNC-02 fields into other approval types (hire_agent regression)", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <ThemeProvider>
+          <ApprovalPayloadRenderer
+            type="hire_agent"
+            payload={{
+              name: "Designer",
+              role: "designer",
+              summaryCounts: { saveCandidateCount: 9 },
+              readyForPrepare: true,
+              reportMarkdown: "should not render for hire_agent",
+            }}
+          />
+        </ThemeProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("Designer");
+    expect(container.textContent).not.toContain("Save candidates");
+    expect(container.textContent).not.toContain("저장 준비 가능");
+    expect(container.textContent).not.toContain("should not render for hire_agent");
+    expect(container.querySelector("details")).toBeNull();
+
+    act(() => {
+      root.unmount();
+    });
+  });
 });
